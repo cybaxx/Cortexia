@@ -1,16 +1,20 @@
-// Update this page (the content is just a fallback if you fail to update the page)
+import { MapView } from '@/components/cortex/MapView';
+import { TopBar } from '@/components/cortex/TopBar';
+import { ScenarioInjector } from '@/components/cortex/ScenarioInjector';
+import { ReasoningFeed } from '@/components/cortex/ReasoningFeed';
+import { BottomBar } from '@/components/cortex/BottomBar';
 
-// IMPORTANT: Fully REPLACE this with your own code
-const PlaceholderIndex = () => {
-  // PLACEHOLDER: Replace this entire return statement with the user's app.
-  // The inline background color is intentionally not part of the design system.
+const Index = () => {
   return (
-    <div className="flex min-h-screen items-center justify-center" style={{ backgroundColor: '#fcfbf8' }}>
-      <img data-lovable-blank-page-placeholder="REMOVE_THIS" src="/placeholder.svg" alt="Your app will live here!" />
-    </div>
+    <main className="relative h-screen w-screen overflow-hidden bg-bg-deep text-text-primary">
+      <h1 className="sr-only">Cortexia — Cognitive Impact Sandbox · Los Angeles</h1>
+      <MapView />
+      <TopBar />
+      <ScenarioInjector />
+      <ReasoningFeed />
+      <BottomBar />
+    </main>
   );
 };
-
-const Index = PlaceholderIndex;
 
 export default Index;
