@@ -5,11 +5,22 @@ import { componentTagger } from "lovable-tagger";
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
+  // Bind IPv4 + IPv6 so `http://localhost` (often ::1) and `http://127.0.0.1` both hit Vite.
+  // Avoids "not found" when another app only listened on one stack on the same port.
   server: {
-    host: "::",
-    port: 8080,
+    host: true,
+    // Use default Vite port to avoid clashes with other tools (8080 is often in use on ::1 only).
+    port: 5173,
+    strictPort: true,
     hmr: {
       overlay: false,
+    },
+    proxy: {
+      "/api": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),

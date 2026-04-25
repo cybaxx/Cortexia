@@ -1,3 +1,16 @@
+# Env / local state
+.env
+**/.env
+!**/.env.example
+backend/cortexia.db
+backend/**/__pycache__
+backend/**/.pytest_cache
+*.pyc
+backend/.venv
+frontend/node_modules
+frontend/dist
+.vite
+
 # Logs
 logs
 *.log

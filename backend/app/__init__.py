@@ -1,0 +1,1 @@
+"""Cortexia FastAPI application package."""
