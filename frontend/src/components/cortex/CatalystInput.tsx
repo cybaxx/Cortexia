@@ -25,8 +25,8 @@ export const CatalystInput = ({
   return (
     <div className="space-y-3">
       <div>
-        <Label className="font-mono text-[9px] uppercase tracking-wider text-text-muted">{label}</Label>
-        <p className="text-[10px] text-text-muted/90 mt-0.5 mb-1.5">
+        <Label className="font-mono text-[9px] uppercase tracking-wider text-white/85">{label}</Label>
+        <p className="text-[10px] text-white/65 mt-0.5 mb-1.5">
           Paste a narrative, drop a long-form article URL in the field below, or write a short policy or comms draft.
         </p>
         <Textarea
@@ -38,7 +38,7 @@ export const CatalystInput = ({
         />
       </div>
       <div className="space-y-1.5">
-        <Label className="font-mono text-[9px] uppercase tracking-wider text-text-muted">Source URL (optional)</Label>
+        <Label className="font-mono text-[9px] uppercase tracking-wider text-white/85">Source URL (optional)</Label>
         <Input
           value={sourceUrl}
           onChange={(e) => onSourceUrlChange(e.target.value)}

@@ -114,3 +114,60 @@ export function generateAgentsForRegion(
   }
   return agents;
 }
+
+interface LandZone {
+  lngMin: number;
+  lngMax: number;
+  latMin: number;
+  latMax: number;
+}
+
+/** Place agents only within the provided land zones, distributed proportionally by zone area. */
+export function generateAgentsForCity(
+  landZones: LandZone[],
+  count = 110,
+): Agent[] {
+  if (landZones.length === 0) return [];
+
+  // Compute total area weight for proportional sampling
+  const areas = landZones.map(
+    (z) => (z.lngMax - z.lngMin) * (z.latMax - z.latMin),
+  );
+  const totalArea = areas.reduce((a, b) => a + b, 0);
+  const cumulative: number[] = [];
+  let cum = 0;
+  for (const a of areas) {
+    cum += a / totalArea;
+    cumulative.push(cum);
+  }
+
+  const agents: Agent[] = [];
+  for (let i = 0; i < count; i++) {
+    // Pick zone by area weight
+    const zonePick = seeded(i + 8500);
+    const zoneIdx = cumulative.findIndex((c) => zonePick <= c) ?? 0;
+    const zone = landZones[Math.max(0, zoneIdx)];
+
+    const r1 = seeded(i + 1);
+    const r2 = seeded(i + 1001);
+    const r3 = seeded(i + 2001);
+    const lng = zone.lngMin + r1 * (zone.lngMax - zone.lngMin);
+    const lat = zone.latMin + r2 * (zone.latMax - zone.latMin);
+
+    let state: AgentState = 'neutral';
+    if (r3 > 0.78) state = 'strain';
+    else if (r3 > 0.58) state = 'adopt';
+
+    agents.push({
+      id: i,
+      name: `${FIRST[i % FIRST.length]} ${LAST[(i * 3) % LAST.length]}`,
+      role: ROLES[i % ROLES.length],
+      position: [lng, lat],
+      state,
+      cognitiveLoad: 0.25 + seeded(i + 5000) * 0.7,
+      emotionalAgitation: 0.15 + seeded(i + 6000) * 0.8,
+      defensivePosture: 0.2 + seeded(i + 7000) * 0.75,
+    });
+  }
+  return agents;
+}
