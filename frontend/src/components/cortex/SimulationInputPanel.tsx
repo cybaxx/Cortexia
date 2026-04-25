@@ -50,8 +50,8 @@ export const SimulationInputPanel = () => {
     <aside className="absolute bottom-4 left-4 top-16 z-20 flex w-[min(100%-1rem,22rem)] flex-col overflow-hidden rounded-[34px] border border-white/[0.12] bg-bg-surface/92 shadow-[0_26px_100px_rgba(8,12,20,0.42)]">
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/[0.08] px-5 py-4">
         <div>
-          <h2 className="font-mono text-[11px] uppercase tracking-[0.14em] text-text-secondary">Input</h2>
-          <p className="font-mono text-[9px] text-text-muted mt-1">
+          <h2 className="font-mono text-[11px] uppercase tracking-[0.14em] text-white/90">Input</h2>
+          <p className="font-mono text-[9px] text-white/60 mt-1">
             {def ? <span className="text-pastel-2/90">{def.label}</span> : 'Select a domain from home'}
           </p>
         </div>
@@ -61,7 +61,7 @@ export const SimulationInputPanel = () => {
             setScreen('useCases');
             resetSandbox();
           }}
-          className="shrink-0 font-mono text-[8px] uppercase tracking-wider text-text-muted hover:text-text-secondary"
+          className="shrink-0 font-mono text-[10px] uppercase tracking-wider text-white/80 hover:text-white"
         >
           Home
         </button>
@@ -70,7 +70,7 @@ export const SimulationInputPanel = () => {
       {def && (
         <div className="cortex-scroll min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-5">
           <div className="space-y-1.5">
-            <Label className="font-mono text-[9px] uppercase tracking-wider text-text-muted">Domain</Label>
+            <Label className="font-mono text-[9px] uppercase tracking-wider text-white/85">Domain</Label>
             <Select
               value={useCase ?? undefined}
               onValueChange={(v) => setUseCase(v as UseCaseId)}
@@ -92,7 +92,7 @@ export const SimulationInputPanel = () => {
           <CitySelector value={cityId} onChange={setCityId} disabled={running} />
 
           <div className="space-y-1.5">
-            <Label className="font-mono text-[9px] uppercase tracking-wider text-text-muted">Signal Complexity</Label>
+            <Label className="font-mono text-[9px] uppercase tracking-wider text-white/85">Signal Complexity</Label>
             <Select
               value={messageComplexity === 0 ? "Simple" : messageComplexity === 0.5 ? "Realistic" : "Stress Test"}
               onValueChange={(v) => {

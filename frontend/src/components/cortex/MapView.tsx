@@ -3,7 +3,7 @@ import Map, { type MapRef } from 'react-map-gl';
 import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer, ArcLayer } from '@deck.gl/layers';
 import { getCityById } from '@/data/cities';
-import { generateAgentsForRegion, generateArcs, COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
+import { generateAgentsForCity, generateArcs, COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
 import { AgentInspectionModal } from './AgentInspectionModal';
 import { useCortexStore } from '@/store/cortex';
 import type { AgentSimulationPayload } from '@/types/simulation';
@@ -57,8 +57,8 @@ export const MapView = () => {
   const mapRef = useRef<MapRef>(null);
 
   const baseAgents = useMemo(
-    () => generateAgentsForRegion(c.longitude, c.latitude, city.span, 110),
-    [c.latitude, c.longitude, city.span],
+    () => generateAgentsForCity(city.landZones, 110),
+    [city.landZones],
   );
 
   const hasServerAgents = Object.keys(agentSimulationById).length > 0;
