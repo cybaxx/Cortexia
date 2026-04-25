@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -17,12 +18,16 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 K2_SYSTEM_PROMPT = (
-    "You are the cognitive router for a synthetic agent. "
-    "Analyze the provided Biological State Vector (BSV) and spatial context. "
-    "If defensive_posture > 0.7, reject the catalyst. "
-    "If cognitive_load > 0.8, exhibit confusion. "
-    "Output your reasoning inside <think></think> tags, "
-    "and your final decision as <action>Adopted</action> or <action>Rejected</action>."
+    "You are the cognitive router for one synthetic agent in Cortexia. "
+    "Use the agent profile, Biological State Vector (BSV), and local neighborhood context to decide "
+    "whether the agent adopts or rejects the catalyst message. "
+    "Return four XML-like tags only: "
+    "<think>2-4 concise sentences of reasoning.</think>"
+    "<action>Adopted</action> or <action>Rejected</action>"
+    "<confidence>0.00-1.00</confidence>"
+    "<signal>cognitive_overload|defensive_reactance|empathic_resonance|memory_alignment|social_proof</signal>. "
+    "If defensive posture is high, prefer defensive_reactance. "
+    "If working memory strain or cognitive load is high, prefer cognitive_overload."
 )
 
 
@@ -42,48 +47,160 @@ def _default_bsv() -> BSV:
     }
 
 
+async def call_tribe_modal_batch(
+    httpx_client: httpx.AsyncClient,
+    catalyst_text: str,
+    agents: list[dict],
+) -> dict[str, BSV]:
+    """
+    Call the deployed Modal `extract-batch-bsv` webhook with a text catalyst and agents array
+    and return the biological state vectors tailored for each agent.
+    """
+    if not tribe_modal_deployment_url():
+        logger.warning("TRIBE_MODAL_URL unset; using fallback multi-agent BSVs")
+        results = {}
+        for a in agents:
+            bsv = _default_bsv()
+            bsv["cognitive_load"] = min(1.0, 0.55 + 0.01 * (len(catalyst_text) % 17))
+            results[str(a["id"])] = bsv
+        return results
+
+    url = tribe_modal_deployment_url().rstrip("/")
+    if not url.startswith("http"):
+        url = f"https://{url}"
+    
+    headers: dict[str, str] = {
+        "Content-Type": "application/json"
+    }
+    if settings.tribe_modal_key and settings.tribe_modal_secret:
+        headers["Modal-Key"] = settings.tribe_modal_key
+        headers["Modal-Secret"] = settings.tribe_modal_secret
+    
+    payload = {
+        "catalyst_text": catalyst_text,
+        "agents": agents
+    }
+    
+    try:
+        r = await httpx_client.post(url, json=payload, headers=headers, timeout=120.0)
+        r.raise_for_status()
+        data = r.json()
+        
+        results = {}
+        agents_dict = data.get("agents", {})
+        for aid, adict in agents_dict.items():
+            results[aid] = {
+                "cognitive_load": float(adict["cognitive_load"]),
+                "emotional_agitation": float(adict["emotional_agitation"]),
+                "defensive_posture": float(adict["defensive_posture"]),
+                "working_memory_strain": float(adict["working_memory_strain"]),
+            }
+        return results
+    except Exception:
+        logger.exception("TRIBE Modal call failed; using fallback multi-agent BSV")
+        results = {}
+        for a in agents:
+            results[str(a["id"])] = _default_bsv()
+        return results
+
+
 async def call_tribe_modal(
     httpx_client: httpx.AsyncClient,
     catalyst_text: str,
 ) -> BSV:
     """
-    Call the deployed Modal `extract_bsv` webhook with a text catalyst
-    and return the biological state vector.
+    Legacy single-catalyst BSV baseline: one synthetic agent, same Modal batch endpoint.
+    Kept for docs and any code paths that expect `call_tribe_modal` by name.
     """
-    if not tribe_modal_deployment_url():
-        logger.warning("TRIBE_MODAL_URL unset; using fallback BSV")
-        bsv = _default_bsv()
-        bsv["cognitive_load"] = min(1.0, 0.55 + 0.01 * (len(catalyst_text) % 17))
-        return bsv
+    out = await call_tribe_modal_batch(
+        httpx_client,
+        catalyst_text,
+        [{"id": 0, "role": "baseline", "latitude": 34.0522, "longitude": -118.2437}],
+    )
+    if "0" in out:
+        return out["0"]
+    if out:
+        return next(iter(out.values()))
+    return _default_bsv()
 
-    url = tribe_modal_deployment_url().rstrip("/")
-    if not url.startswith("http"):
-        url = f"https://{url}"
-    # Modal web endpoints: POST with multipart "file" field (see modal_app.TribeExtractor).
-    files = {
-        "file": (
-            "catalyst.txt",
-            catalyst_text.encode("utf-8"),
-            "text/plain",
+
+def _k2_response_body_to_object(r: httpx.Response) -> Any:
+    """
+    Parse K2 (OpenAI-compatible) response: full JSON, or text/event-stream with `data: {...}` lines.
+    `response.json()` fails on empty body, HTML errors, or SSE — this handles those cases.
+    """
+    raw = r.text or ""
+    stripped = raw.strip()
+    status = r.status_code
+    ct = (r.headers.get("content-type") or "").lower()
+
+    if not stripped:
+        raise ValueError(
+            f"K2 API empty response body (http {status}, content-type={ct!r})"
         )
-    }
-    headers: dict[str, str] = {}
-    if settings.tribe_modal_key and settings.tribe_modal_secret:
-        headers["Modal-Key"] = settings.tribe_modal_key
-        headers["Modal-Secret"] = settings.tribe_modal_secret
+
+    if "text/event-stream" in ct or stripped.startswith("data:"):
+        last_full: Any = None
+        delta_parts: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            last_full = chunk
+            # OpenAI-style streaming: choices[0].delta.content
+            if isinstance(chunk, dict) and chunk.get("choices"):
+                c0 = chunk["choices"][0] if chunk["choices"] else {}
+                if isinstance(c0, dict) and "delta" in c0:
+                    d = c0.get("delta") or {}
+                    if isinstance(d, dict) and isinstance(d.get("content"), str):
+                        delta_parts.append(d["content"])
+        if delta_parts:
+            merged = {
+                "choices": [
+                    {"message": {"content": "".join(delta_parts), "role": "assistant"}}
+                ]
+            }
+            return merged
+        if last_full is not None:
+            return last_full
+        raise ValueError(
+            f"K2 API SSE: no parseable data: lines (http {status}, head={raw[:500]!r})"
+        )
+
     try:
-        r = await httpx_client.post(url, files=files, headers=headers, timeout=120.0)
-        r.raise_for_status()
-        data = r.json()
-        return {
-            "cognitive_load": float(data["cognitive_load"]),
-            "emotional_agitation": float(data["emotional_agitation"]),
-            "defensive_posture": float(data["defensive_posture"]),
-            "working_memory_strain": float(data["working_memory_strain"]),
-        }
-    except Exception:
-        logger.exception("TRIBE Modal call failed; using fallback BSV")
-        return _default_bsv()
+        return json.loads(stripped)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"K2 API returned non-JSON (http {status}): {stripped[:500]!r}"
+        ) from e
+
+
+def _openai_style_assistant_text(out: Any) -> str:
+    """Extract assistant text from an OpenAI-style chat completion JSON object."""
+    if isinstance(out, str) and out.strip():
+        return out
+    if not isinstance(out, dict):
+        return str(out) if out is not None else ""
+    for key in ("output", "text", "response"):
+        v = out.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    choices = out.get("choices")
+    if isinstance(choices, list) and choices:
+        ch0 = choices[0] or {}
+        msg = ch0.get("message")
+        if isinstance(msg, dict) and "content" in msg:
+            return str(msg.get("content") or "")
+        if "text" in ch0:
+            return str(ch0.get("text") or "")
+    return ""
 
 
 def _k2_user_block(
@@ -115,32 +232,44 @@ async def call_k2_think(
     total_neighbors_in_radius: int,
     catalyst_text: str,
 ) -> str:
-    """IFM K2 Think — returns raw model text for downstream parsing."""
-    if not settings.ifm_api_url.strip():
-        logger.warning("IFM_API_URL unset; using deterministic mock K2 output")
+    """K2 Think (api.k2think.ai) — returns raw model text for downstream parsing."""
+    if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
+        logger.warning("IFM_API_KEY (or K2_THINK_API_KEY) or IFM_API_URL unset; using deterministic mock K2 output")
         dp = bsv.get("defensive_posture", 0.0)
         cl = bsv.get("cognitive_load", 0.0)
+        wm = bsv.get("working_memory_strain", 0.0)
         if dp > 0.7:
             action = "Rejected"
-            think = "defensive_posture is elevated; rejecting catalyst."
-        elif cl > 0.8:
+            think = "Threat processing dominates. The message lands as pressure rather than support."
+            confidence = 0.82
+            signal = "defensive_reactance"
+        elif cl > 0.8 or wm > 0.78:
             action = "Rejected"
-            think = "cognitive load very high; confused and defaulting to reject."
+            think = "Working memory is saturated. The message asks for too much integration at once."
+            confidence = 0.74
+            signal = "cognitive_overload"
         else:
             action = "Adopted" if adopted_neighbor_count >= 1 else "Rejected"
-            think = "weighing BSV and neighborhood adoption signal."
+            think = "Neighborhood signal reduces uncertainty and the message feels locally legible."
+            confidence = 0.63 if action == "Adopted" else 0.57
+            signal = "social_proof" if adopted_neighbor_count >= 1 else "memory_alignment"
         return (
-            f"<think>{think}</think> "
+            f"<think>{think}</think>"
             f"<action>{action}</action>"
+            f"<confidence>{confidence:.2f}</confidence>"
+            f"<signal>{signal}</signal>"
         )
 
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if settings.ifm_api_key:
-        headers["Authorization"] = f"Bearer {settings.ifm_api_key}"
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+    }
 
-    # Generic JSON body compatible with many chat-style APIs; adjust to IFM contract.
+    # OpenAI-compatible chat completions (K2 Think docs: api.k2think.ai)
     payload: dict[str, Any] = {
-        "model": "ifm-k2-think",
+        "model": settings.ifm_k2_model,
+        "stream": False,
         "messages": [
             {"role": "system", "content": K2_SYSTEM_PROMPT},
             {
@@ -163,20 +292,13 @@ async def call_k2_think(
         timeout=120.0,
     )
     r.raise_for_status()
-    out = r.json()
-    if isinstance(out, str):
-        return out
-    for key in ("output", "text", "response", "message"):
-        if key in out and isinstance(out[key], str):
-            return out[key]
-    # Some APIs return openai-style choices
-    choices = out.get("choices")
-    if choices and isinstance(choices, list):
-        ch0 = choices[0] or {}
-        msg = ch0.get("message") or {}
-        if "content" in msg:
-            return str(msg["content"])
-    return r.text
+    out = _k2_response_body_to_object(r)
+    text = _openai_style_assistant_text(out)
+    if not text.strip():
+        raise ValueError(
+            f"K2 API returned no assistant content; keys={list(out.keys()) if isinstance(out, dict) else type(out)}"
+        )
+    return text
 
 
 async def call_elevenlabs(

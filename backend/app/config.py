@@ -3,15 +3,10 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
-
-
-def _default_database_url() -> str:
-    p = _BACKEND_DIR / "cortexia.db"
-    return f"sqlite+aiosqlite:///{p.as_posix()}"
 
 
 class Settings(BaseSettings):
@@ -21,20 +16,19 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # SQLite
-    database_url: str = Field(
-        default_factory=_default_database_url,
-        description="Async SQLAlchemy URL",
-    )
-
-    # IFM K2 Think
+    # K2 Think (OpenAI-compatible): https://api.k2think.ai/v1/chat/completions
     ifm_api_url: str = Field(
-        default="",
-        description="Full HTTP URL for K2 Think API",
+        default="https://api.k2think.ai/v1/chat/completions",
+        description="K2 chat-completions URL (set empty to force local mock K2).",
+    )
+    ifm_k2_model: str = Field(
+        default="MBZUAI-IFM/K2-Think-v2",
+        description="Model id in the K2 request body.",
     )
     ifm_api_key: str = Field(
         default="",
-        description="Optional bearer/API key for IFM",
+        description="Bearer token for api.k2think.ai (or IFM).",
+        validation_alias=AliasChoices("ifm_api_key", "IFM_API_KEY", "K2_THINK_API_KEY", "k2_think_api_key"),
     )
 
     # ElevenLabs
@@ -54,6 +48,20 @@ class Settings(BaseSettings):
     tribe_modal_secret: str = Field(
         default="",
         description="Modal-Secret header (token secret) for protected web endpoints",
+    )
+
+    # One-shot HTTP simulation (Modal + K2)
+    simulate_population_size: int = Field(
+        default=110,
+        ge=24,
+        le=220,
+        description="Synthetic agent count generated for each /api/simulate request.",
+    )
+    simulate_k2_concurrency: int = Field(
+        default=10,
+        ge=1,
+        le=32,
+        description="Concurrent per-agent K2 calls during /api/simulate.",
     )
 
     # CORS

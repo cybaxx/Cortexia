@@ -1,15 +1,9 @@
 import { create } from 'zustand';
 import type { UseCaseId } from '@/data/useCases';
 import { getUseCase } from '@/data/useCases';
-import { getCityById } from '@/data/cities';
 import type { Agent } from '@/lib/agents';
-import {
-  buildPropagationReport,
-  buildMemoDiff,
-  type PropagationReport,
-  type RejectionHotspot,
-  type MemoDiffSummary,
-} from '@/lib/propagationReport';
+import { postSimulate } from '@/lib/api/simulate';
+import type { AgentSimulationPayload, MacroResult, ReportHotspot } from '@/types/simulation';
 
 export type Screen = 'useCases' | 'simulation';
 export type InjectPhase = 'idle' | 'initializing' | 'propagating' | 'report' | 'complete';
@@ -21,13 +15,6 @@ export interface SimulationMetrics {
   spatialTension: 'Low' | 'Moderate' | 'High';
 }
 
-export interface MemoRunSnapshot {
-  memo: 'A' | 'B';
-  metrics: SimulationMetrics;
-  report: PropagationReport;
-  completedAt: number;
-}
-
 export type AgentParamPatch = Partial<
   Pick<Agent, 'cognitiveLoad' | 'emotionalAgitation' | 'defensivePosture' | 'state'>
 >;
@@ -36,48 +23,49 @@ interface CortexState {
   screen: Screen;
   useCase: UseCaseId | null;
   cityId: string;
-  /** User-authored catalysts (not preloaded) */
-  catalystA: string;
-  catalystB: string;
+  catalystText: string;
   sourceUrl: string;
+  /** 0..1 scales how much the model perturbs TRIBE BSV per agent */
+  messageComplexity: number;
   status: 'idle' | 'running';
-  selectedMemo: 'A' | 'B' | null;
   injectPhase: InjectPhase;
-  currentReport: PropagationReport | null;
-  rejectionHotspots: RejectionHotspot[];
-  memoAResult: MemoRunSnapshot | null;
-  memoBResult: MemoRunSnapshot | null;
-  memoDiff: MemoDiffSummary | null;
+  rejectionHotspots: ReportHotspot[];
+  apiError: string | null;
   metrics: SimulationMetrics;
   agentOverrides: Record<number, AgentParamPatch>;
+  /** Latest server payload per agent id (TRIBE + K2). */
+  agentSimulationById: Record<number, AgentSimulationPayload>;
+  macroResult: MacroResult | null;
 
   setScreen: (s: Screen) => void;
   setUseCase: (id: UseCaseId | null) => void;
   setCityId: (id: string) => void;
-  setCatalystA: (t: string) => void;
-  setCatalystB: (t: string) => void;
+  setCatalystText: (t: string) => void;
   setSourceUrl: (t: string) => void;
-  setMemo: (m: 'A' | 'B' | null) => void;
+  setMessageComplexity: (n: number) => void;
   setStatus: (s: 'idle' | 'running') => void;
   setInjectPhase: (p: InjectPhase) => void;
   patchAgent: (id: number, partial: AgentParamPatch) => void;
-  startInject: () => void;
+  runSimulation: () => Promise<void>;
   resetSandbox: () => void;
   reportTitle: () => string;
+  getAgentPayload: (id: number) => AgentSimulationPayload | undefined;
 }
 
-function metricsFromReport(r: PropagationReport, useCase: UseCaseId | null): SimulationMetrics {
-  const def = getUseCase(useCase);
-  const baseLoad = 0.42 + (r.adoptionRate / 200) * (def?.id === 'corporate' ? 1.1 : 1);
-  const load = Math.min(0.95, baseLoad + (r.benchmarkComparison === 'below' ? 0.12 : 0.04));
-  const sumShare = r.rejectionHotspots.reduce((a, h) => a + h.share, 0);
-  const tension: 'Low' | 'Moderate' | 'High' =
-    sumShare > 0.5 ? 'High' : sumShare > 0.25 ? 'Moderate' : 'Low';
+function metricsFromPayload(
+  agents: AgentSimulationPayload[],
+  summary: { total: number; adopted: number },
+  hotspots: ReportHotspot[],
+): SimulationMetrics {
+  const avgLoad =
+    agents.reduce((total, agent) => total + agent.tribe_neurological_metrics.cognitive_load, 0) /
+    Math.max(1, agents.length);
+  const hotspotShare = hotspots.reduce((total, hotspot) => total + hotspot.share, 0);
   return {
-    populationReached: r.reachPct,
-    avgCognitiveLoad: Math.round(load * 100) / 100,
-    beliefAdoptionRate: r.adoptionRate,
-    spatialTension: tension,
+    populationReached: Math.round((agents.filter((agent) => agent.belief_state !== 'neutral').length / Math.max(1, summary.total)) * 100),
+    avgCognitiveLoad: Math.round(avgLoad * 100) / 100,
+    beliefAdoptionRate: Math.round((summary.adopted / Math.max(1, summary.total)) * 100),
+    spatialTension: hotspotShare > 0.48 ? 'High' : hotspotShare > 0.22 ? 'Moderate' : 'Low',
   };
 }
 
@@ -87,17 +75,13 @@ export const useCortexStore = create<CortexState>((set, get) => ({
   screen: 'useCases',
   useCase: null,
   cityId: 'la',
-  catalystA: '',
-  catalystB: '',
+  catalystText: '',
   sourceUrl: '',
+  messageComplexity: 0.5,
   status: 'idle',
-  selectedMemo: 'A',
   injectPhase: 'idle',
-  currentReport: null,
   rejectionHotspots: [],
-  memoAResult: null,
-  memoBResult: null,
-  memoDiff: null,
+  apiError: null,
   metrics: {
     populationReached: 0,
     avgCognitiveLoad: 0,
@@ -105,22 +89,22 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     spatialTension: 'Low',
   },
   agentOverrides: {},
+  agentSimulationById: {},
+  macroResult: null,
 
   setScreen: (screen) => set({ screen }),
   setUseCase: (useCase) =>
     set({
       useCase,
-      memoAResult: null,
-      memoBResult: null,
-      memoDiff: null,
-      currentReport: null,
       rejectionHotspots: [],
+      apiError: null,
+      agentSimulationById: {},
+      macroResult: null,
     }),
   setCityId: (cityId) => set({ cityId }),
-  setCatalystA: (catalystA) => set({ catalystA }),
-  setCatalystB: (catalystB) => set({ catalystB }),
+  setCatalystText: (catalystText) => set({ catalystText }),
   setSourceUrl: (sourceUrl) => set({ sourceUrl }),
-  setMemo: (selectedMemo) => set({ selectedMemo }),
+  setMessageComplexity: (messageComplexity) => set({ messageComplexity }),
   setStatus: (status) => set({ status }),
   setInjectPhase: (injectPhase) => set({ injectPhase }),
 
@@ -129,71 +113,87 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       agentOverrides: { ...s.agentOverrides, [id]: { ...s.agentOverrides[id], ...partial } },
     })),
 
+  getAgentPayload: (id) => get().agentSimulationById[id],
+
   reportTitle: () => {
     const { useCase } = get();
     const u = getUseCase(useCase);
     return u ? `Cortexia — ${u.label}` : 'Cortexia — Propagation Report';
   },
 
-  startInject: async () => {
-    const { useCase, selectedMemo, catalystA, catalystB, cityId } = get();
-    if (!useCase || !selectedMemo) return;
-    const ph = get().injectPhase;
-    if (ph !== 'idle' && ph !== 'complete') return;
-    const text = selectedMemo === 'A' ? catalystA : catalystB;
-    if (text.trim().length < 12) return;
+  runSimulation: async () => {
+    const { useCase, catalystText, cityId, sourceUrl, messageComplexity, injectPhase } = get();
+    if (!useCase) return;
+    if (injectPhase !== 'idle' && injectPhase !== 'complete') return;
+    const text = catalystText.trim();
+    if (text.length < 12) return;
 
-    set({ injectPhase: 'initializing', status: 'running', rejectionHotspots: [], currentReport: null, memoDiff: null });
+    set({
+      injectPhase: 'initializing',
+      status: 'running',
+      rejectionHotspots: [],
+      apiError: null,
+      macroResult: null,
+    });
 
-    await sleep(1500);
-    if (get().screen !== 'simulation') return;
-    set({ injectPhase: 'propagating' });
+    try {
+      const res = await postSimulate({
+        catalyst_text: text,
+        source_url: sourceUrl.trim() || null,
+        city_id: cityId,
+        use_case: useCase,
+        message_complexity: messageComplexity,
+      });
 
-    await sleep(2800);
-    if (get().screen !== 'simulation') return;
+      if (get().screen !== 'simulation') return;
 
-    const city = getCityById(cityId);
-    const report = buildPropagationReport(useCase, selectedMemo, text, city.center);
-    const hotspots = report.rejectionHotspots;
-    const metrics = metricsFromReport(report, useCase);
-    const snap: MemoRunSnapshot = {
-      memo: selectedMemo,
-      metrics,
-      report,
-      completedAt: Date.now(),
-    };
+      const byId: Record<number, AgentSimulationPayload> = {};
+      for (const a of res.agents) {
+        byId[a.id] = a;
+      }
+      set({
+        injectPhase: 'propagating',
+        agentSimulationById: byId,
+        macroResult: res.macro_result,
+        rejectionHotspots: res.macro_result.hotspots,
+      });
 
-    set({ injectPhase: 'report', currentReport: report, rejectionHotspots: hotspots, metrics });
+      await sleep(1500); // Live reaction wave
+      if (get().screen !== 'simulation') return;
 
-    if (selectedMemo === 'A') {
-      set({ memoAResult: snap });
-    } else {
-      set({ memoBResult: snap });
+      const metrics = metricsFromPayload(res.agents, res.summary, res.macro_result.hotspots);
+      set({
+        injectPhase: 'report',
+        metrics,
+      });
+
+      await sleep(400);
+      set({ injectPhase: 'complete', status: 'idle' });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Simulation request failed';
+      set({
+        injectPhase: 'complete',
+        status: 'idle',
+        agentSimulationById: {},
+        apiError: msg,
+        rejectionHotspots: [],
+        macroResult: null,
+      });
     }
-
-    const a = get().memoAResult;
-    const b = get().memoBResult;
-    if (a && b) {
-      set({ memoDiff: buildMemoDiff(useCase, a.report.adoptionRate, b.report.adoptionRate) });
-    }
-
-    await sleep(500);
-    set({ injectPhase: 'complete', status: 'idle' });
   },
 
   resetSandbox: () =>
     set({
       injectPhase: 'idle',
       status: 'idle',
-      currentReport: null,
       rejectionHotspots: [],
-      memoAResult: null,
-      memoBResult: null,
-      memoDiff: null,
+      apiError: null,
       agentOverrides: {},
-      catalystA: '',
-      catalystB: '',
+      agentSimulationById: {},
+      macroResult: null,
+      catalystText: '',
       sourceUrl: '',
+      messageComplexity: 0.5,
       metrics: {
         populationReached: 0,
         avgCognitiveLoad: 0,

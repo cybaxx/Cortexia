@@ -26,7 +26,7 @@ export const TopBar = () => {
         : 'Ready';
 
   return (
-    <header className="absolute top-0 left-0 right-0 h-12 bg-bg-surface border-b border-white/[0.08] flex items-center justify-between px-4 z-30">
+    <header className="absolute left-4 right-4 top-4 z-30 flex h-12 items-center justify-between rounded-full border border-white/[0.1] bg-bg-surface/[0.88] px-5 shadow-[0_14px_50px_rgba(7,11,18,0.28)] backdrop-blur-xl">
       <div className="flex items-center gap-3 min-w-0">
         <span className="text-text-primary text-[14px] font-medium tracking-tight shrink-0">Cortexia</span>
         <span className="h-4 w-px bg-white/10 shrink-0" />
@@ -40,7 +40,7 @@ export const TopBar = () => {
           className={`h-1.5 w-1.5 rounded-full ${
             status === 'running' || ['initializing', 'propagating', 'report'].includes(phase)
               ? 'bg-accent-adopt animate-pulse'
-              : 'bg-emerald-500/80'
+              : 'bg-pastel-1/[0.85]'
           }`}
         />
         <span className="font-mono text-[10px] text-text-secondary uppercase tracking-wider hidden sm:inline">

@@ -3,15 +3,35 @@ import Map, { type MapRef } from 'react-map-gl';
 import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer, ArcLayer } from '@deck.gl/layers';
 import { getCityById } from '@/data/cities';
-import { generateAgentsForRegion, generateArcs, COLORS, type Agent } from '@/lib/agents';
-import { AgentPopup } from './AgentPopup';
+import { generateAgentsForRegion, generateArcs, COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
+import { AgentInspectionModal } from './AgentInspectionModal';
 import { useCortexStore } from '@/store/cortex';
+import type { AgentSimulationPayload } from '@/types/simulation';
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string | undefined;
 
 function mergeAgent(base: Agent, o?: Partial<Agent>): Agent {
   if (!o) return base;
   return { ...base, ...o, position: base.position };
+}
+
+function applyPayload(base: Agent, p: AgentSimulationPayload | undefined, o?: Partial<Agent>): Agent {
+  const m = p?.tribe_neurological_metrics;
+  const pos: [number, number] = p
+    ? [p.longitude, p.latitude]
+    : base.position;
+  const st = p ? beliefToAgentState(p.belief_state) : base.state;
+  return mergeAgent(
+    {
+      ...base,
+      position: pos,
+      state: st,
+      cognitiveLoad: m ? m.cognitive_load : base.cognitiveLoad,
+      emotionalAgitation: m ? m.emotional_friction : base.emotionalAgitation,
+      defensivePosture: m ? m.defensive_activation : base.defensivePosture,
+    },
+    o,
+  );
 }
 
 const INITIAL_ZOOM = 2.5;
@@ -21,6 +41,7 @@ export const MapView = () => {
   const overrides = useCortexStore((s) => s.agentOverrides);
   const rejectPhase = useCortexStore((s) => s.injectPhase);
   const hotspots = useCortexStore((s) => s.rejectionHotspots);
+  const agentSimulationById = useCortexStore((s) => s.agentSimulationById);
 
   const city = getCityById(cityId);
   const c = city.center;
@@ -40,9 +61,15 @@ export const MapView = () => {
     [c.latitude, c.longitude, city.span],
   );
 
+  const hasServerAgents = Object.keys(agentSimulationById).length > 0;
+
   const agents = useMemo(
-    () => baseAgents.map((a) => mergeAgent(a, overrides[a.id])),
-    [baseAgents, overrides],
+    () =>
+      baseAgents.map((a) => {
+        const p = agentSimulationById[a.id];
+        return applyPayload(a, p, overrides[a.id]);
+      }),
+    [baseAgents, agentSimulationById, overrides],
   );
 
   const arcs = useMemo(() => generateArcs(agents, 40), [agents]);
@@ -91,7 +118,7 @@ export const MapView = () => {
           getPosition: (d) => [d.lng, d.lat],
           getRadius: (d) => d.radiusMeters,
           radiusUnits: 'meters',
-          getFillColor: [232, 140, 125, 75],
+          getFillColor: [255, 191, 166, 88],
           stroked: false,
           pickable: false,
         })
@@ -103,9 +130,9 @@ export const MapView = () => {
       data: arcs,
       getSourcePosition: (d) => d.source,
       getTargetPosition: (d) => d.target,
-      getSourceColor: [232, 180, 140, showStrain ? 170 : 100],
-      getTargetColor: [160, 190, 235, showStrain ? 165 : 95],
-      getWidth: showStrain ? 1.5 : 1.1,
+      getSourceColor: [188, 231, 219, hasServerAgents && showStrain ? 46 : 18],
+      getTargetColor: [160, 214, 255, hasServerAgents && showStrain ? 46 : 18],
+      getWidth: showStrain && hasServerAgents ? 0.8 : 0.4,
       greatCircle: false,
     }),
     ...(rejectLayer ? [rejectLayer] : []),
@@ -125,20 +152,24 @@ export const MapView = () => {
     }),
   ];
 
+  const payloadForPin = useMemo(
+    () => (pinned ? agentSimulationById[pinned.agent.id] : undefined),
+    [pinned, agentSimulationById],
+  );
+
   const mergedPopupAgent = useMemo(() => {
     if (!pinned) return null;
-    return mergeAgent(
-      baseAgents.find((a) => a.id === pinned.agent.id) || pinned.agent,
-      overrides[pinned.agent.id],
-    );
-  }, [pinned, baseAgents, overrides]);
+    const p = agentSimulationById[pinned.agent.id];
+    const base = baseAgents.find((a) => a.id === pinned.agent.id) || pinned.agent;
+    return applyPayload(base, p, overrides[pinned.agent.id]);
+  }, [pinned, baseAgents, agentSimulationById, overrides]);
 
   return (
     <div className="absolute inset-0 bg-bg-deep">
       {!MAPBOX_TOKEN && (
         <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
-          <div className="font-mono text-[10px] text-text-secondary bg-bg-surface/90 border border-white/[0.08] px-3 py-2 rounded-sm">
-            Set <span className="text-accent-adopt">VITE_MAPBOX_TOKEN</span> in <code className="text-text-primary">frontend/.env</code> to load the basemap.
+          <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-3 py-2 font-mono text-[10px] text-text-secondary">
+            Set <span className="text-pastel-2/90">VITE_MAPBOX_TOKEN</span> in <code className="text-text-primary">frontend/.env</code> to load the basemap.
           </div>
         </div>
       )}
@@ -161,18 +192,19 @@ export const MapView = () => {
       </DeckGL>
 
       {mergedPopupAgent && pinned && (
-        <AgentPopup
+        <AgentInspectionModal
           agent={mergedPopupAgent}
           x={pinned.x}
           y={pinned.y}
           onClose={() => setPinned(null)}
+          payload={payloadForPin}
         />
       )}
 
-      {showStrain && (
+      {hasServerAgents && showStrain && (
         <div className="pointer-events-none absolute bottom-10 left-1/2 -translate-x-1/2 z-10 max-w-sm text-center">
-          <p className="font-mono text-[9px] text-rose-200/80 bg-bg-deep/85 border border-rose-500/15 rounded-sm px-2 py-1">
-            Red regions: modelled resistance clusters. Click an agent to tune parameters and view the brain sim.
+          <p className="rounded-full border border-pastel-3/20 bg-bg-deep/[0.85] px-3 py-1.5 font-mono text-[9px] text-pastel-3/90 shadow-lg">
+            Node color reflects modelled belief state. Click a node to inspect K2 and TRIBE fields.
           </p>
         </div>
       )}
@@ -181,7 +213,7 @@ export const MapView = () => {
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            'radial-gradient(ellipse at center, transparent 55%, rgba(11,15,25,0.55) 100%)',
+            'radial-gradient(circle at 50% 45%, rgba(255,255,255,0.02) 0%, rgba(9,14,22,0.06) 42%, rgba(7,11,18,0.58) 100%)',
         }}
       />
     </div>

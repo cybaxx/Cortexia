@@ -52,6 +52,7 @@ export function buildPropagationReport(
   memo: 'A' | 'B',
   catalystText: string,
   cityCenter: { longitude: number; latitude: number },
+  options?: { adoptionRateOverride?: number },
 ): PropagationReport {
   const def = getUseCase(useCase)!;
   const b = def.adoptionBenchmark;
@@ -61,7 +62,10 @@ export function buildPropagationReport(
 
   // Memo A is slightly “friendlier” for adoption in our toy model, except for health where B can spike fear adoption in segments — keep simple: A = higher base adoption
   const baseAdopt = memo === 'A' ? 0.22 + r(1) * 0.28 : 0.12 + r(2) * 0.22;
-  const adoptionPct = Math.round(baseAdopt * 100);
+  const adoptionPct =
+    options?.adoptionRateOverride !== undefined
+      ? Math.max(0, Math.min(100, Math.round(options.adoptionRateOverride)))
+      : Math.round(baseAdopt * 100);
   const reachPct = Math.min(98, 55 + Math.round((r(3) * 0.35 + (memo === 'A' ? 0.1 : 0.05)) * 100));
   const diff = adoptionPct - b;
   let benchmarkComparison: 'above' | 'below' | 'at' = 'at';
@@ -207,7 +211,7 @@ export function buildMemoDiff(
     public_health: {
       line: 'Autonomy and access language vs mandate-first sequencing',
       detail:
-        'Where Memo A led with clinic access, adoption followed evening-shift cohorts. Memo B’s penalty language created identity-threat clustering in the Gateway cities and South LA that did not appear in the A run.',
+        'Where Memo A led with clinic access, adoption followed evening-shift segments. Memo B’s penalty language created identity-threat clustering in the Gateway cities and South LA that did not appear in the A run.',
     },
     urban: {
       line: 'Co-benefit and mitigation front-loading vs preemption',

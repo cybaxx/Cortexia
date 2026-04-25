@@ -1,1 +1,1 @@
-"""Application services (AI, simulation, websockets)."""
+"""Application services (AI integrations and independent-agent simulation)."""

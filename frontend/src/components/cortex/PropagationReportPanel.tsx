@@ -1,153 +1,115 @@
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, motion } from 'framer-motion';
 import { useCortexStore } from '@/store/cortex';
-import { getUseCase } from '@/data/useCases';
-import { exportPropagationPdf } from '@/lib/exportPdf';
-import { MemoDiffView } from './MemoDiffView';
-import { Loader2, FileDown } from 'lucide-react';
 
 export const PropagationReportPanel = () => {
-  const useCase = useCortexStore((s) => s.useCase);
   const injectPhase = useCortexStore((s) => s.injectPhase);
-  const currentReport = useCortexStore((s) => s.currentReport);
-  const selectedMemo = useCortexStore((s) => s.selectedMemo);
-  const memoAResult = useCortexStore((s) => s.memoAResult);
-  const memoBResult = useCortexStore((s) => s.memoBResult);
-  const memoDiff = useCortexStore((s) => s.memoDiff);
-  const def = getUseCase(useCase);
+  const macroResult = useCortexStore((s) => s.macroResult);
 
-  const canExport = currentReport && injectPhase === 'complete' && def && selectedMemo;
-  const showReport = currentReport && (injectPhase === 'report' || injectPhase === 'complete');
-  const showShimmer = injectPhase === 'initializing' || injectPhase === 'propagating';
+  const showReport = macroResult && (injectPhase === 'report' || injectPhase === 'complete');
 
   return (
-    <aside className="absolute top-12 right-0 bottom-0 w-[min(100%,400px)] max-w-[100vw] bg-bg-surface border-l border-white/[0.08] z-20 flex flex-col shadow-[-4px_0_24px_rgba(0,0,0,0.25)]">
-      <div className="px-4 py-3 border-b border-white/[0.08] flex items-start justify-between gap-2">
-        <div>
-          <h2 className="font-mono text-[11px] uppercase tracking-[0.14em] text-text-secondary">Propagation report</h2>
-          <p className="font-mono text-[9px] text-text-muted mt-0.5">Fills in as the run completes · stakeholder-ready</p>
-        </div>
-        {canExport && currentReport && selectedMemo && (
-          <button
-            type="button"
-            onClick={() =>
-              exportPropagationPdf({
-                title: def!.label,
-                subtitle: def!.benchmarkLabel,
-                report: currentReport,
-                memoLabel: selectedMemo,
-              })
-            }
-            className="shrink-0 flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-wider text-accent-adopt border border-accent-adopt/35 rounded-sm px-2 py-1.5 hover:bg-accent-adopt/10 transition-colors"
+    <AnimatePresence>
+      {showReport && (
+        <aside className="absolute bottom-4 right-4 top-16 z-20 w-[min(96vw,34rem)]">
+          <motion.div
+            initial={{ x: 42, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 42, opacity: 0 }}
+            transition={{ duration: 0.35, ease: 'easeOut' }}
+            className="flex h-full flex-col overflow-hidden rounded-[34px] border border-white/[0.12] bg-[linear-gradient(180deg,rgba(21,30,40,0.95),rgba(13,18,27,0.98))] shadow-[0_28px_120px_rgba(8,12,20,0.48)]"
           >
-            <FileDown className="h-3.5 w-3.5" />
-            Export PDF
-          </button>
-        )}
-      </div>
-
-      <div className="flex-1 overflow-y-auto cortex-scroll px-4 py-3 space-y-5">
-        {showShimmer && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-text-muted font-mono text-[10px]">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {injectPhase === 'initializing' && 'Synthesizing reach surfaces…'}
-              {injectPhase === 'propagating' && 'Mapping rejection clusters and cognitive load…'}
-            </div>
-            <div className="h-2 bg-white/[0.06] rounded-full overflow-hidden">
-              <motion.div
-                className="h-full bg-accent-adopt/50"
-                initial={{ width: '12%' }}
-                animate={{ width: injectPhase === 'propagating' ? '88%' : '40%' }}
-                transition={{ duration: 2.2, ease: 'easeInOut' }}
-              />
-            </div>
-            <p className="text-[11px] text-text-secondary/90 leading-relaxed">
-              The report below will update section-by-section. We preserve the map animation; this panel turns into
-              the deliverable narrative.
-            </p>
-          </div>
-        )}
-
-        <AnimatePresence mode="wait">
-          {showReport && currentReport && (
-            <motion.div
-              key={currentReport.adoptionRate + (def?.id ?? '')}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="space-y-5"
-            >
-              <section>
-                <h3 className="font-mono text-[9px] uppercase tracking-[0.16em] text-text-muted mb-2">Overall reach & adoption</h3>
-                <p className="text-[12px] text-text-primary leading-relaxed">
-                  <span className="text-accent-adopt font-medium">{currentReport.reachPct}%</span> surface reach.{' '}
-                  <span className="text-text-primary font-medium">{currentReport.adoptionRate}%</span> belief adoption
-                  {currentReport.benchmarkComparison === 'above' && (
-                    <span className="text-emerald-400/90"> — above </span>
+            <div className="flex-1 overflow-y-auto px-6 pb-8 pt-6 cortex-scroll">
+              <div className="border-b border-white/10 pb-6">
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">Independent run report</div>
+                <div className="mt-4 flex items-end gap-4">
+                  <div className="text-7xl font-semibold tracking-[-0.06em] text-text-primary">{macroResult.score}</div>
+                  <div className="pb-2 text-text-secondary">
+                    <div className="text-sm uppercase tracking-[0.12em] text-text-muted">Message score</div>
+                    <div className="mt-1 rounded-full border border-white/10 bg-white/[0.06] px-3 py-1.5 text-sm font-medium text-text-primary">
+                      {macroResult.risk_level}
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-4 text-sm leading-relaxed text-text-secondary">{macroResult.summary_text}</p>
+                <div className="mt-4 rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Input used</div>
+                  <p className="mt-2 text-sm leading-relaxed text-text-primary">{macroResult.input_summary}</p>
+                  {macroResult.source_context_summary && (
+                    <p className="mt-3 text-sm leading-relaxed text-text-secondary">
+                      Source context: {macroResult.source_context_summary}
+                    </p>
                   )}
-                  {currentReport.benchmarkComparison === 'below' && (
-                    <span className="text-amber-400/90"> — below </span>
+                  {macroResult.source_warning && (
+                    <p className="mt-3 text-xs uppercase tracking-[0.12em] text-pastel-3">
+                      {macroResult.source_warning}
+                    </p>
                   )}
-                  {currentReport.benchmarkComparison === 'at' && <span> — at </span>}
-                  the <span className="text-text-secondary">{currentReport.benchmark}%</span> benchmark for{' '}
-                  {def?.label.toLowerCase() ?? 'this use case'}.
-                </p>
-                <p className="text-[10px] text-text-muted mt-1.5 leading-snug border-l border-white/[0.1] pl-2">
-                  {def?.benchmarkLabel}
-                </p>
+                </div>
+              </div>
+
+              <div className="mt-6 grid grid-cols-3 gap-3">
+                <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Adopted</div>
+                  <div className="mt-2 text-3xl font-semibold text-pastel-2">{macroResult.sentiment_mix.adopted}</div>
+                </div>
+                <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Rejected</div>
+                  <div className="mt-2 text-3xl font-semibold text-pastel-3">{macroResult.sentiment_mix.rejected}</div>
+                </div>
+                <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Neutral</div>
+                  <div className="mt-2 text-3xl font-semibold text-pastel-1">{macroResult.sentiment_mix.neutral}</div>
+                </div>
+              </div>
+
+              <section className="mt-7">
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">Where resistance clusters</div>
+                <div className="mt-3 space-y-3">
+                  {macroResult.hotspots.length === 0 ? (
+                    <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4 text-sm text-text-secondary">
+                      No meaningful rejection hotspot formed in this run.
+                    </div>
+                  ) : (
+                    macroResult.hotspots.map((hotspot) => (
+                      <div key={hotspot.id} className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-text-primary">{hotspot.label}</div>
+                            <div className="mt-1 text-xs text-text-muted">{hotspot.area}</div>
+                          </div>
+                          <div className="rounded-full bg-pastel-3/15 px-3 py-1 text-xs font-medium text-pastel-3">
+                            {Math.round(hotspot.share * 100)}% of rejections
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </section>
 
-              <section>
-                <h3 className="font-mono text-[9px] uppercase tracking-[0.16em] text-text-muted mb-2">Where it&apos;s rejected</h3>
-                <p className="text-[11px] text-text-secondary mb-2 leading-relaxed">
-                  Hotspots (see <span className="text-rose-400/90">red wash</span> on the map) are clusters where the message meets elevated defensive posture. Highest strain:
-                </p>
-                <ul className="space-y-1.5">
-                  {currentReport.rejectionHotspots.map((h) => (
-                    <li
-                      key={h.id}
-                      className="text-[11px] text-text-primary/95 bg-bg-elevated/60 border border-white/[0.06] rounded-sm px-2 py-1.5"
-                    >
-                      <span className="text-rose-300/90 font-medium">{h.label}</span>
-                      <span className="text-text-muted"> · {h.area}</span>
-                      <span className="text-text-muted"> — ~{Math.round(h.share * 100)}% of modelled rejections</span>
-                    </li>
+              <section className="mt-7">
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">Key insights</div>
+                <div className="mt-3 space-y-3">
+                  {macroResult.insights.map((insight, idx) => (
+                    <div key={`${insight.where}-${idx}`} className="rounded-[24px] border border-white/[0.08] bg-white/[0.06] p-4">
+                      <div className="text-sm font-semibold text-text-primary">{insight.where}</div>
+                      <p className="mt-2 text-sm leading-relaxed text-text-secondary">{insight.why}</p>
+                      <p className="mt-2 text-xs uppercase tracking-[0.12em] text-text-muted">{insight.who}</p>
+                    </div>
                   ))}
-                </ul>
+                </div>
               </section>
 
-              <section>
-                <h3 className="font-mono text-[9px] uppercase tracking-[0.16em] text-text-muted mb-2">Why (cognitive resistance)</h3>
-                <p className="text-[12px] text-text-primary/95 leading-relaxed">{currentReport.whyResistance}</p>
+              <section className="mt-7">
+                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-pastel-2">Suggested rewrite</div>
+                <div className="mt-3 rounded-[28px] border border-pastel-2/25 bg-pastel-2/10 p-5 text-sm leading-relaxed text-text-primary">
+                  {macroResult.suggested_rewrite}
+                </div>
               </section>
-
-              <section>
-                <h3 className="font-mono text-[9px] uppercase tracking-[0.16em] text-text-muted mb-2">Recommendations</h3>
-                <ol className="list-decimal list-inside space-y-1.5 text-[12px] text-text-primary/95 leading-relaxed">
-                  {currentReport.recommendations.map((r, i) => (
-                    <li key={i}>{r}</li>
-                  ))}
-                </ol>
-              </section>
-
-              <section>
-                <h3 className="font-mono text-[9px] uppercase tracking-[0.16em] text-text-muted mb-2">Predicted outcome (if applied)</h3>
-                <p className="text-[12px] text-text-primary/90 leading-relaxed border border-accent-adopt/20 bg-accent-adopt/[0.06] rounded-md px-3 py-2">
-                  {currentReport.predictedOutcome}
-                </p>
-              </section>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {memoAResult && memoBResult && memoDiff && <MemoDiffView />}
-
-        {!showReport && !showShimmer && def && (
-          <p className="text-[11px] text-text-muted leading-relaxed">
-            Select a memo, then use <span className="text-accent-adopt">Inject catalyst</span> to run TRIBE v2 and generate this report. Run both memos to unlock the A vs B diff.
-          </p>
-        )}
-      </div>
-    </aside>
+            </div>
+          </motion.div>
+        </aside>
+      )}
+    </AnimatePresence>
   );
 };

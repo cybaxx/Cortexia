@@ -70,12 +70,18 @@ export function generateArcs(agents: Agent[], count = 35): InfluenceArc[] {
   return arcs;
 }
 
-/** Pastel-on-map: sage, coral, periwinkle (aligned with CSS tokens) */
+/** Map node colors: strict Indigo/Coral/Gray palette. */
 export const COLORS = {
-  neutral: [90, 100, 110, 190] as [number, number, number, number],
-  strain: [232, 165, 140, 210] as [number, number, number, number],
-  adopt: [160, 190, 235, 215] as [number, number, number, number],
+  neutral: [188, 231, 219, 168] as [number, number, number, number], // Mint mist
+  strain: [255, 191, 166, 220] as [number, number, number, number],  // Peach reactance
+  adopt: [160, 214, 255, 224] as [number, number, number, number],   // Sky adoption
 };
+
+export function beliefToAgentState(b: 'adopted' | 'rejected' | 'neutral'): AgentState {
+  if (b === 'adopted') return 'adopt';
+  if (b === 'rejected') return 'strain';
+  return 'neutral';
+}
 
 /** Synthetic population around a metro center (not LA-only). */
 export function generateAgentsForRegion(

@@ -24,6 +24,18 @@ export default defineConfig(({ mode }) => ({
     },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("mapbox-gl")) return "mapbox-gl";
+          if (id.includes("react-map-gl") || id.includes("@deck.gl")) return "map-canvas";
+          if (id.includes("recharts")) return "charts";
+          if (id.includes("@radix-ui")) return "radix-ui";
+        },
+      },
+    },
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

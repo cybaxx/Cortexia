@@ -42,8 +42,8 @@ export const UseCaseSelector = () => {
           Choose a domain
         </h1>
         <p className="text-center text-text-secondary text-sm mt-2 max-w-xl mx-auto">
-          Each domain loads adoption benchmarks and narrative templates. In the lab you supply your own catalyst copy
-          (or URL), pick a target city, and run two variants to compare propagation.
+          Each domain loads adoption benchmarks and report templates. In the lab you supply catalyst text (or a source
+          URL), pick a target city, and run a simulation against the synthetic population.
         </p>
         <div className="grid sm:grid-cols-2 gap-4 mt-10">
           {USE_CASES.map((uc, i) => {
@@ -56,9 +56,9 @@ export const UseCaseSelector = () => {
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: 0.06 * i, duration: 0.35 }}
                 onClick={() => pick(uc.id)}
-                className="text-left rounded-lg border border-white/[0.08] bg-bg-surface/90 hover:border-pastel-2/40 hover:bg-bg-elevated/80 transition-all p-5 group"
+                className="group rounded-[30px] border border-white/[0.08] bg-bg-surface/90 p-6 text-left transition-all hover:border-pastel-2/40 hover:bg-bg-elevated/80"
               >
-                <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-md border border-white/[0.08] bg-bg-elevated/60 text-pastel-2">
+                <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-[18px] border border-white/[0.08] bg-bg-elevated/60 text-pastel-2">
                   <Icon className="h-4 w-4" strokeWidth={1.5} />
                 </div>
                 <div className="font-medium text-text-primary group-hover:text-pastel-2/95 transition-colors">
