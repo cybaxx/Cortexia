@@ -4,6 +4,7 @@ import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer, ArcLayer } from '@deck.gl/layers';
 import { generateAgents, generateArcs, COLORS, type Agent } from '@/lib/agents';
 import { AgentPopup } from './AgentPopup';
+import { useCortexStore } from '@/store/cortex';
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string | undefined;
 
@@ -27,11 +28,13 @@ export const MapView = () => {
   const [viewState, setViewState] = useState<any>(INITIAL_VIEW);
   const [hover, setHover] = useState<{ agent: Agent; x: number; y: number } | null>(null);
   const mapRef = useRef<MapRef>(null);
+  const rejectPhase = useCortexStore((s) => s.injectPhase);
+  const hotspots = useCortexStore((s) => s.rejectionHotspots);
 
   const agents = useMemo(() => generateAgents(110), []);
   const arcs = useMemo(() => generateArcs(agents, 38), [agents]);
+  const showStrain = rejectPhase === 'propagating' || rejectPhase === 'report' || rejectPhase === 'complete';
 
-  // Fly-in animation on mount
   useEffect(() => {
     const t = setTimeout(() => {
       setViewState({
@@ -43,17 +46,32 @@ export const MapView = () => {
     return () => clearTimeout(t);
   }, []);
 
+  const rejectLayer =
+    showStrain && hotspots.length > 0
+      ? new ScatterplotLayer({
+          id: 'rejection-clusters',
+          data: hotspots,
+          getPosition: (d) => [d.lng, d.lat],
+          getRadius: (d) => d.radiusMeters,
+          radiusUnits: 'meters',
+          getFillColor: [244, 63, 94, 70],
+          stroked: false,
+          pickable: false,
+        })
+      : null;
+
   const layers = [
     new ArcLayer<{ source: [number, number]; target: [number, number] }>({
       id: 'influence-arcs',
       data: arcs,
       getSourcePosition: (d) => d.source,
       getTargetPosition: (d) => d.target,
-      getSourceColor: [245, 158, 11, 140],
-      getTargetColor: [59, 130, 246, 120],
-      getWidth: 1.2,
+      getSourceColor: [245, 158, 11, showStrain ? 160 : 100],
+      getTargetColor: [59, 130, 246, showStrain ? 150 : 90],
+      getWidth: showStrain ? 1.6 : 1.1,
       greatCircle: false,
     }),
+    ...(rejectLayer ? [rejectLayer] : []),
     new ScatterplotLayer<Agent>({
       id: 'agents',
       data: agents,
@@ -82,7 +100,7 @@ export const MapView = () => {
       {!MAPBOX_TOKEN && (
         <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none">
           <div className="font-mono text-[10px] text-text-secondary bg-bg-surface/90 border border-white/[0.08] px-3 py-2 rounded-sm">
-            Set <span className="text-accent-adopt">VITE_MAPBOX_TOKEN</span> in .env to load the LA basemap.
+            Set <span className="text-accent-adopt">VITE_MAPBOX_TOKEN</span> in <code className="text-text-primary">frontend/.env</code> to load the LA basemap.
           </div>
         </div>
       )}
@@ -105,7 +123,14 @@ export const MapView = () => {
 
       {hover && <AgentPopup agent={hover.agent} x={hover.x} y={hover.y} />}
 
-      {/* Subtle vignette to merge map into UI chrome */}
+      {showStrain && (
+        <div className="pointer-events-none absolute bottom-20 left-1/2 -translate-x-1/2 z-10 max-w-sm text-center">
+          <p className="font-mono text-[9px] text-rose-300/90 bg-bg-deep/80 border border-rose-500/20 rounded-sm px-2 py-1">
+            Red wash = modelled rejection clusters (defensive posture & strain). Arc intensity follows signal phase.
+          </p>
+        </div>
+      )}
+
       <div
         className="pointer-events-none absolute inset-0"
         style={{

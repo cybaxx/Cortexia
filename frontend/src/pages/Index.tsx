@@ -1,20 +1,32 @@
 import { MapView } from '@/components/cortex/MapView';
 import { TopBar } from '@/components/cortex/TopBar';
 import { ScenarioInjector } from '@/components/cortex/ScenarioInjector';
-import { ReasoningFeed } from '@/components/cortex/ReasoningFeed';
+import { PropagationReportPanel } from '@/components/cortex/PropagationReportPanel';
 import { BottomBar } from '@/components/cortex/BottomBar';
+import { UseCaseSelector } from '@/components/cortex/UseCaseSelector';
+import { useCortexStore } from '@/store/cortex';
 
-const Index = () => {
+const SimulationLayout = () => {
   return (
-    <main className="relative h-screen w-screen overflow-hidden bg-bg-deep text-text-primary">
+    <div className="relative h-screen w-screen overflow-hidden bg-bg-deep text-text-primary">
       <h1 className="sr-only">Cortexia — Cognitive Impact Sandbox · Los Angeles</h1>
       <MapView />
       <TopBar />
       <ScenarioInjector />
-      <ReasoningFeed />
+      <PropagationReportPanel />
       <BottomBar />
-    </main>
+    </div>
   );
+};
+
+const Index = () => {
+  const screen = useCortexStore((s) => s.screen);
+
+  if (screen === 'useCases') {
+    return <UseCaseSelector />;
+  }
+
+  return <SimulationLayout />;
 };
 
 export default Index;
