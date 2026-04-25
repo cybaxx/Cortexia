@@ -3,16 +3,32 @@ import type { UseCaseId } from '@/data/useCases';
 import { getUseCase } from '@/data/useCases';
 import type { Agent } from '@/lib/agents';
 import { postSimulate } from '@/lib/api/simulate';
-import type { AgentSimulationPayload, MacroResult, ReportHotspot } from '@/types/simulation';
+import type {
+  AgentSimulationPayload,
+  CaseSummary,
+  EvidenceInput,
+  EvidenceTrace,
+  InterventionItem,
+  MechanismsReport,
+  SimulateResponse,
+  SpreadModel,
+} from '@/types/simulation';
 
-export type Screen = 'useCases' | 'simulation';
-export type InjectPhase = 'idle' | 'initializing' | 'propagating' | 'report' | 'complete';
+export type Screen = 'useCases' | 'workspace';
+export type WorkspaceStage = 'evidence' | 'spread' | 'mechanisms' | 'interventions';
+export type RunState = 'idle' | 'running' | 'ready' | 'error';
 
-export interface SimulationMetrics {
-  populationReached: number;
-  avgCognitiveLoad: number;
-  beliefAdoptionRate: number;
-  spatialTension: 'Low' | 'Moderate' | 'High';
+export interface AudioUploadState {
+  fileName: string;
+  mimeType: string;
+  durationSeconds?: number | null;
+  transcriptConfidence?: number | null;
+  sourceType: string;
+}
+
+export interface ExportState {
+  lastExportAt?: number | null;
+  exportFormat: 'json' | 'markdown';
 }
 
 export type AgentParamPatch = Partial<
@@ -21,184 +37,235 @@ export type AgentParamPatch = Partial<
 
 interface CortexState {
   screen: Screen;
+  stage: WorkspaceStage;
   useCase: UseCaseId | null;
   cityId: string;
-  catalystText: string;
-  sourceUrl: string;
-  /** 0..1 scales how much the model perturbs TRIBE BSV per agent */
+  caseGoal: string;
   messageComplexity: number;
-  status: 'idle' | 'running';
-  injectPhase: InjectPhase;
-  rejectionHotspots: ReportHotspot[];
+  status: RunState;
   apiError: string | null;
-  metrics: SimulationMetrics;
-  agentOverrides: Record<number, AgentParamPatch>;
-  /** Latest server payload per agent id (TRIBE + K2). */
-  agentSimulationById: Record<number, AgentSimulationPayload>;
-  macroResult: MacroResult | null;
 
-  setScreen: (s: Screen) => void;
-  setUseCase: (id: UseCaseId | null) => void;
-  setCityId: (id: string) => void;
-  setCatalystText: (t: string) => void;
-  setSourceUrl: (t: string) => void;
-  setMessageComplexity: (n: number) => void;
-  setStatus: (s: 'idle' | 'running') => void;
-  setInjectPhase: (p: InjectPhase) => void;
+  evidence: EvidenceInput;
+  audioUpload: AudioUploadState | null;
+  exportState: ExportState;
+
+  latestResponse: SimulateResponse | null;
+  caseSummary: CaseSummary | null;
+  spreadModel: SpreadModel | null;
+  mechanisms: MechanismsReport | null;
+  interventionPlaybook: InterventionItem[];
+  evidenceTrace: EvidenceTrace | null;
+
+  agentOverrides: Record<number, AgentParamPatch>;
+  agentSimulationById: Record<number, AgentSimulationPayload>;
+
+  setScreen: (screen: Screen) => void;
+  setStage: (stage: WorkspaceStage) => void;
+  setUseCase: (useCase: UseCaseId | null) => void;
+  setCityId: (cityId: string) => void;
+  setCaseGoal: (caseGoal: string) => void;
+  setMessageComplexity: (messageComplexity: number) => void;
+  setEvidenceField: <K extends keyof EvidenceInput>(key: K, value: EvidenceInput[K]) => void;
+  setAudioUpload: (audioUpload: AudioUploadState | null) => void;
   patchAgent: (id: number, partial: AgentParamPatch) => void;
-  runSimulation: () => Promise<void>;
-  resetSandbox: () => void;
-  reportTitle: () => string;
   getAgentPayload: (id: number) => AgentSimulationPayload | undefined;
+  runSimulation: () => Promise<void>;
+  exportCase: (format?: 'json' | 'markdown') => void;
+  resetWorkspace: () => void;
+  workspaceTitle: () => string;
 }
 
-function metricsFromPayload(
-  agents: AgentSimulationPayload[],
-  summary: { total: number; adopted: number },
-  hotspots: ReportHotspot[],
-): SimulationMetrics {
-  const avgLoad =
-    agents.reduce((total, agent) => total + agent.tribe_neurological_metrics.cognitive_load, 0) /
-    Math.max(1, agents.length);
-  const hotspotShare = hotspots.reduce((total, hotspot) => total + hotspot.share, 0);
+const DEFAULT_GOAL =
+  'Understand how this information spreads, identify vulnerable segments, and recommend interventions that reduce harm.';
+
+function emptyEvidence(): EvidenceInput {
   return {
-    populationReached: Math.round((agents.filter((agent) => agent.belief_state !== 'neutral').length / Math.max(1, summary.total)) * 100),
-    avgCognitiveLoad: Math.round(avgLoad * 100) / 100,
-    beliefAdoptionRate: Math.round((summary.adopted / Math.max(1, summary.total)) * 100),
-    spatialTension: hotspotShare > 0.48 ? 'High' : hotspotShare > 0.22 ? 'Moderate' : 'Low',
+    text_input: '',
+    source_url: '',
+    transcript: '',
+    edited_analysis_text: '',
+    speaker_context: '',
+    audio_input: null,
   };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+function buildMarkdownExport(response: SimulateResponse): string {
+  const sections = [
+    `# ${response.case_summary.title}`,
+    `## Goal\n${response.case_summary.goal}`,
+    `## Key Finding\n${response.case_summary.key_finding}`,
+    `## Spread Model\n- Spread risk: ${response.spread_model.spread_risk}\n- Adoption rate: ${response.spread_model.belief_adoption_rate}%\n- Population reached: ${response.spread_model.population_reached}%`,
+    `## Mechanisms\n${response.mechanisms.mechanism_summary}`,
+    `## Interventions\n${response.intervention_playbook
+      .map(
+        (item) =>
+          `### ${item.title}\n- Audience: ${item.target_audience}\n- Mechanism: ${item.mechanism_addressed}\n- Channel: ${item.recommended_channel}\n- Messenger: ${item.recommended_messenger}\n- Strategy: ${item.message_strategy}`,
+      )
+      .join('\n\n')}`,
+    `## Evidence Trace\n${response.evidence_trace.analysis_text}`,
+  ];
+  return sections.join('\n\n');
+}
+
+function downloadBlob(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export const useCortexStore = create<CortexState>((set, get) => ({
   screen: 'useCases',
+  stage: 'evidence',
   useCase: null,
   cityId: 'la',
-  catalystText: '',
-  sourceUrl: '',
+  caseGoal: DEFAULT_GOAL,
   messageComplexity: 0.5,
   status: 'idle',
-  injectPhase: 'idle',
-  rejectionHotspots: [],
   apiError: null,
-  metrics: {
-    populationReached: 0,
-    avgCognitiveLoad: 0,
-    beliefAdoptionRate: 0,
-    spatialTension: 'Low',
-  },
+
+  evidence: emptyEvidence(),
+  audioUpload: null,
+  exportState: { exportFormat: 'json', lastExportAt: null },
+
+  latestResponse: null,
+  caseSummary: null,
+  spreadModel: null,
+  mechanisms: null,
+  interventionPlaybook: [],
+  evidenceTrace: null,
+
   agentOverrides: {},
   agentSimulationById: {},
-  macroResult: null,
 
   setScreen: (screen) => set({ screen }),
+  setStage: (stage) => set({ stage }),
   setUseCase: (useCase) =>
     set({
       useCase,
-      rejectionHotspots: [],
-      apiError: null,
+      stage: 'evidence',
+      latestResponse: null,
+      caseSummary: null,
+      spreadModel: null,
+      mechanisms: null,
+      interventionPlaybook: [],
+      evidenceTrace: null,
       agentSimulationById: {},
-      macroResult: null,
+      apiError: null,
     }),
   setCityId: (cityId) => set({ cityId }),
-  setCatalystText: (catalystText) => set({ catalystText }),
-  setSourceUrl: (sourceUrl) => set({ sourceUrl }),
+  setCaseGoal: (caseGoal) => set({ caseGoal }),
   setMessageComplexity: (messageComplexity) => set({ messageComplexity }),
-  setStatus: (status) => set({ status }),
-  setInjectPhase: (injectPhase) => set({ injectPhase }),
+  setEvidenceField: (key, value) =>
+    set((state) => ({
+      evidence: {
+        ...state.evidence,
+        [key]: value,
+      },
+    })),
+  setAudioUpload: (audioUpload) => set({ audioUpload }),
 
   patchAgent: (id, partial) =>
-    set((s) => ({
-      agentOverrides: { ...s.agentOverrides, [id]: { ...s.agentOverrides[id], ...partial } },
+    set((state) => ({
+      agentOverrides: { ...state.agentOverrides, [id]: { ...state.agentOverrides[id], ...partial } },
     })),
 
   getAgentPayload: (id) => get().agentSimulationById[id],
 
-  reportTitle: () => {
-    const { useCase } = get();
-    const u = getUseCase(useCase);
-    return u ? `Cortexia — ${u.label}` : 'Cortexia — Propagation Report';
-  },
-
   runSimulation: async () => {
-    const { useCase, catalystText, cityId, sourceUrl, messageComplexity, injectPhase } = get();
+    const { useCase, cityId, caseGoal, evidence, messageComplexity } = get();
     if (!useCase) return;
-    if (injectPhase !== 'idle' && injectPhase !== 'complete') return;
-    const text = catalystText.trim();
-    if (text.length < 12) return;
+
+    const canonicalText =
+      evidence.edited_analysis_text?.trim() ||
+      evidence.transcript?.trim() ||
+      evidence.text_input.trim();
+    if (canonicalText.length < 12) {
+      set({ apiError: 'Add at least 12 characters of evidence or transcript before modeling the case.' });
+      return;
+    }
 
     set({
-      injectPhase: 'initializing',
       status: 'running',
-      rejectionHotspots: [],
       apiError: null,
-      macroResult: null,
+      latestResponse: null,
+      caseSummary: null,
+      spreadModel: null,
+      mechanisms: null,
+      interventionPlaybook: [],
+      evidenceTrace: null,
+      agentSimulationById: {},
     });
 
     try {
       const res = await postSimulate({
-        catalyst_text: text,
-        source_url: sourceUrl.trim() || null,
+        domain: useCase,
         city_id: cityId,
-        use_case: useCase,
+        case_goal: caseGoal.trim() || DEFAULT_GOAL,
+        evidence,
         message_complexity: messageComplexity,
       });
 
-      if (get().screen !== 'simulation') return;
-
       const byId: Record<number, AgentSimulationPayload> = {};
-      for (const a of res.agents) {
-        byId[a.id] = a;
-      }
+      for (const agent of res.agents) byId[agent.id] = agent;
+
       set({
-        injectPhase: 'propagating',
+        latestResponse: res,
+        caseSummary: res.case_summary,
+        spreadModel: res.spread_model,
+        mechanisms: res.mechanisms,
+        interventionPlaybook: res.intervention_playbook,
+        evidenceTrace: res.evidence_trace,
         agentSimulationById: byId,
-        macroResult: res.macro_result,
-        rejectionHotspots: res.macro_result.hotspots,
+        status: 'ready',
+        stage: 'spread',
       });
-
-      await sleep(1500); // Live reaction wave
-      if (get().screen !== 'simulation') return;
-
-      const metrics = metricsFromPayload(res.agents, res.summary, res.macro_result.hotspots);
-      set({
-        injectPhase: 'report',
-        metrics,
-      });
-
-      await sleep(400);
-      set({ injectPhase: 'complete', status: 'idle' });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Simulation request failed';
-      set({
-        injectPhase: 'complete',
-        status: 'idle',
-        agentSimulationById: {},
-        apiError: msg,
-        rejectionHotspots: [],
-        macroResult: null,
-      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Case analysis failed';
+      set({ status: 'error', apiError: msg });
     }
   },
 
-  resetSandbox: () =>
+  exportCase: (format = 'json') => {
+    const response = get().latestResponse;
+    if (!response) return;
+
+    if (format === 'json') {
+      downloadBlob('cortexia-case.json', JSON.stringify(response, null, 2), 'application/json');
+    } else {
+      downloadBlob('cortexia-case.md', buildMarkdownExport(response), 'text/markdown');
+    }
+    set({ exportState: { exportFormat: format, lastExportAt: Date.now() } });
+  },
+
+  resetWorkspace: () =>
     set({
-      injectPhase: 'idle',
+      screen: 'useCases',
+      stage: 'evidence',
+      useCase: null,
+      cityId: 'la',
+      caseGoal: DEFAULT_GOAL,
+      messageComplexity: 0.5,
       status: 'idle',
-      rejectionHotspots: [],
       apiError: null,
+      evidence: emptyEvidence(),
+      audioUpload: null,
+      exportState: { exportFormat: 'json', lastExportAt: null },
+      latestResponse: null,
+      caseSummary: null,
+      spreadModel: null,
+      mechanisms: null,
+      interventionPlaybook: [],
+      evidenceTrace: null,
       agentOverrides: {},
       agentSimulationById: {},
-      macroResult: null,
-      catalystText: '',
-      sourceUrl: '',
-      messageComplexity: 0.5,
-      metrics: {
-        populationReached: 0,
-        avgCognitiveLoad: 0,
-        beliefAdoptionRate: 0,
-        spatialTension: 'Low',
-      },
     }),
+
+  workspaceTitle: () => {
+    const useCase = getUseCase(get().useCase);
+    return useCase ? `Cortexia — ${useCase.label} Case Workspace` : 'Cortexia — Case Workspace';
+  },
 }));

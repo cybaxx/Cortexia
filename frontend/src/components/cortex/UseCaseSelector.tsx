@@ -13,12 +13,12 @@ const ICON: Record<UseCaseId, LucideIcon> = {
 export const UseCaseSelector = () => {
   const setUseCase = useCortexStore((s) => s.setUseCase);
   const setScreen = useCortexStore((s) => s.setScreen);
-  const reset = useCortexStore((s) => s.resetSandbox);
+  const reset = useCortexStore((s) => s.resetWorkspace);
 
   const pick = (id: UseCaseId) => {
     reset();
     setUseCase(id);
-    setScreen('simulation');
+    setScreen('workspace');
   };
 
   return (

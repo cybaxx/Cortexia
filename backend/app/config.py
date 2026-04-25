@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # ElevenLabs
     elevenlabs_api_key: str = Field(default="")
     elevenlabs_voice_id: str = Field(default="")
+    elevenlabs_stt_model: str = Field(
+        default="scribe_v2",
+        description="ElevenLabs Speech-to-Text model id.",
+    )
 
     # TRIBE v2 on Modal (same as `tribe_modal_deployment_url()` in app.constants)
     tribe_modal_url: str = Field(

@@ -127,6 +127,23 @@ export const AgentInspectionModal = ({
 
       {payload && <K2ThinkTrace lines={payload.k2_reasoning_trace} />}
 
+      {payload && (
+        <div className="mt-3 grid gap-3">
+          <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+            <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Vulnerability</div>
+            <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.agent_insight.vulnerability}</p>
+          </div>
+          <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+            <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Why this state formed</div>
+            <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.agent_insight.cause_of_state}</p>
+          </div>
+          <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+            <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Best intervention</div>
+            <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.agent_insight.best_intervention}</p>
+          </div>
+        </div>
+      )}
+
       <div className="mt-4 space-y-3">
         <ParamRow
           label="Cognitive load (local override)"

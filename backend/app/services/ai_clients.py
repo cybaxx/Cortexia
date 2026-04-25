@@ -334,3 +334,41 @@ async def call_elevenlabs(
     path = str(Path("/tmp/audio") / f"tts-{uuid.uuid4().hex}.mp3")
     Path(path).write_bytes(r.content)
     return path
+
+
+async def transcribe_audio_with_elevenlabs(
+    httpx_client: httpx.AsyncClient,
+    *,
+    filename: str,
+    content: bytes,
+    content_type: str,
+    language_code: str | None = None,
+) -> dict[str, Any]:
+    """
+    Transcribe audio using ElevenLabs Speech-to-Text.
+    Official docs: POST /v1/speech-to-text with multipart form, model_id=scribe_v2 or scribe_v1.
+    """
+    if not settings.elevenlabs_api_key.strip():
+        raise RuntimeError("ELEVENLABS_API_KEY is required for audio transcription.")
+
+    files = {
+        "file": (filename, content, content_type or "application/octet-stream"),
+    }
+    data: dict[str, Any] = {
+        "model_id": settings.elevenlabs_stt_model,
+        "diarize": "true",
+        "timestamps_granularity": "word",
+        "tag_audio_events": "true",
+    }
+    if language_code:
+        data["language_code"] = language_code
+
+    response = await httpx_client.post(
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        headers={"xi-api-key": settings.elevenlabs_api_key},
+        data=data,
+        files=files,
+        timeout=180.0,
+    )
+    response.raise_for_status()
+    return response.json()
