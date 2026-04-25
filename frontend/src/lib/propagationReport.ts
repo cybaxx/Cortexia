@@ -32,24 +32,32 @@ const LA_HOTSPOTS: { label: string; area: string; lng: number; lat: number }[] =
   { label: 'Eastside', area: 'Boyle Heights–Elysian', lng: -118.21, lat: 34.07 },
 ];
 
-function hashSeed(useCase: UseCaseId, memo: 'A' | 'B', salt: string) {
-  const s = `${useCase}${memo}${salt}`;
+function hashSeed(useCase: UseCaseId, memo: 'A' | 'B', catalystText: string, salt: string) {
+  const head = (catalystText || '—').slice(0, 400);
+  const s = `${useCase}${memo}${head}${salt}`;
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
   return Math.abs(h) / 2147483647;
 }
 
+const REF_LNG = -118.2437;
+const REF_LAT = 34.0522;
+
 /**
- * Build a stakeholder-ready report from the selected use case and memo variant.
- * Numbers are deterministic for the same (useCase, memo) so A/B comparisons are stable in-session.
+ * Build a stakeholder-ready report from the selected use case, memo variant, and user catalyst.
+ * Incorporates catalyst text in the model hash; geospatial priors follow the selected city center.
  */
 export function buildPropagationReport(
   useCase: UseCaseId,
   memo: 'A' | 'B',
+  catalystText: string,
+  cityCenter: { longitude: number; latitude: number },
 ): PropagationReport {
   const def = getUseCase(useCase)!;
   const b = def.adoptionBenchmark;
-  const r = (i: number) => hashSeed(useCase, memo, `m${i}`);
+  const r = (i: number) => hashSeed(useCase, memo, catalystText, `m${i}`);
+  const dLng = cityCenter.longitude - REF_LNG;
+  const dLat = cityCenter.latitude - REF_LAT;
 
   // Memo A is slightly “friendlier” for adoption in our toy model, except for health where B can spike fear adoption in segments — keep simple: A = higher base adoption
   const baseAdopt = memo === 'A' ? 0.22 + r(1) * 0.28 : 0.12 + r(2) * 0.22;
@@ -68,8 +76,8 @@ export function buildPropagationReport(
       label: loc.label,
       area: loc.area,
       share: 0.12 + r(20 + idx) * 0.2,
-      lng: loc.lng + (r(30 + idx) - 0.5) * 0.04,
-      lat: loc.lat + (r(40 + idx) - 0.5) * 0.04,
+      lng: loc.lng + dLng + (r(30 + idx) - 0.5) * 0.04,
+      lat: loc.lat + dLat + (r(40 + idx) - 0.5) * 0.04,
       radiusMeters: 1800 + Math.round(r(50 + idx) * 4000),
     };
   });
@@ -144,7 +152,14 @@ export function buildPropagationReport(
     },
   };
 
-  const why = memo === 'A' ? whyByCase[useCase].a : whyByCase[useCase].b;
+  const baseWhy = memo === 'A' ? whyByCase[useCase].a : whyByCase[useCase].b;
+  const snippet = (catalystText || '').trim().slice(0, 180);
+  const why =
+    snippet.length > 0
+      ? `${baseWhy} The supplied catalyst excerpt anchors the run: “${snippet}${
+          (catalystText || '').trim().length > 180 ? '…' : ''
+        }”`
+      : baseWhy;
   const recs = memo === 'A' ? recByCase[useCase].a : recByCase[useCase].b;
 
   const lift = Math.round(4 + r(60) * 9);

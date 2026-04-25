@@ -31,6 +31,9 @@ export default {
         'text-muted': "hsl(var(--text-muted))",
         'accent-strain': "hsl(var(--accent-strain))",
         'accent-adopt': "hsl(var(--accent-adopt))",
+        'pastel-1': "hsl(var(--pastel-1))",
+        'pastel-2': "hsl(var(--pastel-2))",
+        'pastel-3': "hsl(var(--pastel-3))",
         'neutral-agent': "hsl(var(--neutral-agent))",
         primary: {
           DEFAULT: "hsl(var(--accent-adopt))",

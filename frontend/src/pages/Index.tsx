@@ -2,19 +2,17 @@ import { MapView } from '@/components/cortex/MapView';
 import { TopBar } from '@/components/cortex/TopBar';
 import { ScenarioInjector } from '@/components/cortex/ScenarioInjector';
 import { PropagationReportPanel } from '@/components/cortex/PropagationReportPanel';
-import { BottomBar } from '@/components/cortex/BottomBar';
 import { UseCaseSelector } from '@/components/cortex/UseCaseSelector';
 import { useCortexStore } from '@/store/cortex';
 
 const SimulationLayout = () => {
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-bg-deep text-text-primary">
-      <h1 className="sr-only">Cortexia — Cognitive Impact Sandbox · Los Angeles</h1>
+      <h1 className="sr-only">Cortexia — cognitive impact simulation</h1>
       <MapView />
       <TopBar />
       <ScenarioInjector />
       <PropagationReportPanel />
-      <BottomBar />
     </div>
   );
 };

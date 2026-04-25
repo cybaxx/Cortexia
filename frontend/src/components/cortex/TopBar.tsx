@@ -1,4 +1,6 @@
 import { useCortexStore } from '@/store/cortex';
+import { getCityById } from '@/data/cities';
+import { getUseCase } from '@/data/useCases';
 
 const PHASE_LABEL: Record<string, string> = {
   idle: 'Ready',
@@ -12,6 +14,9 @@ export const TopBar = () => {
   const status = useCortexStore((s) => s.status);
   const phase = useCortexStore((s) => s.injectPhase);
   const useCase = useCortexStore((s) => s.useCase);
+  const cityId = useCortexStore((s) => s.cityId);
+  const city = getCityById(cityId);
+  const domain = getUseCase(useCase);
 
   const chip =
     status === 'running' || ['initializing', 'propagating', 'report'].includes(phase)
@@ -26,7 +31,8 @@ export const TopBar = () => {
         <span className="text-text-primary text-[14px] font-medium tracking-tight shrink-0">Cortexia</span>
         <span className="h-4 w-px bg-white/10 shrink-0" />
         <span className="font-mono text-[10px] text-text-secondary uppercase tracking-wider truncate">
-          Los Angeles · {useCase ? 'Synthetic run' : 'Select use case'}
+          {city.label}
+          {domain ? ` · ${domain.label}` : ' · Select domain'}
         </span>
       </div>
       <div className="flex items-center gap-2 shrink-0">

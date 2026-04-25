@@ -20,7 +20,7 @@ export const PropagationReportPanel = () => {
   const showShimmer = injectPhase === 'initializing' || injectPhase === 'propagating';
 
   return (
-    <aside className="absolute top-12 right-0 bottom-16 w-[min(100%,400px)] max-w-[100vw] bg-bg-surface border-l border-white/[0.08] z-20 flex flex-col shadow-[-4px_0_24px_rgba(0,0,0,0.25)]">
+    <aside className="absolute top-12 right-0 bottom-0 w-[min(100%,400px)] max-w-[100vw] bg-bg-surface border-l border-white/[0.08] z-20 flex flex-col shadow-[-4px_0_24px_rgba(0,0,0,0.25)]">
       <div className="px-4 py-3 border-b border-white/[0.08] flex items-start justify-between gap-2">
         <div>
           <h2 className="font-mono text-[11px] uppercase tracking-[0.14em] text-text-secondary">Propagation report</h2>

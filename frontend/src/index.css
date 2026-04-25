@@ -21,8 +21,13 @@ All colors MUST be HSL.
     --text-secondary: 218 11% 65%;  /* #9ca3af */
     --text-muted: 220 9% 46%;
 
-    --accent-strain: 38 92% 50%;    /* #f59e0b amber */
-    --accent-adopt: 217 91% 60%;    /* #3b82f6 muted blue */
+    /* Three pastel accents on dark (dashboard spec) */
+    --pastel-1: 165 42% 68%;
+    --pastel-2: 252 48% 72%;
+    --pastel-3: 18 55% 70%;
+    /* Semantic accents aligned to pastels for status + map */
+    --accent-strain: 18 55% 62%;
+    --accent-adopt: 252 50% 68%;
     --neutral-agent: 220 13% 27%;   /* #374151 */
 
     --background: var(--bg-deep);

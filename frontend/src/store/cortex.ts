@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import type { UseCaseId } from '@/data/useCases';
 import { getUseCase } from '@/data/useCases';
+import { getCityById } from '@/data/cities';
+import type { Agent } from '@/lib/agents';
 import {
   buildPropagationReport,
   buildMemoDiff,
@@ -26,31 +28,41 @@ export interface MemoRunSnapshot {
   completedAt: number;
 }
 
+export type AgentParamPatch = Partial<
+  Pick<Agent, 'cognitiveLoad' | 'emotionalAgitation' | 'defensivePosture' | 'state'>
+>;
+
 interface CortexState {
   screen: Screen;
   useCase: UseCaseId | null;
+  cityId: string;
+  /** User-authored catalysts (not preloaded) */
+  catalystA: string;
+  catalystB: string;
+  sourceUrl: string;
   status: 'idle' | 'running';
   selectedMemo: 'A' | 'B' | null;
   injectPhase: InjectPhase;
-
-  /** Latest completed run (either A or B just finished) */
   currentReport: PropagationReport | null;
   rejectionHotspots: RejectionHotspot[];
   memoAResult: MemoRunSnapshot | null;
   memoBResult: MemoRunSnapshot | null;
   memoDiff: MemoDiffSummary | null;
-
   metrics: SimulationMetrics;
+  agentOverrides: Record<number, AgentParamPatch>;
 
   setScreen: (s: Screen) => void;
   setUseCase: (id: UseCaseId | null) => void;
+  setCityId: (id: string) => void;
+  setCatalystA: (t: string) => void;
+  setCatalystB: (t: string) => void;
+  setSourceUrl: (t: string) => void;
   setMemo: (m: 'A' | 'B' | null) => void;
   setStatus: (s: 'idle' | 'running') => void;
   setInjectPhase: (p: InjectPhase) => void;
-  /** Orchestrated inject with timed phases and report generation */
+  patchAgent: (id: number, partial: AgentParamPatch) => void;
   startInject: () => void;
   resetSandbox: () => void;
-  /** PDF helper reads this title */
   reportTitle: () => string;
 }
 
@@ -74,6 +86,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export const useCortexStore = create<CortexState>((set, get) => ({
   screen: 'useCases',
   useCase: null,
+  cityId: 'la',
+  catalystA: '',
+  catalystB: '',
+  sourceUrl: '',
   status: 'idle',
   selectedMemo: 'A',
   injectPhase: 'idle',
@@ -88,6 +104,7 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     beliefAdoptionRate: 0,
     spatialTension: 'Low',
   },
+  agentOverrides: {},
 
   setScreen: (screen) => set({ screen }),
   setUseCase: (useCase) =>
@@ -99,9 +116,18 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       currentReport: null,
       rejectionHotspots: [],
     }),
+  setCityId: (cityId) => set({ cityId }),
+  setCatalystA: (catalystA) => set({ catalystA }),
+  setCatalystB: (catalystB) => set({ catalystB }),
+  setSourceUrl: (sourceUrl) => set({ sourceUrl }),
   setMemo: (selectedMemo) => set({ selectedMemo }),
   setStatus: (status) => set({ status }),
   setInjectPhase: (injectPhase) => set({ injectPhase }),
+
+  patchAgent: (id, partial) =>
+    set((s) => ({
+      agentOverrides: { ...s.agentOverrides, [id]: { ...s.agentOverrides[id], ...partial } },
+    })),
 
   reportTitle: () => {
     const { useCase } = get();
@@ -110,10 +136,12 @@ export const useCortexStore = create<CortexState>((set, get) => ({
   },
 
   startInject: async () => {
-    const { useCase, selectedMemo } = get();
+    const { useCase, selectedMemo, catalystA, catalystB, cityId } = get();
     if (!useCase || !selectedMemo) return;
     const ph = get().injectPhase;
     if (ph !== 'idle' && ph !== 'complete') return;
+    const text = selectedMemo === 'A' ? catalystA : catalystB;
+    if (text.trim().length < 12) return;
 
     set({ injectPhase: 'initializing', status: 'running', rejectionHotspots: [], currentReport: null, memoDiff: null });
 
@@ -124,7 +152,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     await sleep(2800);
     if (get().screen !== 'simulation') return;
 
-    const report = buildPropagationReport(useCase, selectedMemo);
+    const city = getCityById(cityId);
+    const report = buildPropagationReport(useCase, selectedMemo, text, city.center);
     const hotspots = report.rejectionHotspots;
     const metrics = metricsFromReport(report, useCase);
     const snap: MemoRunSnapshot = {
@@ -161,6 +190,10 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       memoAResult: null,
       memoBResult: null,
       memoDiff: null,
+      agentOverrides: {},
+      catalystA: '',
+      catalystB: '',
+      sourceUrl: '',
       metrics: {
         populationReached: 0,
         avgCognitiveLoad: 0,
