@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 @import 'mapbox-gl/dist/mapbox-gl.css';
 
 @tailwind base;
@@ -11,26 +11,27 @@ All colors MUST be HSL.
 
 @layer base {
   :root {
-    /* Cortexia brand palette */
-    --bg-deep: 222 36% 6%;
-    --bg-surface: 222 28% 11%;
-    --bg-elevated: 223 23% 16%;
+    /* Cortexia research lab palette */
+    --bg-deep: 205 34% 7%;
+    --bg-surface: 203 28% 11%;
+    --bg-elevated: 201 24% 15%;
     --bg-border: 0 0% 100%;         /* used with /8 opacity */
 
-    --text-primary: 18 20% 96%;
-    --text-secondary: 18 12% 74%;
-    --text-muted: 18 8% 52%;
+    --text-primary: 190 18% 96%;
+    --text-secondary: 190 12% 76%;
+    --text-muted: 190 9% 56%;
 
-    /* Brand trio */
-    --pastel-1: 18 92% 74%;
-    --pastel-2: 18 66% 84%;
-    --pastel-3: 201 74% 82%;
-    --accent-strain: 18 90% 72%;
-    --accent-adopt: 201 74% 82%;
-    --neutral-agent: 18 12% 34%;
-    --brand-glow: radial-gradient(circle at top left, hsl(var(--pastel-1) / 0.14), transparent 28%),
-      radial-gradient(circle at 82% 12%, hsl(var(--pastel-3) / 0.10), transparent 22%),
-      radial-gradient(circle at 50% 100%, hsl(var(--pastel-2) / 0.08), transparent 30%);
+    --pastel-1: 34 86% 70%;
+    --pastel-2: 170 52% 70%;
+    --pastel-3: 204 76% 78%;
+    --accent-strain: 34 90% 67%;
+    --accent-adopt: 170 52% 70%;
+    --neutral-agent: 190 10% 35%;
+    --brand-glow: radial-gradient(circle at 12% 12%, hsl(var(--pastel-2) / 0.14), transparent 28%),
+      radial-gradient(circle at 82% 10%, hsl(var(--pastel-3) / 0.16), transparent 26%),
+      radial-gradient(circle at 50% 100%, hsl(var(--pastel-1) / 0.10), transparent 32%);
+    --lab-grid: linear-gradient(hsl(var(--bg-border) / 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--bg-border) / 0.045) 1px, transparent 1px);
 
     --background: var(--bg-deep);
     --foreground: var(--text-primary);
@@ -130,9 +131,9 @@ All colors MUST be HSL.
   body {
     background:
       var(--brand-glow),
-      linear-gradient(180deg, hsl(var(--bg-deep)) 0%, hsl(223 39% 5%) 100%);
+      linear-gradient(180deg, hsl(var(--bg-deep)) 0%, hsl(206 39% 5%) 100%);
     color: hsl(var(--text-primary));
-    font-family: 'Manrope', system-ui, sans-serif;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
     overflow-x: hidden;
     overflow-y: auto;
@@ -140,6 +141,10 @@ All colors MUST be HSL.
 
   .font-mono {
     font-family: 'IBM Plex Mono', monospace;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'Space Grotesk', 'IBM Plex Sans', system-ui, sans-serif;
   }
 }
 
@@ -154,11 +159,11 @@ All colors MUST be HSL.
     overflow: hidden;
     border: 1px solid hsl(var(--bg-border) / 0.08);
     background:
-      linear-gradient(180deg, hsl(var(--bg-surface) / 0.94), hsl(var(--bg-surface) / 0.90)),
+      linear-gradient(180deg, hsl(var(--bg-surface) / 0.95), hsl(var(--bg-surface) / 0.9)),
       var(--brand-glow);
     box-shadow:
       inset 0 1px 0 hsl(var(--bg-border) / 0.05),
-      0 18px 70px rgba(6, 10, 20, 0.28);
+      0 22px 80px rgba(3, 10, 18, 0.34);
   }
 
   .brand-shell::before {
@@ -173,7 +178,7 @@ All colors MUST be HSL.
 
   .brand-chip {
     border: 1px solid hsl(var(--bg-border) / 0.08);
-    background: linear-gradient(135deg, hsl(var(--pastel-2) / 0.10), hsl(var(--pastel-3) / 0.08));
+    background: linear-gradient(135deg, hsl(var(--pastel-2) / 0.13), hsl(var(--pastel-3) / 0.09));
     color: hsl(var(--text-primary));
   }
 
@@ -190,5 +195,50 @@ All colors MUST be HSL.
     background:
       linear-gradient(180deg, hsl(var(--bg-elevated) / 0.78), hsl(var(--bg-surface) / 0.66));
     box-shadow: inset 0 1px 0 hsl(var(--bg-border) / 0.04);
+  }
+
+  .lab-grid {
+    background-image: var(--lab-grid);
+    background-size: 28px 28px;
+  }
+
+  .lab-panel {
+    position: relative;
+    border: 1px solid hsl(var(--bg-border) / 0.1);
+    background:
+      linear-gradient(180deg, hsl(var(--bg-elevated) / 0.9), hsl(var(--bg-surface) / 0.84));
+    box-shadow:
+      inset 0 1px 0 hsl(var(--bg-border) / 0.05),
+      0 12px 40px rgba(2, 8, 16, 0.24);
+  }
+
+  .lab-panel::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(180deg, hsl(var(--pastel-3) / 0.06), transparent 24%),
+      linear-gradient(90deg, transparent, hsl(var(--bg-border) / 0.03), transparent);
+    opacity: 0.85;
+  }
+
+  .lab-kicker {
+    color: hsl(var(--pastel-2));
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+  }
+
+  .lab-input {
+    border: 1px solid hsl(var(--bg-border) / 0.08);
+    background: hsl(var(--bg-elevated) / 0.82);
+    color: hsl(var(--text-primary));
+    box-shadow: inset 0 1px 0 hsl(var(--bg-border) / 0.04);
+  }
+
+  .lab-input::placeholder {
+    color: hsl(var(--text-muted));
   }
 }

@@ -1,7 +1,8 @@
-import { X } from 'lucide-react';
-import { Suspense, lazy } from 'react';
+import { AudioLines, Loader2, Send, X } from 'lucide-react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import type { Agent } from '@/lib/agents';
-import type { AgentSimulationPayload } from '@/types/simulation';
+import { getAgentConversationHistory, postAgentConversation } from '@/lib/api/simulate';
+import type { AgentConversationMessage, AgentSimulationPayload } from '@/types/simulation';
 
 const BrainViz = lazy(() =>
   import('./BrainViz').then((module) => ({ default: module.BrainViz })),
@@ -30,13 +31,56 @@ export const AgentInspectionModal = ({
   y,
   onClose,
   payload,
+  runId,
 }: {
   agent: Agent;
   x: number;
   y: number;
   onClose: () => void;
   payload?: AgentSimulationPayload;
+  runId?: number;
 }) => {
+  const [messages, setMessages] = useState<AgentConversationMessage[]>([]);
+  const [draft, setDraft] = useState('');
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [sending, setSending] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadHistory() {
+      if (!runId || !payload) return;
+      setLoadingHistory(true);
+      try {
+        const history = await getAgentConversationHistory(runId, payload.id);
+        if (!cancelled) setMessages(history);
+      } catch {
+        if (!cancelled) setMessages([]);
+      } finally {
+        if (!cancelled) setLoadingHistory(false);
+      }
+    }
+    void loadHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [payload, runId]);
+
+  async function sendMessage() {
+    if (!runId || !payload || !draft.trim() || sending) return;
+    setSending(true);
+    try {
+      const reply = await postAgentConversation(runId, payload.id, draft.trim());
+      setMessages((current) => [...current, reply]);
+      setDraft('');
+      if (reply.audio_url) {
+        const audio = new Audio(reply.audio_url);
+        void audio.play().catch(() => undefined);
+      }
+    } finally {
+      setSending(false);
+    }
+  }
+
   return (
     <div
       className="pointer-events-auto absolute left-1/2 top-6 z-50 w-[min(34rem,calc(100%-3rem))] max-h-[calc(100%-3rem)] -translate-x-1/2 overflow-y-auto overscroll-contain rounded-[32px] border border-white/[0.12] p-4 shadow-[0_32px_120px_rgba(6,10,20,0.52)]"
@@ -71,8 +115,8 @@ export const AgentInspectionModal = ({
       </div>
 
       <div className="mb-3 rounded-[22px] border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-[10px] font-mono text-text-muted">
-        Each node is simulated independently. The regional brain map below reflects this agent&apos;s calibrated TRIBE
-        state, local network context, and detailed K2 decision path.
+        Each node is simulated independently. TRIBE generates this agent&apos;s cognitive state, then K2 Think explains
+        the outcome, conversation stance, and propagation behavior you see below.
       </div>
 
       <div className="mb-3 rounded-[28px] border border-white/[0.08] bg-bg-elevated/35 p-3">
@@ -107,6 +151,65 @@ export const AgentInspectionModal = ({
           <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
             <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Best intervention</div>
             <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.agent_insight.best_intervention}</p>
+          </div>
+          {payload.round_history && payload.round_history.length > 0 && (
+            <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+              <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Propagation timeline</div>
+              <div className="mt-3 space-y-2">
+                {payload.round_history.map((item) => (
+                  <div key={`${payload.id}-round-${item.round}`} className="rounded-[16px] border border-white/[0.06] bg-bg-deep/45 p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs font-medium text-text-primary">Round {item.round}</div>
+                      <div className="text-[11px] text-text-muted">
+                        {item.belief_state} · {(item.confidence * 100).toFixed(0)}%
+                      </div>
+                    </div>
+                    <p className="mt-2 text-xs leading-relaxed text-text-secondary">{item.post}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+            <div className="mb-3 flex items-center gap-2">
+              <AudioLines className="h-4 w-4 text-pastel-2" />
+              <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Talk to this agent</div>
+            </div>
+            <div className="max-h-44 space-y-2 overflow-y-auto rounded-[18px] border border-white/[0.06] bg-bg-deep/45 p-3">
+              {loadingHistory && <div className="text-xs text-text-secondary">Loading prior turns…</div>}
+              {!loadingHistory && messages.length === 0 && (
+                <div className="text-xs leading-relaxed text-text-secondary">
+                  Ask what this person believes, what would change their mind, or why they reacted this way. Cortexia will answer in-character and speak the reply.
+                </div>
+              )}
+              {messages.map((message) => (
+                <div key={message.id} className="space-y-1">
+                  <div className="text-[11px] text-pastel-1">You: {message.user_message}</div>
+                  <div className="text-[11px] leading-relaxed text-text-secondary">{message.agent_reply}</div>
+                  {message.audio_url && (
+                    <audio controls className="w-full">
+                      <source src={message.audio_url} type="audio/mpeg" />
+                    </audio>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 flex items-end gap-2">
+              <textarea
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="Ask this person what they think, what makes them trust or doubt the claim, or what would change their mind."
+                className="min-h-[84px] flex-1 rounded-[18px] border border-white/[0.08] bg-bg-deep/55 px-3 py-2 text-sm text-text-primary"
+              />
+              <button
+                type="button"
+                onClick={() => void sendMessage()}
+                disabled={!runId || !payload || sending || !draft.trim()}
+                className="inline-flex h-11 items-center justify-center rounded-[16px] border border-pastel-2/25 bg-[hsl(var(--pastel-2)/0.10)] px-3 text-sm text-text-primary disabled:opacity-40"
+              >
+                {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              </button>
+            </div>
           </div>
         </div>
       )}

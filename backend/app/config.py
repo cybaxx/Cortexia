@@ -16,6 +16,20 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    hf_token: str = Field(
+        default="",
+        description="Hugging Face token with access to gated TRIBE dependencies such as Llama 3.2.",
+        validation_alias=AliasChoices("hf_token", "HF_TOKEN", "huggingface_token", "HUGGINGFACE_TOKEN"),
+    )
+    tribe_runtime_mode: str = Field(
+        default="framework",
+        description="Neural pipeline runtime: 'framework' for local tribe_neural processing, 'modal' for remote web endpoint.",
+    )
+    tribe_data_dir: str = Field(
+        default=str(_BACKEND_DIR / "tribe_data"),
+        description="Local cache/data directory for the vendored tribe_neural framework.",
+    )
+
     # K2 Think (OpenAI-compatible): https://api.k2think.ai/v1/chat/completions
     ifm_api_url: str = Field(
         default="https://api.k2think.ai/v1/chat/completions",
@@ -66,6 +80,34 @@ class Settings(BaseSettings):
         ge=1,
         le=32,
         description="Concurrent per-agent K2 calls during /api/simulate.",
+    )
+    simulate_source_fetch_timeout_seconds: float = Field(
+        default=15.0,
+        gt=1.0,
+        le=120.0,
+        description="Timeout for fetching source URLs.",
+    )
+    simulate_tribe_timeout_seconds: float = Field(
+        default=120.0,
+        gt=5.0,
+        le=600.0,
+        description="Timeout for TRIBE batch inference.",
+    )
+    simulate_k2_timeout_seconds: float = Field(
+        default=90.0,
+        gt=5.0,
+        le=300.0,
+        description="Timeout for each agent K2 reasoning call.",
+    )
+    simulate_total_timeout_seconds: float = Field(
+        default=180.0,
+        gt=10.0,
+        le=900.0,
+        description="Hard timeout for the full /api/simulate pipeline.",
+    )
+    pipeline_db_path: str = Field(
+        default=str(_BACKEND_DIR / "cortexia.db"),
+        description="Local SQLite path for persisted case runs and agent outcomes.",
     )
 
     # CORS

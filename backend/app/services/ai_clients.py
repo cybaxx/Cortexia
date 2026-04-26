@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, TypedDict
@@ -13,6 +13,7 @@ import httpx
 
 from app.config import get_settings
 from app.constants import tribe_modal_deployment_url
+from app.services.tribe_framework import run_framework_batch
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -20,9 +21,9 @@ settings = get_settings()
 K2_SYSTEM_PROMPT = """
 You are the agent-level reasoning engine for Cortexia.
 
-Your task is to simulate how one synthetic person processes a narrative after TRIBE has produced a Biological State Vector
-and after Cortexia has applied a lightweight calibration model. You are not writing marketing copy. You are performing a
-structured behavioral judgment.
+Your task is to explain how one synthetic person processes a narrative after TRIBE has produced a Biological State Vector,
+after Cortexia has applied a calibration model, and after Cortexia has computed a deterministic uptake outcome.
+You are not choosing the outcome from scratch. You are explaining the model's outcome faithfully.
 
 Use all of the following inputs:
 - agent role and context
@@ -42,15 +43,60 @@ Interpretive rubric:
 8. If the agent can process the content but only because nearby signals normalize it, prefer social_proof.
 
 Decision rules:
-- "Adopted" means the agent is likely to accept, repeat, or move with the message.
-- "Rejected" means the agent resists the message or treats it as untrustworthy/threatening.
-- Use confidence to reflect internal coherence of the evidence, not rhetorical certainty.
+- "Adopted" means the agent is likely to accept, repeat, or move with the claim.
+- "Rejected" means the agent resists the claim or treats it as untrustworthy/threatening.
+- "Neutral" means the agent is unconvinced but not strongly mobilized either way.
+- Respect the precomputed outcome and score supplied in the user block.
+- Use confidence to reflect internal coherence of the explanation, not rhetorical certainty.
 
 Return exactly these XML-like tags and nothing else:
 <think>3-5 concise sentences explaining the dominant mechanism, the secondary factor, and why the final state follows.</think>
 <action>Adopted</action> or <action>Rejected</action>
 <confidence>0.00-1.00</confidence>
 <signal>cognitive_overload|defensive_reactance|empathic_resonance|memory_alignment|social_proof</signal>
+""".strip()
+
+K2_AGENT_CONVERSATION_PROMPT = """
+You are speaking as one synthetic person inside Cortexia's swarm simulation.
+
+Stay fully in character. You are not an analyst, not an assistant, and not a dashboard.
+You are one person reacting from your own internal state, priors, trust level, and local social context.
+
+Instructions:
+1. Speak in first person as the agent.
+2. Be concrete, natural, and psychologically plausible.
+3. Do not mention TRIBE, BSV, calibration models, K2, prompts, simulations, or hidden system details.
+4. Let your stance reflect the stored outcome and sentiment, but you can express uncertainty or nuance.
+5. Keep the answer between 3 and 6 sentences.
+6. If the user asks what would change your mind, answer honestly from the agent's perspective.
+
+Return plain text only.
+""".strip()
+
+K2_BATCH_REASONING_PROMPT = """
+You are the batch agent-level reasoning engine for Cortexia.
+
+You will receive a JSON array of synthetic people. For each person, Cortexia has already computed:
+- a calibrated Biological State Vector
+- local neighborhood exposure
+- a deterministic uptake score
+- a deterministic final outcome
+
+Your job is not to invent the outcome. Your job is to explain it faithfully and concisely.
+
+Return strict JSON only. No markdown. No prose outside the JSON.
+Return a JSON array where each item has exactly these fields:
+- id: integer
+- reasoning: array of 2 to 4 concise sentences
+- action: "Adopted" | "Rejected" | "Neutral"
+- confidence: number between 0 and 1
+- signal: "cognitive_overload" | "defensive_reactance" | "empathic_resonance" | "memory_alignment" | "social_proof"
+
+Rules:
+- Respect the supplied precomputed outcome for each agent.
+- Use the BSV, traits, neighborhood context, and score breakdown.
+- If credibility is low, adoption should require unusually strong social proof or prior alignment.
+- Keep each reasoning sentence specific and non-generic.
 """.strip()
 
 
@@ -61,32 +107,45 @@ class BSV(TypedDict):
     working_memory_strain: float
 
 
-def _default_bsv() -> BSV:
-    return {
-        "cognitive_load": 0.5,
-        "emotional_agitation": 0.5,
-        "defensive_posture": 0.5,
-        "working_memory_strain": 0.5,
-    }
+class TribeBatchResult(TypedDict):
+    agents: dict[str, BSV]
+    tribe_meta: dict[str, Any]
 
+
+def _extract_json_payload(text: str) -> Any:
+    stripped = text.strip()
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end = decoder.raw_decode(stripped)
+        trailing = stripped[end:].strip()
+        if trailing:
+            logger.warning("K2 batch response included trailing text after JSON payload: %s", trailing[:200])
+        return parsed
+    except json.JSONDecodeError:
+        match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", stripped)
+        if not match:
+            raise ValueError("K2 batch response did not contain parseable JSON.")
+        parsed, end = decoder.raw_decode(match.group(1))
+        trailing = match.group(1)[end:].strip()
+        if trailing:
+            logger.warning("K2 batch extracted JSON payload included trailing text: %s", trailing[:200])
+        return parsed
 
 async def call_tribe_modal_batch(
     httpx_client: httpx.AsyncClient,
     catalyst_text: str,
     agents: list[dict],
-) -> dict[str, BSV]:
+) -> TribeBatchResult:
     """
-    Call the deployed Modal `extract-batch-bsv` webhook with a text catalyst and agents array
-    and return the biological state vectors tailored for each agent.
+    Resolve Cortexia's neural processing engine for a text catalyst and agent batch.
+    Framework mode runs the vendored `tribe_neural` package locally in-process.
+    Modal mode calls the remote HTTPS endpoint.
     """
+    if settings.tribe_runtime_mode.strip().lower() == "framework":
+        return await run_framework_batch(catalyst_text, agents)
+
     if not tribe_modal_deployment_url():
-        logger.warning("TRIBE_MODAL_URL unset; using fallback multi-agent BSVs")
-        results = {}
-        for a in agents:
-            bsv = _default_bsv()
-            bsv["cognitive_load"] = min(1.0, 0.55 + 0.01 * (len(catalyst_text) % 17))
-            results[str(a["id"])] = bsv
-        return results
+        raise RuntimeError("TRIBE_MODAL_URL is required. No TRIBE fallback is available.")
 
     url = tribe_modal_deployment_url().rstrip("/")
     if not url.startswith("http"):
@@ -104,27 +163,28 @@ async def call_tribe_modal_batch(
         "agents": agents
     }
     
+    r = await httpx_client.post(url, json=payload, headers=headers, timeout=settings.simulate_tribe_timeout_seconds)
     try:
-        r = await httpx_client.post(url, json=payload, headers=headers, timeout=120.0)
         r.raise_for_status()
-        data = r.json()
-        
-        results = {}
-        agents_dict = data.get("agents", {})
-        for aid, adict in agents_dict.items():
-            results[aid] = {
-                "cognitive_load": float(adict["cognitive_load"]),
-                "emotional_agitation": float(adict["emotional_agitation"]),
-                "defensive_posture": float(adict["defensive_posture"]),
-                "working_memory_strain": float(adict["working_memory_strain"]),
-            }
-        return results
-    except Exception:
-        logger.exception("TRIBE Modal call failed; using fallback multi-agent BSV")
-        results = {}
-        for a in agents:
-            results[str(a["id"])] = _default_bsv()
-        return results
+    except httpx.HTTPStatusError as exc:
+        detail = (exc.response.text or "").strip()
+        if detail:
+            raise RuntimeError(f"TRIBE endpoint failed with HTTP {exc.response.status_code}: {detail[:1000]}") from exc
+        raise
+    data = r.json()
+    agents_dict = data.get("agents", {})
+    tribe_meta = data.get("tribe_meta") or {}
+    if not isinstance(agents_dict, dict) or not agents_dict:
+        raise RuntimeError("TRIBE response did not include any agent BSVs.")
+    results = {}
+    for aid, adict in agents_dict.items():
+        results[aid] = {
+            "cognitive_load": float(adict["cognitive_load"]),
+            "emotional_agitation": float(adict["emotional_agitation"]),
+            "defensive_posture": float(adict["defensive_posture"]),
+            "working_memory_strain": float(adict["working_memory_strain"]),
+        }
+    return {"agents": results, "tribe_meta": tribe_meta if isinstance(tribe_meta, dict) else {}}
 
 
 async def call_tribe_modal(
@@ -140,11 +200,12 @@ async def call_tribe_modal(
         catalyst_text,
         [{"id": 0, "role": "baseline", "latitude": 34.0522, "longitude": -118.2437}],
     )
-    if "0" in out:
-        return out["0"]
-    if out:
-        return next(iter(out.values()))
-    return _default_bsv()
+    agents = out["agents"]
+    if "0" in agents:
+        return agents["0"]
+    if agents:
+        return next(iter(agents.values()))
+    raise RuntimeError("TRIBE single-agent call returned no BSV.")
 
 
 def _k2_response_body_to_object(r: httpx.Response) -> Any:
@@ -236,14 +297,22 @@ def _k2_user_block(
     catalyst_text: str,
     claim_credibility: float,
     claim_risk: str,
+    computed_outcome: str,
+    adoption_score: float,
+    agent_traits: dict[str, float],
+    score_breakdown: dict[str, float],
 ) -> str:
     return (
         f"Agent persona: name={name}, role={role}.\n"
         f"Calibrated Biological State Vector: {bsv!s}\n"
-        f"Neighborhood context: {adopted_neighbor_count} nearby agents are dispositionally open to the claim within the local 0.05° neighborhood; "
+        f"Neighborhood context: {adopted_neighbor_count} nearby agents are likely to adopt the claim within the local 0.05° neighborhood; "
         f"approximately {total_neighbors_radius} total agents are present in that radius.\n"
         f"Claim credibility estimate: {claim_credibility:.2f} on a 0-1 scale.\n"
         f"Claim risk label: {claim_risk}.\n"
+        f"Precomputed outcome: {computed_outcome}.\n"
+        f"Precomputed adoption score: {adoption_score:.2f}.\n"
+        f"Agent traits: {agent_traits!s}\n"
+        f"Score breakdown: {score_breakdown!s}\n"
         "Reasoning instructions:\n"
         "- Explain the dominant mechanism first.\n"
         "- Mention one secondary force if present.\n"
@@ -265,39 +334,14 @@ async def call_k2_think(
     catalyst_text: str,
     claim_credibility: float,
     claim_risk: str,
+    computed_outcome: str,
+    adoption_score: float,
+    agent_traits: dict[str, float],
+    score_breakdown: dict[str, float],
 ) -> str:
     """K2 Think (api.k2think.ai) — returns raw model text for downstream parsing."""
     if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
-        logger.warning("IFM_API_KEY (or K2_THINK_API_KEY) or IFM_API_URL unset; using deterministic mock K2 output")
-        dp = bsv.get("defensive_posture", 0.0)
-        cl = bsv.get("cognitive_load", 0.0)
-        wm = bsv.get("working_memory_strain", 0.0)
-        if claim_credibility < 0.28 and adopted_neighbor_count < 4:
-            action = "Rejected"
-            think = "The claim has weak baseline credibility and there is not enough local proof to overcome skepticism. The agent defaults to rejection rather than internalizing the claim."
-            confidence = 0.81
-            signal = "defensive_reactance" if dp > 0.58 else "memory_alignment"
-        elif dp > 0.7:
-            action = "Rejected"
-            think = "Defensive posture is dominant, so the content is interpreted as pressure or status threat. Emotional activation reinforces rejection rather than deliberation."
-            confidence = 0.82
-            signal = "defensive_reactance"
-        elif cl > 0.8 or wm > 0.78:
-            action = "Rejected"
-            think = "Working memory strain is elevated and the message asks for too much integration at once. The agent cannot comfortably absorb the claim and defaults to overload-based rejection."
-            confidence = 0.74
-            signal = "cognitive_overload"
-        else:
-            action = "Adopted" if adopted_neighbor_count >= 4 and claim_credibility >= 0.42 else "Rejected"
-            think = "Local openness reduces uncertainty, but adoption only occurs when neighborhood reinforcement is strong enough to offset weak priors. Social proof is influential here, but it is not enough on its own when the claim looks flimsy."
-            confidence = 0.66 if action == "Adopted" else 0.64
-            signal = "social_proof" if adopted_neighbor_count >= 4 else "memory_alignment"
-        return (
-            f"<think>{think}</think>"
-            f"<action>{action}</action>"
-            f"<confidence>{confidence:.2f}</confidence>"
-            f"<signal>{signal}</signal>"
-        )
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No K2 fallback is available.")
 
     headers: dict[str, str] = {
         "Content-Type": "application/json",
@@ -322,6 +366,10 @@ async def call_k2_think(
                     catalyst_text=catalyst_text,
                     claim_credibility=claim_credibility,
                     claim_risk=claim_risk,
+                    computed_outcome=computed_outcome,
+                    adoption_score=adoption_score,
+                    agent_traits=agent_traits,
+                    score_breakdown=score_breakdown,
                 ),
             },
         ],
@@ -330,7 +378,7 @@ async def call_k2_think(
         settings.ifm_api_url,
         json=payload,
         headers=headers,
-        timeout=120.0,
+        timeout=settings.simulate_k2_timeout_seconds,
     )
     r.raise_for_status()
     out = _k2_response_body_to_object(r)
@@ -342,6 +390,71 @@ async def call_k2_think(
     return text
 
 
+async def call_k2_batch_think(
+    httpx_client: httpx.AsyncClient,
+    *,
+    agents: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No K2 fallback is available.")
+    if not agents:
+        return {}
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+    }
+    payload: dict[str, Any] = {
+        "model": settings.ifm_k2_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": K2_BATCH_REASONING_PROMPT},
+            {"role": "user", "content": json.dumps(agents, ensure_ascii=True)},
+        ],
+    }
+    r = await httpx_client.post(
+        settings.ifm_api_url,
+        json=payload,
+        headers=headers,
+        timeout=settings.simulate_k2_timeout_seconds,
+    )
+    r.raise_for_status()
+    out = _k2_response_body_to_object(r)
+    text = _openai_style_assistant_text(out)
+    if not text.strip():
+        raise ValueError("K2 batch reasoning returned empty content.")
+    parsed = _extract_json_payload(text)
+    if not isinstance(parsed, list):
+        raise ValueError("K2 batch reasoning did not return a JSON array.")
+
+    results: dict[int, dict[str, Any]] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise ValueError("K2 batch reasoning returned a non-object item.")
+        if "id" not in item or "action" not in item or "confidence" not in item or "signal" not in item:
+            raise ValueError(f"K2 batch reasoning item is missing required fields: {item}")
+        agent_id = int(item["id"])
+        reasoning = item.get("reasoning")
+        if isinstance(reasoning, str):
+            reasoning_lines = [reasoning.strip()] if reasoning.strip() else []
+        elif isinstance(reasoning, list):
+            reasoning_lines = [str(line).strip() for line in reasoning if str(line).strip()]
+        else:
+            raise ValueError(f"K2 batch reasoning item has invalid reasoning field: {item}")
+        results[agent_id] = {
+            "reasoning": reasoning_lines,
+            "action": str(item["action"]).strip(),
+            "confidence": float(item["confidence"]),
+            "signal": str(item["signal"]).strip(),
+        }
+
+    missing = sorted(set(int(agent["id"]) for agent in agents) - set(results.keys()))
+    if missing:
+        raise ValueError(f"K2 batch reasoning omitted agent ids: {missing[:8]}")
+    return results
+
+
 async def call_elevenlabs(
     httpx_client: httpx.AsyncClient,
     text: str,
@@ -349,12 +462,8 @@ async def call_elevenlabs(
     """
     Synthesize speech with ElevenLabs, save to /tmp/audio, return file path.
     """
-    if not settings.elevenlabs_api_key or not settings.elevenlabs_voice_id:
-        path = str(Path("/tmp/audio") / f"disabled-{uuid.uuid4().hex}.mp3")
-        os.makedirs("/tmp/audio", exist_ok=True)
-        Path(path).write_bytes(b"")
-        logger.warning("ElevenLabs not configured; wrote empty MP3 at %s", path)
-        return path
+    if not settings.elevenlabs_api_key.strip() or not settings.elevenlabs_voice_id.strip():
+        raise RuntimeError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required. No TTS fallback is available.")
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{settings.elevenlabs_voice_id}"
     headers = {
@@ -368,10 +477,10 @@ async def call_elevenlabs(
             "model_id": "eleven_multilingual_v2",
         },
         headers=headers,
-        timeout=120.0,
+        timeout=settings.simulate_k2_timeout_seconds,
     )
     r.raise_for_status()
-    os.makedirs("/tmp/audio", exist_ok=True)
+    Path("/tmp/audio").mkdir(parents=True, exist_ok=True)
     path = str(Path("/tmp/audio") / f"tts-{uuid.uuid4().hex}.mp3")
     Path(path).write_bytes(r.content)
     return path
@@ -413,3 +522,64 @@ async def transcribe_audio_with_elevenlabs(
     )
     response.raise_for_status()
     return response.json()
+
+
+async def call_k2_agent_conversation(
+    httpx_client: httpx.AsyncClient,
+    *,
+    agent_name: str,
+    agent_role: str,
+    analysis_text: str,
+    speaker_context: str | None,
+    outcome: dict[str, Any],
+    traits: dict[str, float],
+    scores: dict[str, Any],
+    user_message: str,
+    prior_turns: list[dict[str, Any]],
+) -> str:
+    if not settings.ifm_api_url.strip() or not settings.ifm_api_key.strip():
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No agent-conversation fallback is available.")
+
+    history = "\n".join(
+        f"User: {turn['user_message']}\nAgent: {turn['agent_reply']}"
+        for turn in prior_turns[-5:]
+    )
+    payload = {
+        "model": settings.ifm_k2_model,
+        "temperature": 0.4,
+        "messages": [
+            {"role": "system", "content": K2_AGENT_CONVERSATION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Agent name: {agent_name}\n"
+                    f"Agent role: {agent_role}\n"
+                    f"Simulated claim: {analysis_text[:1200]}\n"
+                    f"Speaker context: {speaker_context or 'None provided'}\n"
+                    f"Stored stance: {outcome.get('belief_state') or outcome.get('stance')}\n"
+                    f"Stored confidence: {outcome.get('confidence')}\n"
+                    f"Dominant signal: {outcome.get('dominant_signal')}\n"
+                    f"Traits: {json.dumps(traits)}\n"
+                    f"Scores: {json.dumps(scores)}\n"
+                    f"Recent conversation:\n{history or 'No prior turns.'}\n\n"
+                    f"User message: {user_message}"
+                ),
+            },
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+        "Content-Type": "application/json",
+    }
+    r = await httpx_client.post(
+        settings.ifm_api_url,
+        json=payload,
+        headers=headers,
+        timeout=settings.simulate_k2_timeout_seconds,
+    )
+    r.raise_for_status()
+    out = _k2_response_body_to_object(r)
+    text = _openai_style_assistant_text(out).strip()
+    if not text:
+        raise ValueError("K2 agent conversation returned empty content.")
+    return text

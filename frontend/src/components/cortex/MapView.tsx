@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Map, { type MapRef } from 'react-map-gl';
 import DeckGL from '@deck.gl/react';
-import { ArcLayer, ScatterplotLayer } from '@deck.gl/layers';
+import { ScatterplotLayer } from '@deck.gl/layers';
 import { getCityById } from '@/data/cities';
-import { generateAgentsForCity, generateArcs, COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
+import { COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
 import { useCortexStore } from '@/store/cortex';
 import type { AgentSimulationPayload } from '@/types/simulation';
 import { AgentInspectionModal } from './AgentInspectionModal';
@@ -31,12 +31,29 @@ function applyPayload(base: Agent, payload: AgentSimulationPayload | undefined, 
   );
 }
 
+function buildAgentFromPayload(payload: AgentSimulationPayload, override?: Partial<Agent>): Agent {
+  return mergeAgent(
+    {
+      id: payload.id,
+      name: payload.name,
+      role: payload.role,
+      position: [payload.longitude, payload.latitude],
+      state: beliefToAgentState(payload.belief_state),
+      cognitiveLoad: payload.tribe_neurological_metrics.cognitive_load,
+      emotionalAgitation: payload.tribe_neurological_metrics.emotional_friction,
+      defensivePosture: payload.tribe_neurological_metrics.defensive_activation,
+    },
+    override,
+  );
+}
+
 export const MapView = () => {
   const cityId = useCortexStore((s) => s.cityId);
   const overrides = useCortexStore((s) => s.agentOverrides);
   const spreadModel = useCortexStore((s) => s.spreadModel);
   const agentSimulationById = useCortexStore((s) => s.agentSimulationById);
   const status = useCortexStore((s) => s.status);
+  const latestResponse = useCortexStore((s) => s.latestResponse);
 
   const city = getCityById(cityId);
   const c = city.center;
@@ -54,21 +71,13 @@ export const MapView = () => {
   const mapRef = useRef<MapRef>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const baseAgents = useMemo(
-    () => generateAgentsForCity(city.landZones, 110),
-    [city.landZones],
-  );
-
   const agents = useMemo(
     () =>
-      baseAgents.map((agent) => {
-        const payload = agentSimulationById[agent.id];
-        return applyPayload(agent, payload, overrides[agent.id]);
-      }),
-    [baseAgents, agentSimulationById, overrides],
+      Object.values(agentSimulationById)
+        .sort((a, b) => a.id - b.id)
+        .map((payload) => buildAgentFromPayload(payload, overrides[payload.id])),
+    [agentSimulationById, overrides],
   );
-
-  const arcs = useMemo(() => generateArcs(agents, hasServerAgents ? 22 : 12), [agents, hasServerAgents]);
 
   useEffect(() => {
     setPinned(null);
@@ -118,20 +127,6 @@ export const MapView = () => {
   }, [c.zoom]);
 
   const layers = [
-    ...(hasServerAgents
-      ? [
-          new ArcLayer({
-            id: 'influence-arcs',
-            data: arcs,
-            getSourcePosition: (d) => d.source,
-            getTargetPosition: (d) => d.target,
-            getSourceColor: [188, 231, 219, status === 'ready' ? 20 : 10],
-            getTargetColor: [160, 214, 255, status === 'ready' ? 20 : 10],
-            getWidth: status === 'ready' ? 0.55 : 0.35,
-            greatCircle: false,
-          }),
-        ]
-      : []),
     ...(hotspots.length
       ? [
           new ScatterplotLayer({
@@ -140,7 +135,12 @@ export const MapView = () => {
             getPosition: (d) => [d.lng, d.lat],
             getRadius: (d) => d.radiusMeters,
             radiusUnits: 'meters',
-            getFillColor: [255, 191, 166, 88],
+            getFillColor: (d) =>
+              d.state === 'adopted'
+                ? [160, 214, 255, 86]
+                : d.state === 'rejected'
+                  ? [255, 191, 166, 96]
+                  : [188, 231, 219, 74],
             stroked: false,
             pickable: false,
           }),
@@ -166,9 +166,9 @@ export const MapView = () => {
   const mergedPopupAgent = useMemo(() => {
     if (!pinned) return null;
     const payload = agentSimulationById[pinned.agent.id];
-    const base = baseAgents.find((agent) => agent.id === pinned.agent.id) || pinned.agent;
-    return applyPayload(base, payload, overrides[pinned.agent.id]);
-  }, [agentSimulationById, baseAgents, overrides, pinned]);
+    if (!payload) return applyPayload(pinned.agent, undefined, overrides[pinned.agent.id]);
+    return buildAgentFromPayload(payload, overrides[payload.id]);
+  }, [agentSimulationById, overrides, pinned]);
 
   return (
     <div ref={containerRef} className="relative h-full min-h-[420px] bg-bg-deep">
@@ -176,6 +176,14 @@ export const MapView = () => {
         <div className="absolute inset-0 z-10 flex items-center justify-center px-4 text-center">
           <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-4 py-3 font-mono text-[10px] text-text-secondary">
             Set <span className="text-pastel-2/90">VITE_MAPBOX_TOKEN</span> in <code className="text-text-primary">frontend/.env</code> to load the basemap.
+          </div>
+        </div>
+      )}
+
+      {!hasServerAgents && (
+        <div className="pointer-events-none absolute inset-x-6 top-6 z-10 flex justify-center">
+          <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-4 py-3 text-center font-mono text-[10px] text-text-secondary">
+            Run a simulation to populate the map with live TRIBE-backed agents.
           </div>
         </div>
       )}
@@ -205,6 +213,7 @@ export const MapView = () => {
           y={pinned.y}
           onClose={() => setPinned(null)}
           payload={payloadForPin}
+          runId={latestResponse?.run_id}
         />
       )}
 

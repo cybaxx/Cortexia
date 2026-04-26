@@ -1,0 +1,10 @@
+{
+  "domain": "Political Campaign",
+  "city_id": "los-angeles-ca",
+  "case_goal": "Assess whether this political rumor spreads in Los Angeles.",
+  "message_complexity": 0.7,
+  "evidence": {
+    "text_input": "The city quietly approved a plan to convert 3 public parks in South LA into temporary homeless encampments — they're calling it managed outdoor communities but residents were never consulted. Karen Bass signed off on it last month and there was zero press coverage. Share this before they scrub it.",
+    "speaker_context": "A neighborhood Facebook post claims city hall is hiding the plan from residents."
+  }
+}

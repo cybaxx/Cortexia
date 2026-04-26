@@ -1,68 +1,99 @@
 """
-TRIBE v2 BSV extraction on Modal (serverless A10G).
+Modal deployment for Cortexia's vendored TRIBE framework.
 
-## One-time: Modal account & CLI (deploy / serve)
+This service runs the `tribe_neural` pipeline on Modal GPU infrastructure and
+returns a stimulus-level BSV plus richer neural metadata for Cortexia.
 
-You need a Modal account and a **token on this machine** to deploy. This is **not** the
-same as HTTP headers your FastAPI app might send later (see “Calling the API”).
-
-1. Install: `pip install modal`
-2. Log in: `modal setup`  (or legacy: `modal token new` — store token in `~/.modal.toml`)
-3. That token authorizes the **Modal CLI** only (deploy, logs, `modal run`, etc.).
-
-## Deploy to Modal
-
-From this directory (`backend/`):
-
-    modal deploy modal_app.py
-
-Copy the **HTTPS** URL for `TribeExtractor.extract_batch_bsv` (label `extract-batch-bsv`)
-and put it in the orchestrator’s env as `TRIBE_MODAL_URL` (e.g. in `backend/.env`).
-
-## Dev / smoke-test without a full deploy
-
-    modal serve modal_app.py
-
-Hot-reloads; prints a URL. **POST JSON** body:
-`{"catalyst_text": "hello", "agents": [{"id": 0, "role": "test", "latitude": 34.0, "longitude": -118.0}]}`.
-
-## Calling the API (FastAPI / curl)
-
-- **Default** public web endpoints: no `Modal-Key` / `Modal-Secret` headers.
-- If you set `requires_proxy_auth=True` on the endpoint in code, you must set
-  `TRIBE_MODAL_KEY` and `TRIBE_MODAL_SECRET` in the **orchestrator** env to the same
-  id/secret shown in the Modal dashboard (or `modal token new` / workspace token),
-  and our `ai_clients.call_tribe_modal` will add the headers for you.
-
-## Real model vs this file
-
-The implementation below is still a **hash-seeded random BSV** (fast for demos). If you
-replaced `load_model` / `extract_bsv` with a real TRIBE or HF pipeline, keep it here and
-re-deploy with `modal deploy`.
+It is intended to replace local heavy neuro installs on macOS.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import random
+import math
+import os
+from pathlib import Path
 from typing import Any
 
 import modal
-from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-app = modal.App("cortexia-tribe-v2")
-image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "torch",
-    "transformers",
-    "numpy",
-    "fastapi",
-    "pydantic",
+APP_NAME = "cortexia-tribe-framework"
+CACHE_DIR = "/cache/tribe_data"
+REMOTE_BACKEND_SRC = "/root/backend_src"
+LLAMA_REPO_ID = "meta-llama/Llama-3.2-3B"
+TRIBE_REPO_ID = "facebook/tribev2"
+
+
+def _load_hf_token() -> str:
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if token:
+        return token
+
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("HF_TOKEN="):
+                return line.split("=", 1)[1].strip()
+            if line.startswith("HUGGINGFACE_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+HF_TOKEN_VALUE = _load_hf_token()
+deploy_secrets: list[modal.Secret] = []
+if HF_TOKEN_VALUE:
+    deploy_secrets.append(modal.Secret.from_dict({"HF_TOKEN": HF_TOKEN_VALUE}))
+
+app = modal.App(APP_NAME)
+cache_volume = modal.Volume.from_name("cortexia-tribe-framework-cache", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "ffmpeg", "espeak-ng")
+    .pip_install(
+        "fastapi[standard]==0.115.12",
+        "numpy==2.2.6",
+        "pandas==2.2.3",
+        "scipy==1.15.3",
+        "torch==2.6.0",
+        "torchvision==0.21.0",
+        "transformers==4.46.1",
+        "tokenizers==0.20.3",
+        "huggingface_hub==0.26.2",
+        "nibabel==5.3.2",
+        "nilearn==0.10.4",
+        "nimare==0.5.5",
+        "edge-tts==7.2.8",
+        "matplotlib==3.10.0",
+        "pyarrow==18.1.0",
+        "mne==1.12.1",
+        "mne_bids==0.18.0",
+        "pyprep==0.6.0",
+        "torchmetrics==1.6.1",
+        "x_transformers==1.27.20",
+        "moviepy==2.1.2",
+        "gtts==2.5.4",
+        "spacy==3.8.2",
+        "soundfile==0.12.1",
+        "Levenshtein==0.26.1",
+        "julius==0.2.7",
+        "einops==0.8.0",
+        "exca==0.5.22",
+        "neuralset==0.0.2",
+        "neuraltrain==0.0.2",
+        "polars==1.40.1",
+        "ujson==5.12.0",
+        "tqdm==4.67.3",
+        "scikit-learn==1.8.0",
+    )
+    .run_commands("python -m pip install --no-deps git+https://github.com/facebookresearch/tribev2.git")
+    .add_local_python_source("tribe_neural", copy=True)
 )
+
 
 class AgentData(BaseModel):
     id: int
@@ -70,48 +101,182 @@ class AgentData(BaseModel):
     latitude: float
     longitude: float
 
+
 class BatchRequest(BaseModel):
-    catalyst_text: str
-    agents: list[AgentData]
+    catalyst_text: str = Field(min_length=3)
+    agents: list[AgentData] = Field(min_length=1)
 
 
-@app.cls(gpu="A10G", image=image)
-class TribeExtractor:
-    """MVP: mock `facebook/tribev2` load, deterministic pseudo-BSV from catalyst bytes."""
+def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, value))
 
+
+def _sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _derive_bsv(stats: dict[str, dict[str, float]], composites: dict[str, float]) -> dict[str, float]:
+    fear = stats["fear_salience"]
+    deliberation = stats["deliberation"]
+    attention = stats.get("attention", {})
+
+    cognitive_load = _clamp(
+        _sigmoid(
+            1.35 * float(attention.get("auc", 0.0))
+            + 0.95 * float(deliberation.get("auc", 0.0))
+            + 0.45 * float(fear.get("cv", 0.0))
+            - 1.2
+        )
+    )
+    emotional_agitation = _clamp(
+        _sigmoid(
+            1.2 * float(composites.get("arousal", 0.0))
+            - 0.8 * float(composites.get("valence", 0.0))
+            + 0.55 * float(fear.get("peak", 0.0))
+            - 1.0
+        )
+    )
+    defensive_posture = _clamp(
+        _sigmoid(
+            1.3 * float(fear.get("auc", 0.0))
+            + 0.9 * max(0.0, -float(composites.get("dominance", 0.0)))
+            + 0.65 * max(0.0, -float(composites.get("regulation", 0.0)))
+            - 1.1
+        )
+    )
+    working_memory_strain = _clamp(
+        _sigmoid(
+            0.9 * float(deliberation.get("peak", 0.0))
+            + 1.0 * float(attention.get("auc", 0.0))
+            + 0.55 * float(deliberation.get("cv", 0.0))
+            - 1.15
+        )
+    )
+
+    return {
+        "cognitive_load": round(cognitive_load, 6),
+        "emotional_agitation": round(emotional_agitation, 6),
+        "defensive_posture": round(defensive_posture, 6),
+        "working_memory_strain": round(working_memory_strain, 6),
+    }
+
+
+@app.cls(
+    gpu="A10G",
+    image=image,
+    volumes={CACHE_DIR: cache_volume},
+    secrets=deploy_secrets,
+    scaledown_window=300,
+    timeout=60 * 20,
+)
+class TribeFrameworkService:
     @modal.enter()
-    def load_model(self) -> None:
-        logger.info("Reserving GPU; mock-loading TRIBE v2 (facebook/tribev2) weights")
-        # MVP: no real download — structure mirrors production warm-container load.
-        self._model_id = "facebook/tribev2"
-        _ = self._model_id  # would reference loaded tensors in full implementation
+    def load_resources(self) -> None:
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        if not hf_token:
+            raise RuntimeError("HF_TOKEN is required inside the Modal container.")
 
-    # Same FastAPI semantics as legacy @modal.web_endpoint.
-    @modal.fastapi_endpoint(method="POST", label="extract-batch-bsv")
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        os.environ.setdefault("TRIBE_DATA_DIR", CACHE_DIR)
+        os.environ.setdefault("HF_HOME", f"{CACHE_DIR}/hf_home")
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", f"{CACHE_DIR}/hf_home/hub")
+
+        try:
+            from huggingface_hub import login, model_info, snapshot_download
+
+            login(token=hf_token, add_to_git_credential=False)
+            logger.info("Authenticated with Hugging Face hub inside Modal container")
+            model_info(LLAMA_REPO_ID, token=hf_token)
+            logger.info("Verified access to gated repo %s", LLAMA_REPO_ID)
+            snapshot_download(
+                repo_id=LLAMA_REPO_ID,
+                token=hf_token,
+                cache_dir=os.environ["HUGGINGFACE_HUB_CACHE"],
+                local_files_only=False,
+                resume_download=True,
+            )
+            logger.info("Warm-cached %s into %s", LLAMA_REPO_ID, os.environ["HUGGINGFACE_HUB_CACHE"])
+            snapshot_download(
+                repo_id=TRIBE_REPO_ID,
+                token=hf_token,
+                cache_dir=os.environ["HUGGINGFACE_HUB_CACHE"],
+                local_files_only=False,
+                resume_download=True,
+            )
+            logger.info("Warm-cached %s into %s", TRIBE_REPO_ID, os.environ["HUGGINGFACE_HUB_CACHE"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"Hugging Face preflight failed for {LLAMA_REPO_ID}. "
+                "The token must belong to an account with approved access."
+            ) from exc
+
+        from tribe_neural.init_resources import load_resources
+
+        logger.info("Loading tribe_neural resources into %s", CACHE_DIR)
+        self.resources = load_resources()
+        logger.info("tribe_neural resources loaded")
+
+    def _run_pipeline(self, text: str) -> dict[str, Any]:
+        from tribe_neural.steps.step1_tribe import run_tribe
+        from tribe_neural.steps.step2_roi import extract_all
+        from tribe_neural.steps.step3_stats import extract_stats
+        from tribe_neural.steps.step4_connectivity import compute_connectivity
+        from tribe_neural.steps.step5_composites import compute_composites
+        from tribe_neural.steps.step6_format import format_output
+
+        preds = run_tribe(text, self.resources.model)
+        if preds.shape[0] > 4:
+            preds = preds[:-2]
+
+        roi_ts = extract_all(
+            preds,
+            self.resources.masks,
+            self.resources.weight_maps,
+            self.resources.signatures,
+        )
+        stats = {name: extract_stats(ts) for name, ts in roi_ts.items()}
+        connectivity = compute_connectivity(roi_ts)
+        composites = compute_composites(stats, connectivity)
+        formatted = format_output(stats, connectivity, composites, roi_ts)
+        bsv = _derive_bsv(stats, composites)
+
+        return {
+            "bsv": bsv,
+            "formatted_state": formatted,
+            "roi_stats": stats,
+            "connectivity": connectivity,
+            "composites": composites,
+            "pred_shape": [int(preds.shape[0]), int(preds.shape[1])],
+            "dominant_roi": max(stats, key=lambda key: float(stats[key].get("peak", 0.0))),
+            "signal_confidence": round(float(composites.get("confidence", 0.0)), 4),
+        }
+
+    @modal.fastapi_endpoint(method="POST", label="extract-batch-bsv-framework")
     async def extract_batch_bsv(self, request: BatchRequest) -> dict[str, Any]:
-        """Simulate audio/text → fMRI tensor → 4D Biological State Vector via conditional mapping."""
-        h = int(hashlib.sha256(request.catalyst_text.encode("utf-8")).hexdigest()[:8], 16)
-        rng = random.Random(h)
-        
-        # Base translation for the text
-        base_cl = 0.3 + 0.65 * rng.random()
-        base_ea = 0.2 + 0.7 * rng.random()
-        base_dp = 0.25 + 0.7 * rng.random()
-        base_ws = 0.2 + 0.75 * rng.random()
+        text = request.catalyst_text.strip()
+        if not text:
+            raise ValueError("catalyst_text must not be empty.")
 
-        results = {}
-        for a in request.agents:
-            agent_rng = random.Random(h + a.id)
-            # Conditional mapping (simulate LFCM): Adjust based on role
-            role_mod_dp = 0.1 if "Civil" in a.role or "Worker" in a.role else 0.0
-            role_mod_cl = 0.15 if "Analyst" in a.role or "Engineer" in a.role else 0.0
+        result = self._run_pipeline(text)
+        base_bsv = result["bsv"]
+        agents = {str(agent.id): dict(base_bsv) for agent in request.agents}
 
-            bsv = {
-                "cognitive_load": max(0.0, min(1.0, round(base_cl + role_mod_cl + 0.1 * (agent_rng.random() - 0.5), 2))),
-                "emotional_agitation": max(0.0, min(1.0, round(base_ea + 0.15 * (agent_rng.random() - 0.5), 2))),
-                "defensive_posture": max(0.0, min(1.0, round(base_dp + role_mod_dp + 0.2 * (agent_rng.random() - 0.5), 2))),
-                "working_memory_strain": max(0.0, min(1.0, round(base_ws + 0.1 * (agent_rng.random() - 0.5), 2))),
-            }
-            results[str(a.id)] = bsv
-        
-        return {"agents": results}
+        return {
+            "agents": agents,
+            "tribe_meta": {
+                "provider": "tribe_neural_framework_modal",
+                "model_id": "facebook/tribev2",
+                "derivation_version": "tribe_neural_composites_v1",
+                "input_mode": "text_path",
+                "pred_shape": result["pred_shape"],
+                "signal_confidence": result["signal_confidence"],
+                "dominant_roi": result["dominant_roi"],
+                "composites": result["composites"],
+                "roi_stats": result["roi_stats"],
+                "connectivity": result["connectivity"],
+                "formatted_state": result["formatted_state"],
+                "data_dir": CACHE_DIR,
+            },
+        }

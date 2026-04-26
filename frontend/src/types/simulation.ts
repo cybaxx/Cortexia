@@ -39,6 +39,13 @@ export interface AgentSimulationPayload {
     cause_of_state: string;
     best_intervention: string;
   };
+  round_history?: Array<{
+    round: number;
+    belief_state: 'adopted' | 'rejected' | 'neutral';
+    confidence: number;
+    sentiment: 'positive' | 'negative' | 'neutral';
+    post: string;
+  }>;
 }
 
 export interface SummaryCounts {
@@ -98,6 +105,19 @@ export interface EvidenceTrace {
   warnings: string[];
 }
 
+export interface EvidenceGraphNode {
+  id: string;
+  label: string;
+  kind: 'claim' | 'theme' | 'actor' | 'concept' | string;
+  risk?: 'High' | 'Moderate' | 'Low' | string;
+}
+
+export interface EvidenceGraphEdge {
+  source: string;
+  target: string;
+  label: string;
+}
+
 export interface Hotspot {
   id: string;
   label: string;
@@ -106,6 +126,7 @@ export interface Hotspot {
   lng: number;
   lat: number;
   radiusMeters: number;
+  state?: 'adopted' | 'rejected' | 'neutral';
 }
 
 export interface SegmentInsight {
@@ -207,18 +228,102 @@ export interface LegacyMacroResult {
 }
 
 export interface SimulateResponse {
+  run_id?: number;
   city_id: string;
   domain: string;
   case_goal: string;
   effective_catalyst_text: string;
+  tribe_meta?: {
+    provider?: string;
+    model_id?: string;
+    cache_dir?: string;
+    input_mode?: string;
+    derivation_version?: string;
+    pred_shape?: [number, number] | number[];
+    signal_confidence?: number;
+    dominant_roi?: string;
+    formatted_state?: string;
+    data_dir?: string;
+    composites?: Record<string, number | string | boolean>;
+    roi_stats?: Record<string, unknown>;
+    connectivity?: Record<string, unknown>;
+    surface_summary?: Record<string, number | string | boolean>;
+    segment_count?: number;
+    segments_preview?: Array<Record<string, unknown>>;
+  };
   case_summary: CaseSummary;
   spread_model: SpreadModel;
   mechanisms: MechanismsReport;
   intervention_playbook: InterventionItem[];
   evidence_trace: EvidenceTrace;
+  evidence_graph?: {
+    nodes: EvidenceGraphNode[];
+    edges: EvidenceGraphEdge[];
+  };
+  swarm_dynamics?: {
+    narrative_summary: string;
+    rounds: Array<{
+      round: number;
+      adoption_rate: number;
+      rejection_rate: number;
+      neutral_rate: number;
+      dominant_mechanism: DominantSignal;
+      notable_shift: string;
+      posts: Array<{
+        agent_id: number;
+        name: string;
+        role: string;
+        belief_state: 'adopted' | 'rejected' | 'neutral';
+        confidence: number;
+        sentiment: 'positive' | 'negative' | 'neutral';
+        dominant_signal: DominantSignal;
+        post: string;
+      }>;
+    }>;
+  };
   summary: SummaryCounts;
   agents: AgentSimulationPayload[];
   macro_result: LegacyMacroResult;
+}
+
+export interface RecentRunSummary {
+  id: number;
+  created_at: string;
+  domain: string;
+  city_id: string;
+  case_goal: string;
+  claim: {
+    credibility?: number;
+    harm?: number;
+    [key: string]: unknown;
+  };
+  fidelity: number;
+}
+
+export interface PersistedRunResponse {
+  id: number;
+  created_at: string;
+  domain: string;
+  city_id: string;
+  case_goal: string;
+  evidence: EvidenceInput;
+  analysis_text: string;
+  source_excerpt?: string | null;
+  source_warning?: string | null;
+  claim: Record<string, unknown>;
+  fidelity: number;
+  response: SimulateResponse;
+}
+
+export interface AgentConversationMessage {
+  id: number;
+  created_at?: string;
+  user_message: string;
+  agent_reply: string;
+  sentiment: 'positive' | 'negative' | 'neutral' | string;
+  stance: 'adopted' | 'rejected' | 'neutral' | string;
+  audio_filename?: string | null;
+  audio_url?: string | null;
 }
 
 export interface TranscriptionResponse {

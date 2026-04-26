@@ -1,23 +1,16 @@
-import { Suspense, lazy } from 'react';
+import { ProductLanding } from '@/components/cortex/ProductLanding';
+import { SimulationDashboard } from '@/components/cortex/SimulationDashboard';
 import { useCortexStore } from '@/store/cortex';
-import { UseCaseSelector } from '@/components/cortex/UseCaseSelector';
-
-const CaseWorkspace = lazy(() =>
-  import('@/components/cortex/CaseWorkspace').then((module) => ({ default: module.CaseWorkspace })),
-);
 
 const Index = () => {
   const screen = useCortexStore((s) => s.screen);
+  const setScreen = useCortexStore((s) => s.setScreen);
 
-  if (screen === 'useCases') {
-    return <UseCaseSelector />;
+  if (screen === 'dashboard' || screen === 'workspace') {
+    return <SimulationDashboard onBack={() => setScreen('landing')} />;
   }
 
-  return (
-    <Suspense fallback={<div className="min-h-screen bg-bg-deep" />}>
-      <CaseWorkspace />
-    </Suspense>
-  );
+  return <ProductLanding onEnter={() => setScreen('dashboard')} />;
 };
 
 export default Index;

@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Literal
@@ -25,9 +27,11 @@ import httpx
 
 from app.city_presets import get_city
 from app.config import get_settings
+from app.pipeline_store import persist_case_run
 from app.services.ai_clients import BSV, call_k2_think, call_tribe_modal_batch
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 SignalType = Literal[
     "cognitive_overload",
@@ -195,8 +199,22 @@ class _Region:
     bsv: BSV
 
 
+@dataclass(frozen=True)
+class _Traits:
+    evidence_literacy: float
+    peer_susceptibility: float
+    identity_sensitivity: float
+    institutional_trust: float
+    analytic_scrutiny: float
+    baseline_openness: float
+
+
 def _compress_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _count_phrase(text: str, phrase: str) -> int:
+    return len(re.findall(rf"\b{re.escape(phrase)}\b", text))
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -220,7 +238,7 @@ def _extract_page_text(html_text: str) -> str:
 def _sentences(text: str) -> list[str]:
     cleaned = re.sub(r"\s+", " ", text.strip())
     if not cleaned:
-        return ["No reasoning returned."]
+        return []
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()][:6]
 
 
@@ -235,7 +253,7 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
 
         response = await httpx_client.get(
             source_url,
-            timeout=15.0,
+            timeout=settings.simulate_source_fetch_timeout_seconds,
             follow_redirects=True,
             headers={
                 "User-Agent": "CortexiaCompass/0.3 (+evidence-ingestion)",
@@ -247,10 +265,10 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
         extracted = _extract_page_text(response.text) if "text/html" in content_type or "<html" in response.text[:500].lower() else response.text[:3200]
         extracted = _compress_ws(extracted)
         if not extracted:
-            return None, "Source URL responded, but no readable text could be extracted."
+            raise RuntimeError("Source URL responded, but no readable text could be extracted.")
         return extracted[:2000], None
-    except Exception:
-        return None, "Source URL could not be fetched; analysis used the provided text and transcript only."
+    except Exception as exc:
+        raise RuntimeError(f"Source URL fetch failed: {exc}") from exc
 
 
 def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
@@ -307,8 +325,53 @@ def _case_feature_vector(analysis_text: str, case_goal: str, domain: str, messag
 
 def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | None) -> dict[str, float | str]:
     lowered = analysis_text.lower()
-    credibility = 0.56
-    harm = 0.22
+    words = re.findall(r"[a-zA-Z']+", analysis_text)
+    word_count = max(1, len(words))
+    sentence_count = max(1, len([s for s in re.split(r"(?<=[.!?])\s+", analysis_text) if s.strip()]))
+    avg_sentence_length = word_count / sentence_count
+    uppercase_ratio = sum(1 for ch in analysis_text if ch.isupper()) / max(1, sum(1 for ch in analysis_text if ch.isalpha()))
+
+    citation_count = sum(_count_phrase(lowered, token) for token in ("according to", "reported by", "study", "trial", "data", "evidence", "research"))
+    hedge_count = sum(_count_phrase(lowered, token) for token in ("may", "might", "suggests", "could", "associated with"))
+    certainty_count = sum(_count_phrase(lowered, token) for token in ("always", "never", "everyone", "nobody", "scientifically proven", "proven cure"))
+    conspiracy_count = sum(_count_phrase(lowered, token) for token in ("cover up", "hiding this", "don't want you to know", "big pharma", "medical system"))
+    replacement_count = sum(_count_phrase(lowered, token) for token in ("replace medication", "replace prescription", "stop taking medication", "don't need medication"))
+    sensational_count = sum(_count_phrase(lowered, token) for token in ("miracle", "secret", "cure", "shocking", "what doctors won't tell you"))
+    local_specificity = sum(_count_phrase(lowered, token) for token in ("south la", "los angeles", "karen bass", "residents", "public parks", "press coverage"))
+    urgency_count = sum(_count_phrase(lowered, token) for token in ("share this", "before they scrub it", "zero press coverage", "quietly approved"))
+
+    credibility = _clamp(
+        0.22
+        + min(0.18, citation_count * 0.05)
+        + min(0.08, hedge_count * 0.025)
+        + min(0.08, max(0.0, (avg_sentence_length - 10) / 25) * 0.08)
+        + (0.08 if source_excerpt else 0.0)
+        - min(0.18, certainty_count * 0.06)
+        - min(0.18, conspiracy_count * 0.07)
+        - min(0.22, replacement_count * 0.10)
+        - min(0.16, sensational_count * 0.06)
+        - min(0.08, uppercase_ratio * 0.24),
+        0.05,
+        0.95,
+    )
+    harm = _clamp(
+        0.18
+        + min(0.22, replacement_count * 0.10)
+        + min(0.16, sensational_count * 0.05)
+        + min(0.12, conspiracy_count * 0.05)
+        + (0.08 if domain == "public_health" else 0.0),
+        0.05,
+        0.95,
+    )
+    virality = _clamp(
+        0.18
+        + min(0.18, urgency_count * 0.07)
+        + min(0.14, local_specificity * 0.03)
+        + min(0.12, conspiracy_count * 0.05)
+        + min(0.08, certainty_count * 0.03),
+        0.05,
+        0.95,
+    )
 
     for pattern, penalty in LOW_CREDIBILITY_PATTERNS:
         if pattern in lowered:
@@ -316,6 +379,39 @@ def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | No
             harm += penalty * 0.55
 
     if domain == "public_health":
+        if any(token in lowered for token in ("scientifically proven", "clinically proven", "proven cure")):
+            credibility -= 0.18
+            harm += 0.11
+        if any(
+            token in lowered
+            for token in (
+                "replace prescription medication",
+                "replace medication",
+                "you do not need medication",
+                "you don't need medication",
+                "stop taking medication",
+            )
+        ):
+            credibility -= 0.34
+            harm += 0.26
+        if any(
+            token in lowered
+            for token in (
+                "doctors have been hiding this",
+                "doctors are hiding this",
+                "medical system ignores natural cures",
+                "pharmaceutical drugs",
+                "big pharma",
+                "what doctors won't tell you",
+            )
+        ):
+            credibility -= 0.22
+            harm += 0.18
+        if any(token in lowered for token in ("apple cider vinegar", "natural cure", "detox", "cleanse")):
+            credibility -= 0.14
+            harm += 0.09
+        if any(token in lowered for token in ("blood pressure", "hypertension", "anxiety", "live longer")):
+            harm += 0.08
         if "alcohol" in lowered and any(token in lowered for token in ("good for you", "healthy", "beneficial", "great for")):
             credibility -= 0.38
             harm += 0.28
@@ -323,12 +419,18 @@ def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | No
             credibility -= 0.24
             harm += 0.16
 
-    if any(token in lowered for token in ("always", "never", "everyone", "nobody", "proves that")):
+    if certainty_count >= 2 or any(token in lowered for token in ("scientifically proven", "proves that")):
         credibility -= 0.08
-    if source_excerpt:
+    if source_excerpt and any(token in source_excerpt.lower() for token in ("study", "journal", "clinical", "trial", "research", "cdc", "nih", "who")):
         credibility += 0.05
-    if any(token in lowered for token in ("study", "according to", "data", "evidence")):
+    if any(token in lowered for token in ("study", "according to", "data", "evidence")) and not any(
+        token in lowered for token in ("scientifically proven", "miracle cure", "secret cure", "replace medication")
+    ):
         credibility += 0.04
+
+    if domain == "political":
+        credibility += min(0.08, local_specificity * 0.02)
+        harm += min(0.06, urgency_count * 0.02)
 
     credibility = _clamp(credibility, 0.05, 0.95)
     harm = _clamp(harm, 0.05, 0.95)
@@ -336,6 +438,7 @@ def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | No
     return {
         "credibility": credibility,
         "harm": harm,
+        "virality": virality,
         "risk_label": risk_label,
     }
 
@@ -346,11 +449,11 @@ def _model_fidelity_factor(source_excerpt: str | None) -> tuple[float, list[str]
     if settings.tribe_modal_url.strip():
         fidelity += 0.18
     else:
-        notes.append("TRIBE is running in fallback/demo mode, so neural-state fidelity is limited.")
+        notes.append("TRIBE endpoint is not configured, so the run cannot produce a valid neural-state analysis.")
     if settings.ifm_api_key.strip():
         fidelity += 0.16
     else:
-        notes.append("K2 reasoning is running in fallback mode, so behavioral explanations are heuristic.")
+        notes.append("K2 endpoint is not configured, so the run cannot produce agent-level reasoning.")
     if source_excerpt:
         fidelity += 0.08
     else:
@@ -376,6 +479,19 @@ def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
         "institutional_trust": _clamp(0.42 + service * 0.16 + civic * 0.08 - analytical * 0.04),
         "identity_salience": _clamp(0.34 + civic * 0.18 + analytical * 0.07),
     }
+
+
+def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
+    cond = _agent_conditioning(agent, city_id)
+    seeded_shift = lambda offset: (_seeded(agent.id * 29 + offset) - 0.5) * 0.12
+    return _Traits(
+        evidence_literacy=_clamp(0.48 + cond["analytical"] * 0.22 + cond["service"] * 0.08 + seeded_shift(7)),
+        peer_susceptibility=_clamp(0.42 + cond["civic"] * 0.16 + cond["peripheral_pressure"] * 0.18 + seeded_shift(11)),
+        identity_sensitivity=_clamp(0.36 + cond["identity_salience"] * 0.34 + seeded_shift(13)),
+        institutional_trust=_clamp(cond["institutional_trust"] + seeded_shift(17)),
+        analytic_scrutiny=_clamp(0.44 + cond["analytical"] * 0.28 + seeded_shift(19)),
+        baseline_openness=_clamp(0.46 + cond["service"] * 0.08 + cond["civic"] * 0.04 - cond["peripheral_pressure"] * 0.06 + seeded_shift(23)),
+    )
 
 
 def _apply_lfcm_calibration(
@@ -488,6 +604,112 @@ def _derive_brain_regions(bsv: BSV, *, role: str, supportive_neighbors: int, res
     }
 
 
+def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_diagnostics: dict[str, float | str]) -> dict[str, float]:
+    lowered = analysis_text.lower()
+    anti_institution = any(token in lowered for token in ("they don't want you", "officials lie", "government", "cover up", "media"))
+    prosocial = any(token in lowered for token in ("community", "family", "protect", "help", "support"))
+    absolutist = any(token in lowered for token in ("always", "never", "everyone", "nobody", "proves"))
+    health_falsehood = domain == "public_health" and any(token in lowered for token in ("alcohol is good for you", "miracle cure", "doctor hate this"))
+    political_rumor = domain == "political" and any(
+        token in lowered
+        for token in (
+            "quietly approved",
+            "never consulted",
+            "zero press coverage",
+            "share this before they scrub it",
+            "signed off",
+            "managed outdoor communities",
+        )
+    )
+
+    prior_fit = _clamp(
+        0.22
+        + traits.baseline_openness * 0.18
+        + (traits.identity_sensitivity * 0.12 if prosocial else 0.0)
+        + ((1.0 - traits.institutional_trust) * 0.16 if anti_institution else 0.0)
+        + ((1.0 - traits.institutional_trust) * 0.16 + traits.identity_sensitivity * 0.08 if political_rumor else 0.0)
+        - traits.analytic_scrutiny * 0.10
+        - traits.evidence_literacy * 0.14
+        - (0.14 if health_falsehood else 0.0)
+        - (0.06 if absolutist else 0.0)
+    )
+    scrutiny = _clamp(
+        0.28
+        + traits.evidence_literacy * 0.24
+        + traits.analytic_scrutiny * 0.22
+        + traits.institutional_trust * 0.08
+        + (0.08 if health_falsehood else 0.0)
+        - (0.06 if political_rumor else 0.0)
+    )
+    return {"prior_fit": prior_fit, "scrutiny": scrutiny}
+
+
+def _baseline_uptake_score(
+    *,
+    analysis_text: str,
+    domain: str,
+    bsv: BSV,
+    traits: _Traits,
+    claim_diagnostics: dict[str, float | str],
+) -> tuple[float, dict[str, float]]:
+    align = _claim_alignment(analysis_text, domain, traits, claim_diagnostics)
+    claim_cred = float(claim_diagnostics["credibility"])
+    harm = float(claim_diagnostics["harm"])
+    virality = float(claim_diagnostics.get("virality", 0.18))
+
+    score = _clamp(
+        0.18
+        + claim_cred * 0.28
+        + virality * (0.16 + (1.0 - traits.institutional_trust) * 0.14)
+        + align["prior_fit"] * 0.18
+        + traits.peer_susceptibility * 0.08
+        + traits.baseline_openness * 0.08
+        + bsv["emotional_agitation"] * 0.05
+        - align["scrutiny"] * 0.22
+        - traits.evidence_literacy * 0.10
+        - bsv["defensive_posture"] * 0.07
+        - bsv["working_memory_strain"] * 0.06
+        - harm * 0.22
+    )
+    return score, {
+        "claim_credibility": claim_cred,
+        "virality": virality,
+        "prior_fit": align["prior_fit"],
+        "peer_susceptibility": traits.peer_susceptibility,
+        "baseline_openness": traits.baseline_openness,
+        "scrutiny": align["scrutiny"],
+        "defensive_posture": bsv["defensive_posture"],
+        "working_memory_strain": bsv["working_memory_strain"],
+        "harm_penalty": harm,
+    }
+
+
+def _final_uptake_score(
+    baseline_score: float,
+    *,
+    local_adoption_ratio: float,
+    resonance: float,
+    traits: _Traits,
+    bsv: BSV,
+    claim_diagnostics: dict[str, float | str],
+) -> tuple[float, dict[str, float]]:
+    claim_cred = float(claim_diagnostics["credibility"])
+    virality = float(claim_diagnostics.get("virality", 0.18))
+    social_lift = local_adoption_ratio * (0.10 + traits.peer_susceptibility * 0.10)
+    openness_lift = resonance * 0.06 + traits.baseline_openness * 0.05 + virality * 0.04
+    friction_penalty = bsv["cognitive_load"] * 0.05 + bsv["defensive_posture"] * 0.05
+    credibility_gate = 0.10 if claim_cred < 0.25 and virality < 0.35 else 0.04 if claim_cred < 0.25 else 0.0
+    final = _clamp(baseline_score + social_lift + openness_lift - friction_penalty - credibility_gate)
+    return final, {
+        "baseline_score": baseline_score,
+        "local_adoption_ratio": local_adoption_ratio,
+        "social_lift": social_lift,
+        "openness_lift": openness_lift,
+        "friction_penalty": friction_penalty,
+        "credibility_gate": credibility_gate,
+    }
+
+
 def _dominant_signal(bsv: BSV, regions: dict[str, float], supportive_neighbors: int) -> SignalType:
     if bsv["defensive_posture"] > 0.7 or regions["insula"] > 0.72:
         return "defensive_reactance"
@@ -511,8 +733,12 @@ def _parse_k2_output(raw: str, fallback_signal: SignalType) -> tuple[list[str], 
     signal_match = _SIGNAL_RE.search(raw)
 
     thinking = think_match.group(1).strip() if think_match else raw.strip()
-    action = action_match.group(1).lower() if action_match else "rejected"
-    confidence = float(confidence_match.group(1)) if confidence_match else 0.58
+    if not action_match:
+        raise RuntimeError("K2 response did not include an <action> tag.")
+    if not confidence_match:
+        raise RuntimeError("K2 response did not include a <confidence> tag.")
+    action = action_match.group(1).lower()
+    confidence = float(confidence_match.group(1))
     signal_text = signal_match.group(1).strip().lower() if signal_match else fallback_signal
     signal: SignalType = fallback_signal
     if signal_text in {"cognitive_overload", "defensive_reactance", "empathic_resonance", "memory_alignment", "social_proof"}:
@@ -548,6 +774,202 @@ def _intervention_hint(signal: SignalType) -> str:
     return f"{library['recommended_messenger']} via {library['recommended_channel']}"
 
 
+def _state_from_score(score: float, claim_credibility: float) -> str:
+    adopt_threshold = 0.72 if claim_credibility < 0.18 else 0.66 if claim_credibility < 0.3 else 0.61
+    reject_threshold = 0.31 if claim_credibility < 0.18 else 0.34 if claim_credibility < 0.3 else 0.43
+    if score >= adopt_threshold:
+        return "adopted"
+    if score <= reject_threshold:
+        return "rejected"
+    return "neutral"
+
+
+def _sentiment_for_state(state: str) -> str:
+    if state == "adopted":
+        return "positive"
+    if state == "rejected":
+        return "negative"
+    return "neutral"
+
+
+def _round_post_text(
+    agent: dict[str, Any],
+    round_number: int,
+    state: str,
+    claim_snippet: str,
+    *,
+    adopt_exposure: float,
+    reject_exposure: float,
+    score: float,
+) -> str:
+    signal = str(agent["dominant_signal"])
+    role = agent["role"]
+    role_lower = role.lower()
+    role_frame = (
+        "From a neighborhood coordination lens,"
+        if "organizer" in role_lower or "policy" in role_lower
+        else "From a reporting lens,"
+        if "journal" in role_lower
+        else "From a public-service lens,"
+        if "health" in role_lower or "educator" in role_lower or "responder" in role_lower
+        else "From an analytical lens,"
+        if "research" in role_lower or "engineer" in role_lower or "analyst" in role_lower
+        else "From where I sit,"
+    )
+    mood = "still" if round_number > 1 else "initially"
+    exposure_clause = (
+        f" After seeing roughly {round(adopt_exposure * 100)}% supportive signals nearby,"
+        if adopt_exposure > reject_exposure and adopt_exposure > 0
+        else f" After seeing roughly {round(reject_exposure * 100)}% skeptical signals nearby,"
+        if reject_exposure > 0
+        else ""
+    )
+    if state == "adopted":
+        if signal == "social_proof":
+            return f"{role_frame} I {mood} read the claim about {claim_snippet} as socially believable.{exposure_clause} it feels easier for me to repeat."
+        if signal == "memory_alignment":
+            return f"{role_frame} the claim about {claim_snippet} sounds familiar and plausible in the way people around me already talk about it.{exposure_clause}"
+        return f"{role_frame} at round {round_number}, I’m leaning toward the claim about {claim_snippet} because it still feels coherent enough to pass along, even if I’m only about {round(score * 100)}% persuaded.{exposure_clause}"
+    if state == "neutral":
+        return f"{role_frame} I'm not fully buying the claim about {claim_snippet}, but I also haven't fully dismissed it.{exposure_clause} I can see why someone overloaded or unsure might keep it circulating."
+    if signal == "defensive_reactance":
+        return f"{role_frame} the claim about {claim_snippet} feels manipulative or overstated to me, so I’m pushing back instead of accepting it.{exposure_clause}"
+    if signal == "cognitive_overload":
+        return f"{role_frame} the claim about {claim_snippet} comes in too forcefully and with too many leaps, so I end up rejecting it rather than sorting through it.{exposure_clause}"
+    return f"{role_frame} I don’t find the claim about {claim_snippet} convincing enough to trust or repeat at this point.{exposure_clause}"
+
+
+def _build_swarm_dynamics(
+    *,
+    analysis_text: str,
+    agents: list[dict[str, Any]],
+    claim_credibility: float,
+) -> dict[str, Any]:
+    claim_snippet = _compress_ws(analysis_text)[:72]
+    rounds: list[dict[str, Any]] = []
+    prev_scores: dict[int, float] = {}
+    prev_states: dict[int, str] = {}
+    neighbors_by_agent: dict[int, list[dict[str, Any]]] = {}
+    per_agent_history: dict[int, list[dict[str, Any]]] = {}
+
+    for agent in agents:
+        pipeline = agent.get("_pipeline") or {}
+        prev_scores[agent["id"]] = float(pipeline.get("baseline_score", 0.5))
+        prev_states[agent["id"]] = _state_from_score(prev_scores[agent["id"]], claim_credibility)
+        neighbors_by_agent[agent["id"]] = [
+            other
+            for other in agents
+            if other["id"] != agent["id"]
+            and _within_radius(agent["latitude"], agent["longitude"], other["latitude"], other["longitude"], radius_deg=0.06)
+        ]
+
+    for round_number in (1, 2, 3):
+        simulated_agents: list[dict[str, Any]] = []
+        next_scores: dict[int, float] = {}
+        next_states: dict[int, str] = {}
+        for agent in agents:
+            pipeline = agent.get("_pipeline") or {}
+            baseline = float(pipeline.get("baseline_score", 0.5))
+            final = float(pipeline.get("final_score", baseline))
+            traits = pipeline.get("traits") or {}
+            role_bias = 0.02 if "journal" in agent["role"].lower() or "organizer" in agent["role"].lower() else 0.0
+            neighbors = neighbors_by_agent[agent["id"]]
+            adopted_neighbors = sum(1 for other in neighbors if prev_states.get(other["id"]) == "adopted")
+            rejected_neighbors = sum(1 for other in neighbors if prev_states.get(other["id"]) == "rejected")
+            total_neighbors = len(neighbors)
+            adopt_exposure = adopted_neighbors / max(1, total_neighbors)
+            reject_exposure = rejected_neighbors / max(1, total_neighbors)
+            peer_sus = float(traits.get("peer_susceptibility", 0.5))
+            openness = float(traits.get("baseline_openness", 0.5))
+            scrutiny = float(traits.get("analytic_scrutiny", 0.5))
+            identity = float(traits.get("identity_sensitivity", 0.5))
+            score = _clamp(
+                baseline * (0.62 if round_number == 1 else 0.34)
+                + final * (0.18 if round_number == 1 else 0.32)
+                + prev_scores[agent["id"]] * (0.20 if round_number == 1 else 0.34)
+                + adopt_exposure * (0.10 + peer_sus * 0.10 + role_bias)
+                - reject_exposure * (0.08 + scrutiny * 0.08)
+                + openness * 0.03
+                - identity * (0.02 if claim_credibility < 0.35 else 0.0)
+                - (0.07 if claim_credibility < 0.22 else 0.0),
+            )
+            state = _state_from_score(score, claim_credibility)
+            sentiment = _sentiment_for_state(state)
+            confidence = round(max(0.2, min(0.92, 0.36 + abs(score - 0.5) * 0.96 + round_number * 0.04)), 3)
+            post = _round_post_text(
+                agent,
+                round_number,
+                state,
+                claim_snippet,
+                adopt_exposure=adopt_exposure,
+                reject_exposure=reject_exposure,
+                score=score,
+            )
+            row = {
+                "agent_id": agent["id"],
+                "name": agent["name"],
+                "role": agent["role"],
+                "belief_state": state,
+                "confidence": confidence,
+                "sentiment": sentiment,
+                "dominant_signal": agent["dominant_signal"],
+                "post": post,
+                "adopt_exposure": round(adopt_exposure, 3),
+                "reject_exposure": round(reject_exposure, 3),
+            }
+            simulated_agents.append(row)
+            per_agent_history.setdefault(agent["id"], []).append(
+                {
+                    "round": round_number,
+                    "belief_state": state,
+                    "confidence": confidence,
+                    "sentiment": sentiment,
+                    "post": post,
+                }
+            )
+            next_scores[agent["id"]] = score
+            next_states[agent["id"]] = state
+
+        adopted = sum(1 for item in simulated_agents if item["belief_state"] == "adopted")
+        rejected = sum(1 for item in simulated_agents if item["belief_state"] == "rejected")
+        neutral = len(simulated_agents) - adopted - rejected
+        dominant_signal = max(
+            ("cognitive_overload", "defensive_reactance", "social_proof", "memory_alignment", "empathic_resonance"),
+            key=lambda sig: sum(1 for item in simulated_agents if item["dominant_signal"] == sig),
+        )
+        notable_shift = (
+            f"Round 1 surfaces the initial reading pattern: {adopted} adopt, {rejected} reject, and {neutral} hold in the middle."
+            if round_number == 1
+            else f"Round 2 introduces neighborhood reinforcement, shifting exposure through nearby adopted ({sum(item['adopt_exposure'] for item in simulated_agents)/max(1,len(simulated_agents)):.2f}) and rejected ({sum(item['reject_exposure'] for item in simulated_agents)/max(1,len(simulated_agents)):.2f}) signals."
+            if round_number == 2
+            else f"Round 3 shows where the claim actually stabilizes after repeated exposure across the local network."
+        )
+        highlighted_posts = sorted(
+            simulated_agents,
+            key=lambda item: (abs(item["confidence"] - 0.5), item["adopt_exposure"] + item["reject_exposure"]),
+            reverse=True,
+        )[:6]
+        rounds.append(
+            {
+                "round": round_number,
+                "adoption_rate": round(adopted / max(1, len(simulated_agents)) * 100),
+                "rejection_rate": round(rejected / max(1, len(simulated_agents)) * 100),
+                "neutral_rate": round(neutral / max(1, len(simulated_agents)) * 100),
+                "dominant_mechanism": dominant_signal,
+                "notable_shift": notable_shift,
+                "posts": highlighted_posts,
+            }
+        )
+        prev_scores = next_scores
+        prev_states = next_states
+
+    return {
+        "rounds": rounds,
+        "per_agent_history": per_agent_history,
+        "narrative_summary": "The swarm now runs as a real short propagation loop: each round updates agent stance from prior score, local exposure, and network pressure instead of replaying the same canned narrative.",
+    }
+
+
 async def _run_agent_reasoning(
     httpx_client: httpx.AsyncClient,
     *,
@@ -560,63 +982,45 @@ async def _run_agent_reasoning(
     total_neighbors: int,
     resonance: float,
     regions: dict[str, float],
+    traits: _Traits,
+    baseline_score: float,
+    final_score: float,
+    local_adoption_ratio: float,
+    score_breakdown: dict[str, float],
     claim_diagnostics: dict[str, float | str],
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Any]:
     signal = _dominant_signal(bsv, regions, supportive_neighbors)
+    claim_credibility = float(claim_diagnostics["credibility"])
+    predetermined_state = _state_from_score(final_score, claim_credibility)
 
     async with semaphore:
-        try:
-            raw = await call_k2_think(
-                httpx_client,
-                name=agent.name,
-                role=f"{agent.role} in {DOMAIN_CONTEXT.get(domain, domain)}",
-                bsv=bsv,
-                adopted_neighbor_count=supportive_neighbors,
-                total_neighbors_in_radius=total_neighbors,
-                catalyst_text=(
-                    f"{analysis_text}\n"
-                    f"Case goal: {case_goal}\n"
-                    f"Context: target domain={DOMAIN_CONTEXT.get(domain, domain)}; "
-                    f"dominant mechanism={_signal_label(signal)}; local resonance={resonance:.2f}."
-                ),
-                claim_credibility=float(claim_diagnostics["credibility"]),
-                claim_risk=str(claim_diagnostics["risk_label"]),
-            )
-        except Exception:
-            raw = (
-                "<think>Upstream K2 failure; using local fallback from the agent neural profile and neighborhood context.</think>"
-                f"<action>{'Rejected' if signal in ('defensive_reactance', 'cognitive_overload') else 'Adopted'}</action>"
-                f"<confidence>{0.62 if signal in ('defensive_reactance', 'cognitive_overload') else 0.57:.2f}</confidence>"
-                f"<signal>{signal}</signal>"
-            )
+        raw = await call_k2_think(
+            httpx_client,
+            name=agent.name,
+            role=f"{agent.role} in {DOMAIN_CONTEXT.get(domain, domain)}",
+            bsv=bsv,
+            adopted_neighbor_count=supportive_neighbors,
+            total_neighbors_in_radius=total_neighbors,
+            catalyst_text=(
+                f"{analysis_text}\n"
+                f"Case goal: {case_goal}\n"
+                f"Context: target domain={DOMAIN_CONTEXT.get(domain, domain)}; "
+                f"dominant mechanism={_signal_label(signal)}; local resonance={resonance:.2f}; "
+                f"baseline uptake score={baseline_score:.2f}; final uptake score={final_score:.2f}; "
+                f"local adoption ratio={local_adoption_ratio:.2f}."
+            ),
+            claim_credibility=claim_credibility,
+            claim_risk=str(claim_diagnostics["risk_label"]),
+            computed_outcome=predetermined_state.title(),
+            adoption_score=final_score,
+            agent_traits=traits.__dict__,
+            score_breakdown=score_breakdown,
+        )
 
-    reasoning, action, confidence, parsed_signal = _parse_k2_output(raw, signal)
-    support_ratio = 0.0 if total_neighbors == 0 else supportive_neighbors / max(1, total_neighbors)
-    claim_credibility = float(claim_diagnostics["credibility"])
-    claim_harm = float(claim_diagnostics["harm"])
-    adoption_score = _clamp(
-        claim_credibility * 0.36
-        + support_ratio * 0.18
-        + resonance * 0.10
-        + (1.0 - bsv["defensive_posture"]) * 0.13
-        + (1.0 - bsv["cognitive_load"]) * 0.10
-        + (0.05 if parsed_signal in {"memory_alignment", "empathic_resonance"} else 0.0)
-        + (0.04 if parsed_signal == "social_proof" else 0.0)
-        - claim_harm * 0.22
-        - bsv["emotional_agitation"] * 0.07
-    )
-
-    if claim_credibility < 0.24 and support_ratio < 0.45:
-        state = "rejected"
-    elif action == "adopted" and adoption_score >= 0.61:
-        state = "adopted"
-    elif adoption_score <= 0.42 or action == "rejected":
-        state = "rejected"
-    else:
-        state = "neutral"
-
-    confidence = _clamp((confidence * 0.58) + (abs(adoption_score - 0.5) * 2.0 * 0.22) + (claim_credibility * 0.08), 0.18, 0.82)
+    reasoning, _action, confidence, parsed_signal = _parse_k2_output(raw, signal)
+    state = predetermined_state
+    confidence = _clamp((confidence * 0.46) + (abs(final_score - 0.5) * 2.0 * 0.24) + (claim_credibility * 0.06), 0.18, 0.78)
 
     return {
         "id": agent.id,
@@ -641,6 +1045,75 @@ async def _run_agent_reasoning(
             "cause_of_state": reasoning[0] if reasoning else _signal_summary(parsed_signal, state, regions),
             "best_intervention": _intervention_hint(parsed_signal),
         },
+        "_pipeline": {
+            "traits": traits.__dict__,
+            "baseline_score": round(baseline_score, 3),
+            "final_score": round(final_score, 3),
+            "local_adoption_ratio": round(local_adoption_ratio, 3),
+            "score_breakdown": {k: round(v, 3) for k, v in score_breakdown.items()},
+        },
+    }
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def _materialize_agent_result(
+    *,
+    agent: _Virt,
+    bsv: BSV,
+    regions: dict[str, float],
+    traits: _Traits,
+    baseline_score: float,
+    final_score: float,
+    local_adoption_ratio: float,
+    score_breakdown: dict[str, float],
+    claim_credibility: float,
+    raw_reasoning: dict[str, Any],
+    default_signal: SignalType,
+) -> dict[str, Any]:
+    parsed_signal_text = str(raw_reasoning["signal"]).strip().lower()
+    parsed_signal: SignalType = default_signal
+    if parsed_signal_text in {"cognitive_overload", "defensive_reactance", "empathic_resonance", "memory_alignment", "social_proof"}:
+        parsed_signal = parsed_signal_text  # type: ignore[assignment]
+    state = _state_from_score(final_score, claim_credibility)
+    reasoning = [str(line).strip() for line in raw_reasoning.get("reasoning", []) if str(line).strip()]
+    confidence = _clamp(
+        (float(raw_reasoning["confidence"]) * 0.46) + (abs(final_score - 0.5) * 2.0 * 0.24) + (claim_credibility * 0.06),
+        0.18,
+        0.78,
+    )
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "role": agent.role,
+        "longitude": agent.lng,
+        "latitude": agent.lat,
+        "belief_state": state,
+        "k2_reasoning_trace": reasoning,
+        "k2_decision_confidence": confidence,
+        "dominant_signal": parsed_signal,
+        "brain_regions": regions,
+        "brain_summary": _signal_summary(parsed_signal, state, regions),
+        "tribe_neurological_metrics": {
+            "cognitive_load": float(bsv["cognitive_load"]),
+            "emotional_friction": float(bsv["emotional_agitation"]),
+            "defensive_activation": float(bsv["defensive_posture"]),
+            "working_memory_strain": float(bsv["working_memory_strain"]),
+        },
+        "agent_insight": {
+            "vulnerability": f"Most sensitive to {_signal_label(parsed_signal)} dynamics.",
+            "cause_of_state": reasoning[0] if reasoning else _signal_summary(parsed_signal, state, regions),
+            "best_intervention": _intervention_hint(parsed_signal),
+        },
+        "_pipeline": {
+            "traits": traits.__dict__,
+            "baseline_score": round(baseline_score, 3),
+            "final_score": round(final_score, 3),
+            "local_adoption_ratio": round(local_adoption_ratio, 3),
+            "score_breakdown": {k: round(v, 3) for k, v in score_breakdown.items()},
+        },
     }
 
 
@@ -653,28 +1126,32 @@ def _cluster_key(city_id: str, latitude: float, longitude: float) -> tuple[str, 
 
 def _build_hotspots(city_id: str, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     adopted = [a for a in agents if a["belief_state"] == "adopted"]
-    if not adopted:
+    rejected = [a for a in agents if a["belief_state"] == "rejected"]
+    salient = adopted if len(adopted) >= len(rejected) and adopted else rejected
+    if not salient:
         return []
+    hotspot_state = "adopted" if salient is adopted else "rejected"
 
     buckets: dict[str, dict[str, Any]] = {}
-    for agent in adopted:
+    for agent in salient:
         key, label = _cluster_key(city_id, agent["latitude"], agent["longitude"])
         bucket = buckets.setdefault(key, {"id": key.lower(), "label": label, "area": label, "count": 0, "lat_sum": 0.0, "lng_sum": 0.0, "share_sum": 0.0})
         bucket["count"] += 1
         bucket["lat_sum"] += agent["latitude"]
         bucket["lng_sum"] += agent["longitude"]
-        bucket["share_sum"] += 1.0 / len(adopted)
+        bucket["share_sum"] += 1.0 / len(salient)
 
     ranked = sorted(buckets.values(), key=lambda item: item["count"], reverse=True)[:3]
     return [
         {
             "id": item["id"],
-            "label": item["label"],
+            "label": f"{item['label']} {'uptake' if hotspot_state == 'adopted' else 'rejection'} cluster",
             "area": item["area"],
             "share": round(item["share_sum"], 3),
             "lng": item["lng_sum"] / item["count"],
             "lat": item["lat_sum"] / item["count"],
             "radiusMeters": 1400 + item["count"] * 180,
+            "state": hotspot_state,
         }
         for item in ranked
     ]
@@ -690,6 +1167,63 @@ def _extract_claims(analysis_text: str) -> list[dict[str, Any]]:
             "risk": "High" if any(word in sentence.lower() for word in ("maga", "look down", "fair or not", "community", "good for you", "miracle cure", "cures")) else "Moderate",
         })
     return claims
+
+
+def _extract_entities(analysis_text: str, speaker_context: str | None) -> list[dict[str, Any]]:
+    combined = f"{speaker_context or ''} {analysis_text}"
+    raw_candidates = re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}|[A-Z]{2,})\b", combined)
+    phrase_candidates = re.findall(
+        r"\b(?:south la|los angeles|karen bass|managed outdoor communities|public parks?|homeless encampments?|press coverage|residents)\b",
+        combined.lower(),
+    )
+    entities: list[str] = []
+    seen: set[str] = set()
+    for item in [*(phrase.title() for phrase in phrase_candidates), *raw_candidates]:
+        cleaned = _compress_ws(item.strip(" .,:;!?\"'"))
+        if len(cleaned) < 3:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        entities.append(cleaned)
+        if len(entities) >= 8:
+            break
+    return [
+        {
+            "id": f"entity-{index+1}",
+            "label": label,
+            "kind": "concept"
+            if any(token in label.lower() for token in ("pressure", "health", "medication", "claim", "trust"))
+            else "actor",
+        }
+        for index, label in enumerate(entities)
+    ]
+
+
+def _build_evidence_graph(
+    analysis_text: str,
+    speaker_context: str | None,
+    claims: list[dict[str, Any]],
+    themes: list[str],
+) -> dict[str, Any]:
+    entities = _extract_entities(analysis_text, speaker_context)
+    claim_nodes = [
+        {"id": claim["id"], "label": claim["text"][:84], "kind": "claim", "risk": claim["risk"]}
+        for claim in claims[:4]
+    ]
+    theme_nodes = [
+        {"id": f"theme-{index+1}", "label": theme.replace("_", " "), "kind": "theme"}
+        for index, theme in enumerate(themes[:5])
+    ]
+    nodes = [*claim_nodes, *theme_nodes, *entities][:14]
+    edges: list[dict[str, Any]] = []
+    for claim in claim_nodes:
+        for theme in theme_nodes[:2]:
+            edges.append({"source": claim["id"], "target": theme["id"], "label": "activates"})
+        for entity in entities[:2]:
+            edges.append({"source": claim["id"], "target": entity["id"], "label": "references"})
+    return {"nodes": nodes, "edges": edges[:18]}
 
 
 def _extract_themes(analysis_text: str) -> list[str]:
@@ -867,6 +1401,7 @@ def _build_workspace_payload(
     source_warning: str | None,
     agents: list[dict[str, Any]],
     claim_diagnostics: dict[str, float | str],
+    swarm_dynamics: dict[str, Any],
 ) -> dict[str, Any]:
     total = len(agents)
     adopted = sum(1 for agent in agents if agent["belief_state"] == "adopted")
@@ -891,6 +1426,7 @@ def _build_workspace_payload(
     hotspots = _build_hotspots(city_id, agents)
     claims = _extract_claims(analysis_text)
     themes = _extract_themes(analysis_text)
+    evidence_graph = _build_evidence_graph(analysis_text, evidence.get("speaker_context"), claims, themes)
     target_segments = _build_segment_buckets(agents)
     dominant_drivers, mechanism_summary = _build_mechanism_summary(agents)
     intervention_playbook = _build_intervention_playbook(
@@ -969,6 +1505,11 @@ def _build_workspace_payload(
         "mechanisms": mechanisms,
         "intervention_playbook": intervention_playbook,
         "evidence_trace": evidence_trace,
+        "evidence_graph": evidence_graph,
+        "swarm_dynamics": {
+            "rounds": swarm_dynamics["rounds"],
+            "narrative_summary": swarm_dynamics["narrative_summary"],
+        },
         "summary": {"total": total, "adopted": adopted, "rejected": rejected, "neutral": neutral},
         "agents": agents,
         "macro_result": {
@@ -1025,89 +1566,255 @@ async def run_simulation_http(
     message_complexity: float,
 ) -> dict[str, object]:
     population = _build_virtual_population(city_id, settings.simulate_population_size)
+    stage_trace: list[dict[str, float | str]] = []
 
-    async with httpx.AsyncClient() as httpx_client:
-        source_excerpt, source_warning = await _fetch_source_context(httpx_client, evidence.get("source_url"))
-        analysis_text, _ = _build_analysis_text(evidence, source_excerpt)
-        case_features = _case_feature_vector(analysis_text, case_goal, domain, message_complexity)
-        claim_diagnostics = _claim_diagnostics(analysis_text, domain, source_excerpt)
-        batch_agents = [{"id": agent.id, "role": agent.role, "latitude": agent.lat, "longitude": agent.lng} for agent in population]
-        tribe_results = await call_tribe_modal_batch(httpx_client, analysis_text, batch_agents)
+    async def _timed(stage: str, awaitable: Any) -> Any:
+        logger.info("Simulation stage start: %s", stage)
+        started = time.perf_counter()
+        result = await awaitable
+        seconds = round(time.perf_counter() - started, 3)
+        stage_trace.append({"stage": stage, "seconds": seconds})
+        logger.info("Simulation stage complete: %s in %.3fs", stage, seconds)
+        return result
 
-        noisy_regions = [
-            _Region(
-                agent_id=agent.id,
-                latitude=agent.lat,
-                longitude=agent.lng,
-                bsv=_apply_lfcm_calibration(
-                    tribe_results.get(
-                        str(agent.id),
-                        {
-                            "cognitive_load": 0.5,
-                            "emotional_agitation": 0.5,
-                            "defensive_posture": 0.5,
-                            "working_memory_strain": 0.5,
-                        },
+    async def _run_pipeline() -> dict[str, object]:
+        async with httpx.AsyncClient() as httpx_client:
+            source_excerpt, source_warning = await _timed(
+                "source_fetch",
+                _fetch_source_context(httpx_client, evidence.get("source_url")),
+            )
+            analysis_text, _ = _build_analysis_text(evidence, source_excerpt)
+            case_features = _case_feature_vector(analysis_text, case_goal, domain, message_complexity)
+            claim_diagnostics = _claim_diagnostics(analysis_text, domain, source_excerpt)
+            batch_agents = [{"id": agent.id, "role": agent.role, "latitude": agent.lat, "longitude": agent.lng} for agent in population]
+            tribe_batch = await _timed(
+                "tribe_batch",
+                call_tribe_modal_batch(httpx_client, analysis_text, batch_agents),
+            )
+            tribe_results = tribe_batch["agents"]
+            tribe_meta = tribe_batch.get("tribe_meta") or {}
+
+            missing_ids = [str(agent.id) for agent in population if str(agent.id) not in tribe_results]
+            if missing_ids:
+                raise RuntimeError(f"TRIBE response is missing BSVs for agent ids: {', '.join(missing_ids[:8])}")
+
+            calibrated_regions = [
+                _Region(
+                    agent_id=agent.id,
+                    latitude=agent.lat,
+                    longitude=agent.lng,
+                    bsv=_apply_lfcm_calibration(
+                        tribe_results[str(agent.id)],
+                        agent=agent,
+                        city_id=city_id,
+                        case_features=case_features,
+                        message_complexity=message_complexity,
                     ),
-                    agent=agent,
-                    city_id=city_id,
-                    case_features=case_features,
-                    message_complexity=message_complexity,
-                ),
-            )
-            for agent in population
-        ]
+                )
+                for agent in population
+            ]
+            regions_by_id = {region.agent_id: region for region in calibrated_regions}
 
-        semaphore = asyncio.Semaphore(settings.simulate_k2_concurrency)
-        tasks = []
-        for agent in population:
-            raw_region = next(region for region in noisy_regions if region.agent_id == agent.id)
-            supportive_neighbors, total_neighbors, resonance = _neighbor_context(agent, noisy_regions)
-            adjusted_bsv = _apply_spatial_bsv(raw_region.bsv, supportive_neighbors, total_neighbors, resonance)
-            regions = _derive_brain_regions(
-                adjusted_bsv,
-                role=agent.role,
-                supportive_neighbors=supportive_neighbors,
-                resonance=resonance,
-                agent_id=agent.id,
-            )
-            tasks.append(
-                _run_agent_reasoning(
-                    httpx_client,
-                    agent=agent,
+            trait_map = {agent.id: _agent_traits(agent, city_id) for agent in population}
+            baseline_scores: dict[int, float] = {}
+            baseline_breakdowns: dict[int, dict[str, float]] = {}
+            for agent in population:
+                raw_region = regions_by_id[agent.id]
+                baseline_score, breakdown = _baseline_uptake_score(
                     analysis_text=analysis_text,
                     domain=domain,
-                    case_goal=case_goal,
-                    bsv=adjusted_bsv,
-                    supportive_neighbors=supportive_neighbors,
-                    total_neighbors=total_neighbors,
-                    resonance=resonance,
-                    regions=regions,
+                    bsv=raw_region.bsv,
+                    traits=trait_map[agent.id],
                     claim_diagnostics=claim_diagnostics,
-                    semaphore=semaphore,
                 )
+                baseline_scores[agent.id] = baseline_score
+                baseline_breakdowns[agent.id] = breakdown
+
+            likely_adopters = {agent.id for agent in population if baseline_scores[agent.id] >= 0.58}
+
+            computed_agents: list[dict[str, Any]] = []
+            for agent in population:
+                raw_region = regions_by_id[agent.id]
+                supportive_neighbors, total_neighbors, resonance = _neighbor_context(agent, calibrated_regions)
+                adjusted_bsv = _apply_spatial_bsv(raw_region.bsv, supportive_neighbors, total_neighbors, resonance)
+                nearby_adopters = 0
+                nearby_total = 0
+                for other in population:
+                    if other.id == agent.id:
+                        continue
+                    if not _within_radius(agent.lat, agent.lng, other.lat, other.lng):
+                        continue
+                    nearby_total += 1
+                    if other.id in likely_adopters:
+                        nearby_adopters += 1
+                local_adoption_ratio = 0.0 if nearby_total == 0 else nearby_adopters / nearby_total
+                final_score, final_breakdown = _final_uptake_score(
+                    baseline_scores[agent.id],
+                    local_adoption_ratio=local_adoption_ratio,
+                    resonance=resonance,
+                    traits=trait_map[agent.id],
+                    bsv=adjusted_bsv,
+                    claim_diagnostics=claim_diagnostics,
+                )
+                regions = _derive_brain_regions(
+                    adjusted_bsv,
+                    role=agent.role,
+                    supportive_neighbors=nearby_adopters,
+                    resonance=resonance,
+                    agent_id=agent.id,
+                )
+                signal = _dominant_signal(adjusted_bsv, regions, nearby_adopters)
+                predetermined_state = _state_from_score(final_score, float(claim_diagnostics["credibility"]))
+                merged_breakdown = {**baseline_breakdowns[agent.id], **final_breakdown}
+                computed_agents.append(
+                    {
+                        "agent": agent,
+                        "bsv": adjusted_bsv,
+                        "regions": regions,
+                        "traits": trait_map[agent.id],
+                        "baseline_score": baseline_scores[agent.id],
+                        "final_score": final_score,
+                        "local_adoption_ratio": local_adoption_ratio,
+                        "score_breakdown": merged_breakdown,
+                        "default_signal": signal,
+                        "supportive_neighbors": nearby_adopters,
+                        "total_neighbors": nearby_total,
+                    }
+                )
+
+            agents = [
+                _materialize_agent_result(
+                    agent=item["agent"],
+                    bsv=item["bsv"],
+                    regions=item["regions"],
+                    traits=item["traits"],
+                    baseline_score=item["baseline_score"],
+                    final_score=item["final_score"],
+                    local_adoption_ratio=item["local_adoption_ratio"],
+                    score_breakdown=item["score_breakdown"],
+                    claim_credibility=float(claim_diagnostics["credibility"]),
+                    raw_reasoning={
+                        "reasoning": [
+                            _signal_summary(
+                                item["default_signal"],
+                                _state_from_score(item["final_score"], float(claim_diagnostics["credibility"])),
+                                item["regions"],
+                            ),
+                            (
+                                f"{item['supportive_neighbors']} of {item['total_neighbors']} nearby agents reinforce the claim, "
+                                f"while the modeled uptake score settles at {item['final_score']:.2f} after local exposure."
+                            ),
+                        ],
+                        "confidence": round(
+                            _clamp(
+                                0.42
+                                + abs(item["final_score"] - 0.5) * 0.54
+                                + float(claim_diagnostics["credibility"]) * 0.08,
+                                0.18,
+                                0.78,
+                            ),
+                            3,
+                        ),
+                        "signal": item["default_signal"],
+                    },
+                    default_signal=item["default_signal"],
+                )
+                for item in computed_agents
+            ]
+            agents.sort(key=lambda agent: agent["id"])
+            swarm_dynamics = _build_swarm_dynamics(
+                analysis_text=analysis_text,
+                agents=agents,
+                claim_credibility=float(claim_diagnostics["credibility"]),
             )
+            per_agent_history = swarm_dynamics["per_agent_history"]
+            for agent in agents:
+                agent["round_history"] = per_agent_history.get(agent["id"], [])
 
-        agents = list(await asyncio.gather(*tasks))
-        agents.sort(key=lambda agent: agent["id"])
-        payload = _build_workspace_payload(
-            city_id=city_id,
-            domain=domain,
-            case_goal=case_goal,
-            evidence=evidence,
-            analysis_text=analysis_text,
-            source_excerpt=source_excerpt,
-            source_warning=source_warning,
-            agents=agents,
-            claim_diagnostics=claim_diagnostics,
-        )
+            fidelity_factor, _ = _model_fidelity_factor(source_excerpt)
+            payload = _build_workspace_payload(
+                city_id=city_id,
+                domain=domain,
+                case_goal=case_goal,
+                evidence=evidence,
+                analysis_text=analysis_text,
+                source_excerpt=source_excerpt,
+                source_warning=source_warning,
+                agents=agents,
+                claim_diagnostics=claim_diagnostics,
+                swarm_dynamics=swarm_dynamics,
+            )
+            run_id = await _timed(
+                "persist_run",
+                asyncio.to_thread(
+                    persist_case_run,
+                    domain=domain,
+                    city_id=city_id,
+                    case_goal=case_goal,
+                    evidence=evidence,
+                    analysis_text=analysis_text,
+                    source_excerpt=source_excerpt,
+                    source_warning=source_warning,
+                    claim=claim_diagnostics,
+                    fidelity=fidelity_factor,
+                    response=payload,
+                    round_rows=[
+                        {
+                            "round_number": round_item["round"],
+                            "adoption_rate": round_item["adoption_rate"],
+                            "rejection_rate": round_item["rejection_rate"],
+                            "neutral_rate": round_item["neutral_rate"],
+                            "dominant_mechanism": round_item["dominant_mechanism"],
+                            "notable_shift": round_item["notable_shift"],
+                            "posts": round_item["posts"],
+                        }
+                        for round_item in swarm_dynamics["rounds"]
+                    ],
+                    agent_rows=[
+                        {
+                            "agent_id": agent["id"],
+                            "name": agent["name"],
+                            "role": agent["role"],
+                            "latitude": agent["latitude"],
+                            "longitude": agent["longitude"],
+                            "tribe": tribe_results[str(agent["id"])],
+                            "calibrated": regions_by_id[agent["id"]].bsv,
+                            "traits": agent["_pipeline"]["traits"],
+                            "scores": {
+                                "baseline": agent["_pipeline"]["baseline_score"],
+                                "final": agent["_pipeline"]["final_score"],
+                                "breakdown": agent["_pipeline"]["score_breakdown"],
+                            },
+                            "outcome": {
+                                "belief_state": agent["belief_state"],
+                                "confidence": agent["k2_decision_confidence"],
+                                "dominant_signal": agent["dominant_signal"],
+                                "sentiment": "negative"
+                                if agent["belief_state"] == "rejected"
+                                else "positive"
+                                if agent["belief_state"] == "adopted"
+                                else "neutral",
+                                "round_history": agent.get("round_history", []),
+                            },
+                        }
+                        for agent in agents
+                    ],
+                ),
+            )
+            for agent in agents:
+                agent.pop("_pipeline", None)
 
-        payload.update(
-            {
-                "city_id": city_id,
-                "domain": domain,
-                "case_goal": case_goal,
-                "effective_catalyst_text": analysis_text,
-            }
-        )
-        return payload
+            payload.update(
+                {
+                    "city_id": city_id,
+                    "domain": domain,
+                    "case_goal": case_goal,
+                    "effective_catalyst_text": analysis_text,
+                    "run_id": run_id,
+                    "tribe_meta": tribe_meta,
+                    "stage_trace": stage_trace,
+                }
+            )
+            return payload
+
+    return await asyncio.wait_for(_run_pipeline(), timeout=settings.simulate_total_timeout_seconds)

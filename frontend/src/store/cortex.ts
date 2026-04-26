@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { UseCaseId } from '@/data/useCases';
 import { getUseCase } from '@/data/useCases';
 import type { Agent } from '@/lib/agents';
-import { postSimulate } from '@/lib/api/simulate';
+import { getRecentRuns, getRunById, postSimulate } from '@/lib/api/simulate';
 import { exportCasePdf } from '@/lib/exportCasePdf';
 import type {
   AgentSimulationPayload,
@@ -11,11 +11,13 @@ import type {
   EvidenceTrace,
   InterventionItem,
   MechanismsReport,
+  PersistedRunResponse,
+  RecentRunSummary,
   SimulateResponse,
   SpreadModel,
 } from '@/types/simulation';
 
-export type Screen = 'useCases' | 'workspace';
+export type Screen = 'landing' | 'dashboard' | 'useCases' | 'workspace';
 export type WorkspaceStage = 'evidence' | 'spread' | 'mechanisms' | 'interventions';
 export type RunState = 'idle' | 'running' | 'ready' | 'error';
 
@@ -49,6 +51,8 @@ interface CortexState {
   evidence: EvidenceInput;
   audioUpload: AudioUploadState | null;
   exportState: ExportState;
+  recentRuns: RecentRunSummary[];
+  recentRunsStatus: 'idle' | 'loading' | 'ready' | 'error';
 
   latestResponse: SimulateResponse | null;
   caseSummary: CaseSummary | null;
@@ -56,6 +60,8 @@ interface CortexState {
   mechanisms: MechanismsReport | null;
   interventionPlaybook: InterventionItem[];
   evidenceTrace: EvidenceTrace | null;
+  evidenceGraph: SimulateResponse['evidence_graph'] | null;
+  swarmDynamics: SimulateResponse['swarm_dynamics'] | null;
 
   agentOverrides: Record<number, AgentParamPatch>;
   agentSimulationById: Record<number, AgentSimulationPayload>;
@@ -72,6 +78,8 @@ interface CortexState {
   getAgentPayload: (id: number) => AgentSimulationPayload | undefined;
   runSimulation: () => Promise<void>;
   exportCase: (format?: 'json' | 'markdown' | 'pdf') => void;
+  loadRecentRuns: () => Promise<void>;
+  openRun: (runId: number) => Promise<void>;
   resetWorkspace: () => void;
   workspaceTitle: () => string;
 }
@@ -118,10 +126,48 @@ function downloadBlob(filename: string, content: string, mimeType: string) {
   URL.revokeObjectURL(url);
 }
 
+function applySimulationResponse(set: (partial: Partial<CortexState>) => void, response: SimulateResponse) {
+  const provider = response.tribe_meta?.provider;
+  const modelId = response.tribe_meta?.model_id;
+  if (!provider || !modelId) {
+    throw new Error('Simulation response did not include live TRIBE metadata. Refusing to render fallback data.');
+  }
+
+  const byId: Record<number, AgentSimulationPayload> = {};
+  for (const agent of response.agents) byId[agent.id] = agent;
+
+  set({
+    latestResponse: response,
+    caseSummary: response.case_summary,
+    spreadModel: response.spread_model,
+    mechanisms: response.mechanisms,
+    interventionPlaybook: response.intervention_playbook,
+    evidenceTrace: response.evidence_trace,
+    evidenceGraph: response.evidence_graph ?? null,
+    swarmDynamics: response.swarm_dynamics ?? null,
+    agentSimulationById: byId,
+    status: 'ready',
+    stage: 'spread',
+  });
+}
+
+function applyPersistedRun(set: (partial: Partial<CortexState>) => void, record: PersistedRunResponse) {
+  applySimulationResponse(set, record.response);
+  set({
+    cityId: record.city_id,
+    caseGoal: record.case_goal,
+    evidence: {
+      ...record.evidence,
+      edited_analysis_text:
+        record.evidence.edited_analysis_text?.trim() || record.response.evidence_trace.analysis_text,
+    },
+  });
+}
+
 export const useCortexStore = create<CortexState>((set, get) => ({
-  screen: 'useCases',
+  screen: 'landing',
   stage: 'evidence',
-  useCase: null,
+  useCase: 'public_health',
   cityId: 'la',
   caseGoal: DEFAULT_GOAL,
   messageComplexity: 0.5,
@@ -131,6 +177,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
   evidence: emptyEvidence(),
   audioUpload: null,
   exportState: { exportFormat: 'json', lastExportAt: null },
+  recentRuns: [],
+  recentRunsStatus: 'idle',
 
   latestResponse: null,
   caseSummary: null,
@@ -138,6 +186,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
   mechanisms: null,
   interventionPlaybook: [],
   evidenceTrace: null,
+  evidenceGraph: null,
+  swarmDynamics: null,
 
   agentOverrides: {},
   agentSimulationById: {},
@@ -154,6 +204,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       mechanisms: null,
       interventionPlaybook: [],
       evidenceTrace: null,
+      evidenceGraph: null,
+      swarmDynamics: null,
       agentSimulationById: {},
       apiError: null,
     }),
@@ -198,6 +250,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       mechanisms: null,
       interventionPlaybook: [],
       evidenceTrace: null,
+      evidenceGraph: null,
+      swarmDynamics: null,
       agentSimulationById: {},
     });
 
@@ -209,21 +263,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
         evidence,
         message_complexity: messageComplexity,
       });
-
-      const byId: Record<number, AgentSimulationPayload> = {};
-      for (const agent of res.agents) byId[agent.id] = agent;
-
-      set({
-        latestResponse: res,
-        caseSummary: res.case_summary,
-        spreadModel: res.spread_model,
-        mechanisms: res.mechanisms,
-        interventionPlaybook: res.intervention_playbook,
-        evidenceTrace: res.evidence_trace,
-        agentSimulationById: byId,
-        status: 'ready',
-        stage: 'spread',
-      });
+      applySimulationResponse(set, res);
+      void get().loadRecentRuns();
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Case analysis failed';
       set({ status: 'error', apiError: msg });
@@ -244,11 +285,32 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     set({ exportState: { exportFormat: format, lastExportAt: Date.now() } });
   },
 
+  loadRecentRuns: async () => {
+    set({ recentRunsStatus: 'loading' });
+    try {
+      const runs = await getRecentRuns();
+      set({ recentRuns: runs, recentRunsStatus: 'ready' });
+    } catch {
+      set({ recentRunsStatus: 'error' });
+    }
+  },
+
+  openRun: async (runId: number) => {
+    set({ status: 'running', apiError: null });
+    try {
+      const record = await getRunById(runId);
+      applyPersistedRun(set, record);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'Loading persisted run failed';
+      set({ status: 'error', apiError: msg });
+    }
+  },
+
   resetWorkspace: () =>
     set({
-      screen: 'useCases',
+      screen: 'landing',
       stage: 'evidence',
-      useCase: null,
+      useCase: 'public_health',
       cityId: 'la',
       caseGoal: DEFAULT_GOAL,
       messageComplexity: 0.5,
@@ -257,12 +319,16 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       evidence: emptyEvidence(),
       audioUpload: null,
       exportState: { exportFormat: 'json', lastExportAt: null },
+      recentRuns: [],
+      recentRunsStatus: 'idle',
       latestResponse: null,
       caseSummary: null,
       spreadModel: null,
       mechanisms: null,
       interventionPlaybook: [],
       evidenceTrace: null,
+      evidenceGraph: null,
+      swarmDynamics: null,
       agentOverrides: {},
       agentSimulationById: {},
     }),
