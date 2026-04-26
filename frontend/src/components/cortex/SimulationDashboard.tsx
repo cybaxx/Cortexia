@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Component, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   ArrowLeft,
   AudioLines,
@@ -17,9 +17,56 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { CITY_PRESETS, getCityById } from '@/data/cities';
-import { USE_CASES, type UseCaseId } from '@/data/useCases';
+import { USE_CASES } from '@/data/useCases';
 import { useCortexStore } from '@/store/cortex';
 import { MapView } from './MapView';
+
+class MapErrorBoundary extends Component<
+  {
+    safeMode: boolean;
+    onRetrySafeMode: () => void;
+    children: ReactNode;
+  },
+  { hasError: boolean }
+> {
+  constructor(props: { safeMode: boolean; onRetrySafeMode: () => void; children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps: { safeMode: boolean }) {
+    if (prevProps.safeMode !== this.props.safeMode && this.state.hasError) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="rounded-[24px] border border-amber-300/20 bg-amber-500/10 p-5 text-sm text-amber-50">
+          <div className="font-medium">The map visualization hit a rendering error.</div>
+          <div className="mt-2 text-amber-100/80">
+            The simulation data is still available. Retry in safe mode to render agent markers without the network arc overlays.
+          </div>
+          {!this.props.safeMode && (
+            <button
+              type="button"
+              onClick={this.props.onRetrySafeMode}
+              className="mt-4 rounded-[16px] border border-amber-200/30 bg-white/10 px-4 py-2 text-sm text-white"
+            >
+              Retry map in safe mode
+            </button>
+          )}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const NOTES_STORAGE_KEY = 'cortexia-compass-notes';
 
@@ -80,6 +127,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
   const exportCase = useCortexStore((s) => s.exportCase);
 
   const [notes, setNotes] = useState('');
+  const [mapSafeMode, setMapSafeMode] = useState(true);
   const city = getCityById(cityId);
   const selectedUseCase = USE_CASES.find((item) => item.id === useCase) ?? USE_CASES[1] ?? USE_CASES[0];
   const scenarioText = evidence.text_input.trim();
@@ -99,6 +147,12 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
   useEffect(() => {
     window.localStorage.setItem(NOTES_STORAGE_KEY, notes);
   }, [notes]);
+
+  useEffect(() => {
+    if (latestResponse) {
+      setMapSafeMode(true);
+    }
+  }, [latestResponse]);
 
   const complexityMeta = useMemo(() => {
     const closest = [...COMPLEXITY_PRESETS].sort(
@@ -343,19 +397,45 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
           )}
 
           {stepId === 'simulation' && (
-            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-              <div className="space-y-5">
-                <Panel
-                  title="Simulation Map"
-                  kicker="2. Spread"
-                  icon={MapPinned}
-                  body="Every node represents one synthetic person. Click any node to inspect its TRIBE state, K2 reasoning, timeline, and future interview panel."
-                >
-                  <div className="rounded-[28px] border border-white/[0.08] bg-bg-deep/55 p-2">
-                    <MapView />
-                  </div>
-                </Panel>
+            <div className="space-y-5">
+              <Panel
+                title="Simulation Map"
+                kicker="2. Spread"
+                icon={MapPinned}
+                body="Every node represents one synthetic person. Click any node to inspect its TRIBE state, K2 reasoning, timeline, and future interview panel."
+              >
+                <div className="mb-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMapSafeMode(true)}
+                    className={`rounded-full border px-3 py-1.5 text-[11px] ${
+                      mapSafeMode
+                        ? 'border-pastel-2/30 bg-[hsl(var(--pastel-2)/0.10)] text-text-primary'
+                        : 'border-white/[0.08] bg-white/[0.03] text-text-secondary'
+                    }`}
+                  >
+                    Safe mode
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMapSafeMode(false)}
+                    className={`rounded-full border px-3 py-1.5 text-[11px] ${
+                      !mapSafeMode
+                        ? 'border-pastel-2/30 bg-[hsl(var(--pastel-2)/0.10)] text-text-primary'
+                        : 'border-white/[0.08] bg-white/[0.03] text-text-secondary'
+                    }`}
+                  >
+                    Rich overlays
+                  </button>
+                </div>
+                <div className="rounded-[28px] border border-white/[0.08] bg-bg-deep/55 p-2">
+                  <MapErrorBoundary safeMode={mapSafeMode} onRetrySafeMode={() => setMapSafeMode(true)}>
+                    <MapView showArcs={!mapSafeMode} />
+                  </MapErrorBoundary>
+                </div>
+              </Panel>
 
+              <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
                 <div className="grid gap-5 lg:grid-cols-2">
                   <Panel
                     title="Interview Flow"
@@ -389,102 +469,89 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                     />
                   </Panel>
                 </div>
-              </div>
 
-              <div className="space-y-5">
-                <Panel
-                  title="Simulation Readout"
-                  kicker="Live"
-                  icon={Network}
-                  body="This is the high-level spread summary generated from the current run."
-                >
-                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                    <ReadoutCard label="City" value={city.label} />
-                    <ReadoutCard label="Use case" value={selectedUseCase.label} />
-                    <ReadoutCard label="Spread risk" value={caseSummary?.spread_risk ?? 'Awaiting run'} />
-                    <ReadoutCard
-                      label="Adoption rate"
-                      value={spreadModel ? `${spreadModel.belief_adoption_rate}%` : 'Awaiting run'}
-                    />
-                    <ReadoutCard
-                      label="Population reached"
-                      value={spreadModel ? `${spreadModel.population_reached}%` : 'Awaiting run'}
-                    />
-                    <ReadoutCard
-                      label="Dominant pathway"
-                      value={dominantPathway?.label ?? 'Awaiting run'}
-                    />
-                  </div>
-                </Panel>
-
-                <Panel
-                  title="Why It Spread"
-                  kicker="Mechanisms"
-                  icon={BrainCircuit}
-                  body="A concise explanation of what the current run says is moving this narrative."
-                >
-                  <div className="space-y-3">
-                    <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] px-4 py-4 text-sm leading-relaxed text-text-secondary">
-                      {spreadStory ?? 'Run a simulation to see the spread storyline.'}
-                    </div>
-                    <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] px-4 py-4 text-sm leading-relaxed text-text-secondary">
-                      {mechanisms?.mechanism_summary ?? 'Mechanism analysis will appear after the run completes.'}
-                    </div>
-                  </div>
-                </Panel>
-
-                <Panel
-                  title="TRIBE Output"
-                  kicker="Neural State"
-                  icon={BrainCircuit}
-                  body="This is the upstream cognitive-state layer feeding the K2 reasoning pass."
-                >
-                  <div className="space-y-3">
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                      <ReadoutCard label="Provider" value={latestResponse?.tribe_meta?.provider ?? 'Awaiting run'} />
-                      <ReadoutCard label="Model" value={latestResponse?.tribe_meta?.model_id ?? 'Awaiting run'} />
-                      <ReadoutCard
-                        label="Dominant ROI"
-                        value={latestResponse?.tribe_meta?.dominant_roi ?? 'Awaiting run'}
-                      />
-                      <ReadoutCard
-                        label="Signal confidence"
-                        value={
-                          latestResponse?.tribe_meta?.signal_confidence != null
-                            ? `${Math.round(latestResponse.tribe_meta.signal_confidence * 100)}%`
-                            : 'Awaiting run'
-                        }
-                      />
-                    </div>
-                    <div className="rounded-[20px] border border-white/[0.08] bg-bg-deep/45 p-4">
-                      <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
-                        Formatted neural state
+                <div className="space-y-5">
+                  <Panel
+                    title="Why It Spread"
+                    kicker="Mechanisms"
+                    icon={BrainCircuit}
+                    body="A concise explanation of what the current run says is moving this narrative."
+                  >
+                    <div className="space-y-3">
+                      <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] px-4 py-4 text-sm leading-relaxed text-text-secondary">
+                        {spreadStory ?? 'Run a simulation to see the spread storyline.'}
                       </div>
-                      <pre className="mt-3 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary">
-                        {latestResponse?.tribe_meta?.formatted_state ??
-                          'Run a simulation to inspect the TRIBE formatted state output driving the downstream K2 pass.'}
-                      </pre>
+                      <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.03] px-4 py-4 text-sm leading-relaxed text-text-secondary">
+                        {mechanisms?.mechanism_summary ?? 'Mechanism analysis will appear after the run completes.'}
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <ReadoutCard label="Spread risk" value={caseSummary?.spread_risk ?? 'Awaiting run'} />
+                        <ReadoutCard
+                          label="Adoption rate"
+                          value={spreadModel ? `${spreadModel.belief_adoption_rate}%` : 'Awaiting run'}
+                        />
+                        <ReadoutCard
+                          label="Population reached"
+                          value={spreadModel ? `${spreadModel.population_reached}%` : 'Awaiting run'}
+                        />
+                        <ReadoutCard label="Dominant pathway" value={dominantPathway?.label ?? 'Awaiting run'} />
+                      </div>
                     </div>
-                  </div>
-                </Panel>
+                  </Panel>
 
-                <div className="flex gap-3">
-                  <button
-                    type="button"
-                    onClick={goBackStep}
-                    className="inline-flex items-center gap-2 rounded-[18px] border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-sm text-text-primary"
+                  <Panel
+                    title="TRIBE Output"
+                    kicker="Neural State"
+                    icon={BrainCircuit}
+                    body="This is the upstream cognitive-state layer feeding the K2 reasoning pass."
                   >
-                    <ChevronLeft className="h-4 w-4" />
-                    Back to intake
-                  </button>
-                  <button
-                    type="button"
-                    onClick={goNext}
-                    className="inline-flex items-center gap-2 rounded-[18px] border border-pastel-2/30 bg-[hsl(var(--pastel-2)/0.10)] px-4 py-3 text-sm text-text-primary"
-                  >
-                    Continue to report
-                    <ChevronRight className="h-4 w-4" />
-                  </button>
+                    <div className="space-y-3">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <ReadoutCard label="Provider" value={latestResponse?.tribe_meta?.provider ?? 'Awaiting run'} />
+                        <ReadoutCard label="Model" value={latestResponse?.tribe_meta?.model_id ?? 'Awaiting run'} />
+                        <ReadoutCard
+                          label="Dominant ROI"
+                          value={latestResponse?.tribe_meta?.dominant_roi ?? 'Awaiting run'}
+                        />
+                        <ReadoutCard
+                          label="Signal confidence"
+                          value={
+                            latestResponse?.tribe_meta?.signal_confidence != null
+                              ? `${Math.round(latestResponse.tribe_meta.signal_confidence * 100)}%`
+                              : 'Awaiting run'
+                          }
+                        />
+                      </div>
+                      <div className="rounded-[20px] border border-white/[0.08] bg-bg-deep/45 p-4">
+                        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
+                          Formatted neural state
+                        </div>
+                        <pre className="mt-3 max-h-[120px] overflow-y-auto whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary cortex-scroll">
+                          {latestResponse?.tribe_meta?.formatted_state ??
+                            'Run a simulation to inspect the TRIBE formatted state output driving the downstream K2 pass.'}
+                        </pre>
+                      </div>
+                    </div>
+                  </Panel>
+
+                  <div className="flex gap-3">
+                    <button
+                      type="button"
+                      onClick={goBackStep}
+                      className="inline-flex items-center gap-2 rounded-[18px] border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-sm text-text-primary"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                      Back to intake
+                    </button>
+                    <button
+                      type="button"
+                      onClick={goNext}
+                      className="inline-flex items-center gap-2 rounded-[18px] border border-pastel-2/30 bg-[hsl(var(--pastel-2)/0.10)] px-4 py-3 text-sm text-text-primary"
+                    >
+                      Continue to report
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

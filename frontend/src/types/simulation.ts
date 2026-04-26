@@ -262,6 +262,21 @@ export interface SimulateResponse {
   };
   swarm_dynamics?: {
     narrative_summary: string;
+    network_edges?: Array<{
+      source_id: number;
+      target_id: number;
+      source_lng: number;
+      source_lat: number;
+      target_lng: number;
+      target_lat: number;
+    }>;
+    event_log?: Array<{
+      tick: number;
+      author_id: number;
+      target_agent_id?: number | null;
+      action_type: 'talk_to_agent' | 'post_public' | 'do_nothing' | string;
+      content: string;
+    }>;
     rounds: Array<{
       round: number;
       adoption_rate: number;
@@ -278,6 +293,8 @@ export interface SimulateResponse {
         sentiment: 'positive' | 'negative' | 'neutral';
         dominant_signal: DominantSignal;
         post: string;
+        target_agent_id?: number | null;
+        action_type?: 'talk_to_agent' | 'post_public' | 'do_nothing' | string;
       }>;
     }>;
   };

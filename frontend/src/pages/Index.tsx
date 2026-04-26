@@ -6,7 +6,7 @@ const Index = () => {
   const screen = useCortexStore((s) => s.screen);
   const setScreen = useCortexStore((s) => s.setScreen);
 
-  if (screen === 'dashboard' || screen === 'workspace') {
+  if (screen === 'dashboard') {
     return <SimulationDashboard onBack={() => setScreen('landing')} />;
   }
 

@@ -29,6 +29,7 @@ from app.city_presets import get_city
 from app.config import get_settings
 from app.pipeline_store import persist_case_run
 from app.services.ai_clients import BSV, call_k2_think, call_tribe_modal_batch
+from app.services.langgraph_multi_agent_sim import AgentAction, run_simulation_loop
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -207,6 +208,117 @@ class _Traits:
     institutional_trust: float
     analytic_scrutiny: float
     baseline_openness: float
+
+
+@dataclass(frozen=True)
+class _NetworkEdge:
+    source_id: int
+    target_id: int
+
+
+@dataclass
+class _HeuristicLangGraphDecisionEngine:
+    """Deterministic per-agent interaction engine for the UI-facing propagation loop."""
+
+    agent_lookup: dict[str, dict[str, Any]]
+
+    def decide(
+        self,
+        *,
+        agent_id: str,
+        agent_profile: dict[str, Any],
+        scenario: str,
+        visible_messages: list[Any],
+        tick: int,
+    ) -> AgentAction:
+        payload = self.agent_lookup[agent_id]
+        state = str(payload["belief_state"])
+        signal = str(payload["dominant_signal"])
+        confidence = float(payload.get("confidence", 0.5))
+        connections = [str(item) for item in (agent_profile.get("connections") or [])]
+
+        if not visible_messages:
+            if tick == 0 and state == "adopted":
+                return AgentAction(
+                    author_id=agent_id,
+                    action_type="post_public",
+                    content=f"{payload['name']} is leaning into the claim: {scenario[:120]}",
+                    rationale="Initial adopter seeds the narrative publicly.",
+                )
+            if tick == 0 and state == "rejected" and confidence >= 0.62:
+                return AgentAction(
+                    author_id=agent_id,
+                    action_type="post_public",
+                    content=f"{payload['name']} warns that the claim feels overstated or misleading.",
+                    rationale="High-confidence rejector broadcasts skepticism.",
+                )
+            return AgentAction(
+                author_id=agent_id,
+                action_type="do_nothing",
+                content="",
+                rationale="No direct-neighbor activity observed.",
+            )
+
+        visible_authors = [str(message.name or message.additional_kwargs.get("author_id") or "") for message in visible_messages]
+        visible_text = " ".join(str(message.content) for message in visible_messages).lower()
+        latest_author = next((author for author in reversed(visible_authors) if author and author != agent_id), None)
+
+        if state == "adopted":
+            if latest_author and latest_author in connections:
+                return AgentAction(
+                    author_id=agent_id,
+                    action_type="talk_to_agent",
+                    target_agent_id=latest_author,
+                    content="This lines up with what I already suspected. Are others around you repeating it too?",
+                    rationale="Adopter reinforces the claim through a direct tie.",
+                )
+            return AgentAction(
+                author_id=agent_id,
+                action_type="post_public",
+                content="More people in my network are echoing this. It feels increasingly credible locally.",
+                rationale="Adopter escalates from private signal to public propagation.",
+            )
+
+        if state == "rejected":
+            if latest_author and latest_author in connections:
+                if signal == "cognitive_overload":
+                    content = "This still sounds too compressed and overstated for me to trust. What is the actual source?"
+                else:
+                    content = "I’m not convinced. This reads more like pressure than evidence."
+                return AgentAction(
+                    author_id=agent_id,
+                    action_type="talk_to_agent",
+                    target_agent_id=latest_author,
+                    content=content,
+                    rationale="Rejector pushes back directly against a visible neighbor signal.",
+                )
+            return AgentAction(
+                author_id=agent_id,
+                action_type="post_public",
+                content="The claim is circulating, but the details still do not hold together for me.",
+                rationale="Rejector issues a public corrective posture.",
+            )
+
+        if latest_author and latest_author in connections:
+            question = (
+                "I’m still undecided. Where did this start?"
+                if "source" not in visible_text
+                else "I’m not settled yet. Why are people around you buying this?"
+            )
+            return AgentAction(
+                author_id=agent_id,
+                action_type="talk_to_agent",
+                target_agent_id=latest_author,
+                content=question,
+                rationale="Neutral agent probes a direct neighbor before deciding.",
+            )
+
+        return AgentAction(
+            author_id=agent_id,
+            action_type="do_nothing",
+            content="",
+            rationale="No actionable direct-neighbor signal this tick.",
+        )
 
 
 def _compress_ws(text: str) -> str:
@@ -769,6 +881,25 @@ def _role_cohort(role: str) -> str:
     return "General community actors"
 
 
+def _distance_sq(a: _Virt, b: _Virt) -> float:
+    return (a.lat - b.lat) ** 2 + (a.lng - b.lng) ** 2
+
+
+def _build_network_edges(population: list[_Virt], degree: int = 4) -> list[_NetworkEdge]:
+    """Construct a sparse undirected adjacency list from local geographic proximity."""
+
+    edges: set[tuple[int, int]] = set()
+    for agent in population:
+        nearest = sorted(
+            (other for other in population if other.id != agent.id),
+            key=lambda other: _distance_sq(agent, other),
+        )[:degree]
+        for other in nearest:
+            a, b = sorted((agent.id, other.id))
+            edges.add((a, b))
+    return [_NetworkEdge(source_id=a, target_id=b) for a, b in sorted(edges)]
+
+
 def _intervention_hint(signal: SignalType) -> str:
     library = INTERVENTION_LIBRARY[signal]
     return f"{library['recommended_messenger']} via {library['recommended_channel']}"
@@ -967,6 +1098,151 @@ def _build_swarm_dynamics(
         "rounds": rounds,
         "per_agent_history": per_agent_history,
         "narrative_summary": "The swarm now runs as a real short propagation loop: each round updates agent stance from prior score, local exposure, and network pressure instead of replaying the same canned narrative.",
+    }
+
+
+def _build_swarm_dynamics_langgraph(
+    *,
+    analysis_text: str,
+    population: list[_Virt],
+    agents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run a real LangGraph propagation loop and convert it into the UI payload shape."""
+
+    population_by_id = {agent.id: agent for agent in population}
+    agent_payload_by_id = {str(agent["id"]): agent for agent in agents}
+    network_edges = _build_network_edges(population)
+
+    connections_by_id: dict[int, set[int]] = {agent.id: set() for agent in population}
+    for edge in network_edges:
+        connections_by_id[edge.source_id].add(edge.target_id)
+        connections_by_id[edge.target_id].add(edge.source_id)
+
+    graph_agents: dict[str, dict[str, Any]] = {}
+    for virt in population:
+        payload = agent_payload_by_id[str(virt.id)]
+        graph_agents[str(virt.id)] = {
+            "id": str(virt.id),
+            "name": virt.name,
+            "role": virt.role,
+            "latitude": virt.lat,
+            "longitude": virt.lng,
+            "belief_state": payload["belief_state"],
+            "dominant_signal": payload["dominant_signal"],
+            "confidence": payload["k2_decision_confidence"],
+            "connections": [str(other_id) for other_id in sorted(connections_by_id[virt.id])],
+        }
+
+    final_state = run_simulation_loop(
+        {
+            "scenario": analysis_text,
+            "agents": graph_agents,
+            "global_message_log": [],
+            "tick": 0,
+            "max_ticks": 3,
+            "pending_actions": [],
+            "scenario_initialized": False,
+        },
+        _HeuristicLangGraphDecisionEngine(agent_lookup=graph_agents),
+    )
+
+    per_agent_history: dict[int, list[dict[str, Any]]] = {agent.id: [] for agent in population}
+    rounds_by_tick: dict[int, list[dict[str, Any]]] = {}
+    event_log: list[dict[str, Any]] = []
+
+    for message in final_state["global_message_log"]:
+        author = message.name or message.additional_kwargs.get("author_id")
+        if author in {None, "", "environment"}:
+            continue
+        tick = int(message.additional_kwargs.get("tick", 0)) + 1
+        action_type = str(message.additional_kwargs.get("action_type") or "do_nothing")
+        target_agent_id = message.additional_kwargs.get("target_agent_id")
+        agent_payload = agent_payload_by_id[str(author)]
+        author_id = int(str(author))
+
+        history_row = {
+            "round": tick,
+            "belief_state": agent_payload["belief_state"],
+            "confidence": agent_payload["k2_decision_confidence"],
+            "sentiment": _sentiment_for_state(agent_payload["belief_state"]),
+            "post": str(message.content),
+        }
+        per_agent_history[author_id].append(history_row)
+
+        round_post = {
+            "agent_id": author_id,
+            "name": agent_payload["name"],
+            "role": agent_payload["role"],
+            "belief_state": agent_payload["belief_state"],
+            "confidence": agent_payload["k2_decision_confidence"],
+            "sentiment": _sentiment_for_state(agent_payload["belief_state"]),
+            "dominant_signal": agent_payload["dominant_signal"],
+            "post": str(message.content),
+            "target_agent_id": int(target_agent_id) if str(target_agent_id).isdigit() else None,
+            "action_type": action_type,
+        }
+        rounds_by_tick.setdefault(tick, []).append(round_post)
+        event_log.append(
+            {
+                "tick": tick,
+                "author_id": author_id,
+                "target_agent_id": round_post["target_agent_id"],
+                "action_type": action_type,
+                "content": str(message.content),
+            }
+        )
+
+    rounds: list[dict[str, Any]] = []
+    for tick in range(1, final_state["max_ticks"] + 1):
+        posts = rounds_by_tick.get(tick, [])
+        if not posts:
+            continue
+        adopted = sum(1 for item in posts if item["belief_state"] == "adopted")
+        rejected = sum(1 for item in posts if item["belief_state"] == "rejected")
+        neutral = sum(1 for item in posts if item["belief_state"] == "neutral")
+        dominant_signal = max(
+            ("cognitive_overload", "defensive_reactance", "social_proof", "memory_alignment", "empathic_resonance"),
+            key=lambda sig: sum(1 for item in posts if item["dominant_signal"] == sig),
+        )
+        talk_count = sum(1 for item in posts if item["action_type"] == "talk_to_agent")
+        public_count = sum(1 for item in posts if item["action_type"] == "post_public")
+        rounds.append(
+            {
+                "round": tick,
+                "adoption_rate": round(adopted / max(1, len(posts)) * 100),
+                "rejection_rate": round(rejected / max(1, len(posts)) * 100),
+                "neutral_rate": round(neutral / max(1, len(posts)) * 100),
+                "dominant_mechanism": dominant_signal,
+                "notable_shift": (
+                    f"Tick {tick} produced {talk_count} direct neighbor conversations and {public_count} public broadcasts "
+                    f"across the explicit LangGraph network."
+                ),
+                "posts": posts[:8],
+            }
+        )
+
+    edge_payload = [
+        {
+            "source_id": edge.source_id,
+            "target_id": edge.target_id,
+            "source_lng": population_by_id[edge.source_id].lng,
+            "source_lat": population_by_id[edge.source_id].lat,
+            "target_lng": population_by_id[edge.target_id].lng,
+            "target_lat": population_by_id[edge.target_id].lat,
+        }
+        for edge in network_edges
+    ]
+
+    return {
+        "rounds": rounds,
+        "per_agent_history": per_agent_history,
+        "event_log": event_log,
+        "network_edges": edge_payload,
+        "narrative_summary": (
+            "This propagation layer is now driven by a LangGraph loop. "
+            "Agents only react to messages authored by directly connected neighbors, "
+            "and the map can render those live network edges."
+        ),
     }
 
 
@@ -1509,6 +1785,8 @@ def _build_workspace_payload(
         "swarm_dynamics": {
             "rounds": swarm_dynamics["rounds"],
             "narrative_summary": swarm_dynamics["narrative_summary"],
+            "network_edges": swarm_dynamics.get("network_edges", []),
+            "event_log": swarm_dynamics.get("event_log", []),
         },
         "summary": {"total": total, "adopted": adopted, "rejected": rejected, "neutral": neutral},
         "agents": agents,
@@ -1722,10 +2000,10 @@ async def run_simulation_http(
                 for item in computed_agents
             ]
             agents.sort(key=lambda agent: agent["id"])
-            swarm_dynamics = _build_swarm_dynamics(
+            swarm_dynamics = _build_swarm_dynamics_langgraph(
                 analysis_text=analysis_text,
+                population=population,
                 agents=agents,
-                claim_credibility=float(claim_diagnostics["credibility"]),
             )
             per_agent_history = swarm_dynamics["per_agent_history"]
             for agent in agents:

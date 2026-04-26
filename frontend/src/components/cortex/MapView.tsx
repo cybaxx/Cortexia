@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import Map, { type MapRef } from 'react-map-gl';
+import ReactMap, { type MapRef } from 'react-map-gl';
 import DeckGL from '@deck.gl/react';
-import { ScatterplotLayer } from '@deck.gl/layers';
+import { ArcLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { getCityById } from '@/data/cities';
 import { COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
 import { useCortexStore } from '@/store/cortex';
@@ -47,18 +47,18 @@ function buildAgentFromPayload(payload: AgentSimulationPayload, override?: Parti
   );
 }
 
-export const MapView = () => {
+export const MapView = ({ showArcs = true }: { showArcs?: boolean }) => {
   const cityId = useCortexStore((s) => s.cityId);
   const overrides = useCortexStore((s) => s.agentOverrides);
   const spreadModel = useCortexStore((s) => s.spreadModel);
   const agentSimulationById = useCortexStore((s) => s.agentSimulationById);
-  const status = useCortexStore((s) => s.status);
   const latestResponse = useCortexStore((s) => s.latestResponse);
 
   const city = getCityById(cityId);
   const c = city.center;
   const hotspots = spreadModel?.hotspots ?? [];
-  const hasServerAgents = Object.keys(agentSimulationById).length > 0;
+  const swarmRounds = latestResponse?.swarm_dynamics?.rounds ?? [];
+  const latestRound = swarmRounds.length ? swarmRounds[swarmRounds.length - 1] : undefined;
 
   const [viewState, setViewState] = useState({
     longitude: c.longitude,
@@ -77,6 +77,46 @@ export const MapView = () => {
         .sort((a, b) => a.id - b.id)
         .map((payload) => buildAgentFromPayload(payload, overrides[payload.id])),
     [agentSimulationById, overrides],
+  );
+
+  const activeInteractionArcs = useMemo(() => {
+    if (!showArcs || !latestRound) return [];
+    const byId = new globalThis.Map<number, AgentSimulationPayload>(
+      Object.values(agentSimulationById).map((payload) => [payload.id, payload]),
+    );
+    return latestRound.posts
+      .filter((post) => post.action_type === 'talk_to_agent' && post.target_agent_id != null)
+      .map((post) => {
+        const source = byId.get(post.agent_id);
+        const target = byId.get(post.target_agent_id ?? -1);
+        if (!source || !target) return null;
+        return {
+          sourcePosition: [source.longitude, source.latitude] as [number, number],
+          targetPosition: [target.longitude, target.latitude] as [number, number],
+          beliefState: post.belief_state,
+        };
+      })
+      .filter(
+        (
+          item,
+        ): item is {
+          sourcePosition: [number, number];
+          targetPosition: [number, number];
+          beliefState: AgentSimulationPayload['belief_state'];
+        } => Boolean(item),
+      );
+  }, [agentSimulationById, latestRound]);
+
+  const networkEdges = useMemo(
+    () =>
+      (latestResponse?.swarm_dynamics?.network_edges ?? []).filter(
+        (edge) =>
+          Number.isFinite(edge.source_lng) &&
+          Number.isFinite(edge.source_lat) &&
+          Number.isFinite(edge.target_lng) &&
+          Number.isFinite(edge.target_lat),
+      ),
+    [latestResponse],
   );
 
   useEffect(() => {
@@ -127,6 +167,46 @@ export const MapView = () => {
   }, [c.zoom]);
 
   const layers = [
+    ...(showArcs && networkEdges.length
+      ? [
+          new ArcLayer({
+            id: 'network-edges',
+            data: networkEdges,
+            pickable: false,
+            getSourcePosition: (d) => [d.source_lng, d.source_lat],
+            getTargetPosition: (d) => [d.target_lng, d.target_lat],
+            getSourceColor: [120, 150, 170, 28],
+            getTargetColor: [120, 150, 170, 10],
+            getWidth: 1.2,
+            widthMinPixels: 1,
+          }),
+        ]
+      : []),
+    ...(showArcs && activeInteractionArcs.length
+      ? [
+          new ArcLayer({
+            id: 'interaction-arcs',
+            data: activeInteractionArcs,
+            pickable: false,
+            getSourcePosition: (d) => d.sourcePosition,
+            getTargetPosition: (d) => d.targetPosition,
+            getSourceColor: (d) =>
+              d.beliefState === 'adopted'
+                ? [160, 214, 255, 210]
+                : d.beliefState === 'rejected'
+                  ? [255, 191, 166, 210]
+                  : [188, 231, 219, 190],
+            getTargetColor: (d) =>
+              d.beliefState === 'adopted'
+                ? [160, 214, 255, 72]
+                : d.beliefState === 'rejected'
+                  ? [255, 191, 166, 72]
+                  : [188, 231, 219, 64],
+            getWidth: 2.4,
+            widthMinPixels: 2,
+          }),
+        ]
+      : []),
     ...(hotspots.length
       ? [
           new ScatterplotLayer({
@@ -180,24 +260,16 @@ export const MapView = () => {
         </div>
       )}
 
-      {!hasServerAgents && (
-        <div className="pointer-events-none absolute inset-x-6 top-6 z-10 flex justify-center">
-          <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-4 py-3 text-center font-mono text-[10px] text-text-secondary">
-            Run a simulation to populate the map with live TRIBE-backed agents.
-          </div>
-        </div>
-      )}
-
       <DeckGL
         viewState={viewState}
         controller
         layers={layers}
-        onViewStateChange={(event: any) => setViewState(event.viewState)}
+        onViewStateChange={(event: { viewState: typeof viewState }) => setViewState(event.viewState)}
         onClick={handleDeckClick}
         style={{ position: 'absolute', inset: 0 }}
       >
         {MAPBOX_TOKEN && (
-          <Map
+          <ReactMap
             ref={mapRef}
             mapboxAccessToken={MAPBOX_TOKEN}
             mapStyle="mapbox://styles/mapbox/dark-v11"
@@ -227,6 +299,21 @@ export const MapView = () => {
         <div className="rounded-full border border-white/[0.08] bg-bg-deep/[0.78] px-3 py-1.5 font-mono text-[9px] text-text-secondary">
           Mint: neutral / uncommitted
         </div>
+        {showArcs && networkEdges.length > 0 && (
+          <div className="rounded-full border border-white/[0.08] bg-bg-deep/[0.78] px-3 py-1.5 font-mono text-[9px] text-text-secondary">
+            Grey arcs: LangGraph network
+          </div>
+        )}
+        {showArcs && activeInteractionArcs.length > 0 && (
+          <div className="rounded-full border border-white/[0.08] bg-bg-deep/[0.78] px-3 py-1.5 font-mono text-[9px] text-text-secondary">
+            Bright arcs: latest tick interactions
+          </div>
+        )}
+        {!showArcs && (
+          <div className="rounded-full border border-white/[0.08] bg-bg-deep/[0.78] px-3 py-1.5 font-mono text-[9px] text-text-secondary">
+            Safe mode: agent markers only
+          </div>
+        )}
       </div>
 
       <div

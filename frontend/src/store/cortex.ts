@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import type { UseCaseId } from '@/data/useCases';
-import { getUseCase } from '@/data/useCases';
 import type { Agent } from '@/lib/agents';
 import { getRecentRuns, getRunById, postSimulate } from '@/lib/api/simulate';
 import { exportCasePdf } from '@/lib/exportCasePdf';
@@ -17,7 +16,7 @@ import type {
   SpreadModel,
 } from '@/types/simulation';
 
-export type Screen = 'landing' | 'dashboard' | 'useCases' | 'workspace';
+export type Screen = 'landing' | 'dashboard';
 export type WorkspaceStage = 'evidence' | 'spread' | 'mechanisms' | 'interventions';
 export type RunState = 'idle' | 'running' | 'ready' | 'error';
 
@@ -80,8 +79,6 @@ interface CortexState {
   exportCase: (format?: 'json' | 'markdown' | 'pdf') => void;
   loadRecentRuns: () => Promise<void>;
   openRun: (runId: number) => Promise<void>;
-  resetWorkspace: () => void;
-  workspaceTitle: () => string;
 }
 
 const DEFAULT_GOAL =
@@ -304,37 +301,5 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       const msg = error instanceof Error ? error.message : 'Loading persisted run failed';
       set({ status: 'error', apiError: msg });
     }
-  },
-
-  resetWorkspace: () =>
-    set({
-      screen: 'landing',
-      stage: 'evidence',
-      useCase: 'public_health',
-      cityId: 'la',
-      caseGoal: DEFAULT_GOAL,
-      messageComplexity: 0.5,
-      status: 'idle',
-      apiError: null,
-      evidence: emptyEvidence(),
-      audioUpload: null,
-      exportState: { exportFormat: 'json', lastExportAt: null },
-      recentRuns: [],
-      recentRunsStatus: 'idle',
-      latestResponse: null,
-      caseSummary: null,
-      spreadModel: null,
-      mechanisms: null,
-      interventionPlaybook: [],
-      evidenceTrace: null,
-      evidenceGraph: null,
-      swarmDynamics: null,
-      agentOverrides: {},
-      agentSimulationById: {},
-    }),
-
-  workspaceTitle: () => {
-    const useCase = getUseCase(get().useCase);
-    return useCase ? `Cortexia — ${useCase.label} Case Workspace` : 'Cortexia — Case Workspace';
   },
 }));

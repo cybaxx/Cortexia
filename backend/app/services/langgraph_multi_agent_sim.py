@@ -389,6 +389,16 @@ def build_simulation_graph(decision_engine: AgentDecisionEngine):
     return graph.compile()
 
 
+def run_simulation_loop(
+    initial_state: SimulationState,
+    decision_engine: AgentDecisionEngine,
+) -> SimulationState:
+    """Convenience wrapper for invoking the compiled simulation graph."""
+
+    graph = build_simulation_graph(decision_engine)
+    return graph.invoke(initial_state)
+
+
 def make_chat_openai_decision_engine(
     *,
     model: str = "gpt-4o-mini",
@@ -478,4 +488,3 @@ if __name__ == "__main__":
     demo_graph = build_simulation_graph(RuleBasedDemoDecisionEngine())
     final = demo_graph.invoke(demo_state)
     _print_demo_summary(final)
-
