@@ -69,6 +69,8 @@ Instructions:
 4. Let your stance reflect the stored outcome and sentiment, but you can express uncertainty or nuance.
 5. Keep the answer between 3 and 6 sentences.
 6. If the user asks what would change your mind, answer honestly from the agent's perspective.
+7. Return only the words the agent would actually say out loud.
+8. Do not include hidden reasoning, <think> tags, analysis, preambles, or explanations of your process.
 
 Return plain text only.
 """.strip()
@@ -96,7 +98,117 @@ Rules:
 - Respect the supplied precomputed outcome for each agent.
 - Use the BSV, traits, neighborhood context, and score breakdown.
 - If credibility is low, adoption should require unusually strong social proof or prior alignment.
+- Every item must be a JSON object. Never return strings, commentary, code fences, XML, or a preamble.
 - Keep each reasoning sentence specific and non-generic.
+- Different agents must not receive near-duplicate wording unless their profiles are genuinely near-identical.
+- Explicitly vary the explanation based on role, traits, local exposure, and the score breakdown.
+- Prefer concrete mechanisms like evidence scrutiny, institutional trust, identity threat, peer normalization, overload, or prior-fit mismatch instead of repeating the same brain-region formula for everyone.
+- Use the agent's role as the first interpretive lens. The first reasoning sentence should sound specific to that role.
+- Do not start every explanation the same way. Vary sentence openings across agents.
+- Do not copy raw field names or dump numbers mechanically. Use only the few numbers that matter most to explain the outcome.
+- Mention social context only if it materially changes the explanation. If supportive_neighbors is 0, say the lack of peer reinforcement matters.
+- Confidence should reflect how internally coherent the supplied outcome is, not how persuasive the rumor sounds.
+
+Output discipline:
+- Return one array only.
+- The array length must equal the number of input agents.
+- Preserve input ids exactly.
+- If an agent is rejected because of overload, explain what specifically could not be processed or verified for that role.
+- If multiple agents share the same final signal, still differentiate them using role, traits, and neighborhood context.
+
+Example output shape:
+[{"id": 1, "reasoning": ["Sentence 1.", "Sentence 2."], "action": "Rejected", "confidence": 0.81, "signal": "cognitive_overload"}]
+""".strip()
+
+K2_ACTION_CENTER_PROMPT = """
+You are the final-step operations synthesis engine for Cortexia.
+
+Inputs include:
+- the scenario the user simulated
+- city and use-case context
+- simulation findings from TRIBE + K2
+- optional live web research results and structured extraction results
+
+Your task:
+1. Summarize what matters most right now.
+2. Turn the research and simulation into concrete operational next steps.
+3. Identify what should be monitored next.
+4. Flag which sources deserve browser-based manual verification.
+
+Return strict JSON only with exactly these top-level keys:
+- headline: string
+- executive_summary: string
+- decision_window: string
+- urgency: "low" | "medium" | "high"
+- confidence_note: string
+- recommended_actions: array of objects with keys:
+  - title: string
+  - owner: string
+  - audience: string
+  - timeline: string
+  - action: string
+  - why_now: string
+- monitoring_queries: array of strings
+- source_briefings: array of objects with keys:
+  - url: string
+  - why_it_matters: string
+  - credibility_note: string
+- browser_verification_queue: array of objects with keys:
+  - url: string
+  - reason: string
+  - check_for: string
+
+Rules:
+- Be operational, not academic.
+- Recommended actions should be immediately usable by a comms, policy, trust, or response team.
+- If live sources are thin, say so clearly in the confidence note and lean more on simulation findings.
+- Never output markdown or prose outside the JSON object.
+""".strip()
+
+K2_EXPLANATION_ONLY_PROMPT = """
+You explain why one synthetic person reached a precomputed outcome in Cortexia.
+
+Important:
+- The outcome, signal, and confidence are already computed elsewhere.
+- Your only job is to write 2 concise sentences that sound specific to this person.
+- Do not output JSON, XML, markdown, tags, or analysis of your process.
+- Do not include hidden reasoning or preambles.
+- Return plain text only.
+
+Writing rules:
+- Sentence 1 should begin from the person's role or decision lens.
+- Sentence 2 should explain the strongest reason the person ended at the supplied outcome, using only the most relevant factors.
+- Be concrete and role-specific.
+- Do not repeat identical wording across agents.
+- Avoid generic phrases like "the content feels effortful" unless absolutely necessary.
+""".strip()
+
+K2_TIMELINE_BATCH_PROMPT = """
+You generate the propagation-timeline language for Cortexia.
+
+You will receive a JSON array. Each item represents one agent at one round of the simulation.
+The state, confidence, trigger pressures, messenger fit, and structural context are already computed.
+Your job is to write the user-facing text only.
+
+Return strict JSON only. No markdown. No prose outside the JSON.
+Return one JSON array where each item has exactly these fields:
+- agent_id: integer
+- round: integer
+- phase_label: string
+- trigger_label: string
+- post: string
+- change_summary: string
+
+Rules:
+- Everything should sound like a distinct person in a distinct moment, not a template.
+- Use the agent's role, demographics, signal, local messenger context, and state transition.
+- Do not start every item the same way.
+- Avoid canned phrases like "from a civic lens" or "the evidence gap stayed unresolved."
+- `post` should sound like the actual thought or message that explains the round.
+- `change_summary` should explain what changed using the provided metrics, but in natural language.
+- `phase_label` should be short and human-readable, tied to the actual event.
+- `trigger_label` should be short and specific to the cause, not generic.
+- Preserve agent_id and round exactly.
 """.strip()
 
 
@@ -112,6 +224,19 @@ class TribeBatchResult(TypedDict):
     tribe_meta: dict[str, Any]
 
 
+def _find_first_list_candidate(value: Any, *, max_depth: int = 4) -> list[Any] | None:
+    if max_depth < 0:
+        return None
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for nested in value.values():
+            found = _find_first_list_candidate(nested, max_depth=max_depth - 1)
+            if found is not None:
+                return found
+    return None
+
+
 def _extract_json_payload(text: str) -> Any:
     stripped = text.strip()
     decoder = json.JSONDecoder()
@@ -122,11 +247,28 @@ def _extract_json_payload(text: str) -> Any:
             logger.warning("K2 batch response included trailing text after JSON payload: %s", trailing[:200])
         return parsed
     except json.JSONDecodeError:
-        match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", stripped)
-        if not match:
+        candidates: list[tuple[tuple[int, int, int, int], int, Any, str]] = []
+        for match in re.finditer(r"[\[{]", stripped):
+            start = match.start()
+            try:
+                parsed, end = decoder.raw_decode(stripped[start:])
+            except json.JSONDecodeError:
+                continue
+            trailing = stripped[start + end :].strip()
+            if isinstance(parsed, list):
+                dict_count = sum(1 for item in parsed if isinstance(item, dict))
+                scalar_count = sum(1 for item in parsed if not isinstance(item, dict))
+                score = (2 if dict_count > 0 else 1, dict_count, len(parsed), end - len(trailing))
+                candidates.append((score, start, parsed, trailing))
+            elif isinstance(parsed, dict):
+                score = (1, 1 if "id" in parsed else 0, len(parsed), end - len(trailing))
+                candidates.append((score, start, parsed, trailing))
+
+        if not candidates:
             raise ValueError("K2 batch response did not contain parseable JSON.")
-        parsed, end = decoder.raw_decode(match.group(1))
-        trailing = match.group(1)[end:].strip()
+
+        _score, start, parsed, trailing = max(candidates, key=lambda item: item[0])
+        logger.warning("K2 batch response required recovery from noisy text; using JSON payload starting at byte %s.", start)
         if trailing:
             logger.warning("K2 batch extracted JSON payload included trailing text: %s", trailing[:200])
         return parsed
@@ -162,7 +304,6 @@ async def call_tribe_modal_batch(
         "catalyst_text": catalyst_text,
         "agents": agents
     }
-    
     r = await httpx_client.post(url, json=payload, headers=headers, timeout=settings.simulate_tribe_timeout_seconds)
     try:
         r.raise_for_status()
@@ -285,6 +426,24 @@ def _openai_style_assistant_text(out: Any) -> str:
         if "text" in ch0:
             return str(ch0.get("text") or "")
     return ""
+
+
+def _strip_k2_hidden_reasoning(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    if "</think>" in cleaned:
+        cleaned = cleaned.rsplit("</think>", 1)[-1].strip()
+
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?(action|confidence|signal)>", "", cleaned, flags=re.IGNORECASE)
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if lines:
+        cleaned = "\n".join(lines)
+
+    return cleaned.strip()
 
 
 def _k2_user_block(
@@ -425,15 +584,47 @@ async def call_k2_batch_think(
     if not text.strip():
         raise ValueError("K2 batch reasoning returned empty content.")
     parsed = _extract_json_payload(text)
+    if isinstance(parsed, dict):
+        for key in ("results", "items", "data", "agents", "output"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, list):
+                parsed = candidate
+                break
+        else:
+            nested = _find_first_list_candidate(parsed)
+            if nested is not None:
+                parsed = nested
     if not isinstance(parsed, list):
         raise ValueError("K2 batch reasoning did not return a JSON array.")
 
     results: dict[int, dict[str, Any]] = {}
+    skipped_items = 0
     for item in parsed:
+        if isinstance(item, str):
+            try:
+                recovered = _extract_json_payload(item)
+            except ValueError:
+                skipped_items += 1
+                continue
+            if isinstance(recovered, list):
+                recovered_objects = [candidate for candidate in recovered if isinstance(candidate, dict)]
+                if len(recovered_objects) == 1:
+                    item = recovered_objects[0]
+                else:
+                    skipped_items += 1
+                    continue
+            elif isinstance(recovered, dict):
+                item = recovered
+            else:
+                skipped_items += 1
+                continue
+
         if not isinstance(item, dict):
-            raise ValueError("K2 batch reasoning returned a non-object item.")
+            skipped_items += 1
+            continue
         if "id" not in item or "action" not in item or "confidence" not in item or "signal" not in item:
-            raise ValueError(f"K2 batch reasoning item is missing required fields: {item}")
+            skipped_items += 1
+            continue
         agent_id = int(item["id"])
         reasoning = item.get("reasoning")
         if isinstance(reasoning, str):
@@ -441,7 +632,8 @@ async def call_k2_batch_think(
         elif isinstance(reasoning, list):
             reasoning_lines = [str(line).strip() for line in reasoning if str(line).strip()]
         else:
-            raise ValueError(f"K2 batch reasoning item has invalid reasoning field: {item}")
+            skipped_items += 1
+            continue
         results[agent_id] = {
             "reasoning": reasoning_lines,
             "action": str(item["action"]).strip(),
@@ -449,15 +641,191 @@ async def call_k2_batch_think(
             "signal": str(item["signal"]).strip(),
         }
 
+    if skipped_items:
+        logger.warning("K2 batch reasoning skipped %s malformed item(s) while recovering usable results.", skipped_items)
+
     missing = sorted(set(int(agent["id"]) for agent in agents) - set(results.keys()))
     if missing:
         raise ValueError(f"K2 batch reasoning omitted agent ids: {missing[:8]}")
     return results
 
 
+async def call_k2_explanation_only(
+    httpx_client: httpx.AsyncClient,
+    *,
+    agent_name: str,
+    agent_role: str,
+    role_lens: str,
+    scenario: str,
+    case_goal: str,
+    precomputed_outcome: str,
+    dominant_signal: str,
+    social_context_label: str,
+    primary_decision_anchor: str,
+    traits: dict[str, float],
+    demographics: dict[str, Any] | None,
+    bsv: dict[str, float],
+    score_breakdown: dict[str, float],
+) -> list[str]:
+    if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No K2 fallback is available.")
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+    }
+    payload: dict[str, Any] = {
+        "model": settings.ifm_k2_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": K2_EXPLANATION_ONLY_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Agent name: {agent_name}\n"
+                    f"Agent role: {agent_role}\n"
+                    f"Role lens: {role_lens}\n"
+                    f"Scenario: {scenario[:900]}\n"
+                    f"Case goal: {case_goal}\n"
+                    f"Precomputed outcome: {precomputed_outcome}\n"
+                    f"Dominant signal: {dominant_signal}\n"
+                    f"Primary decision anchor: {primary_decision_anchor}\n"
+                    f"Social context: {social_context_label}\n"
+                    f"Demographics: {json.dumps(demographics or {}, ensure_ascii=True)}\n"
+                    f"Traits: {json.dumps(traits, ensure_ascii=True)}\n"
+                    f"BSV: {json.dumps(bsv, ensure_ascii=True)}\n"
+                    f"Score breakdown: {json.dumps(score_breakdown, ensure_ascii=True)}\n"
+                ),
+            },
+        ],
+    }
+    r = await httpx_client.post(
+        settings.ifm_api_url,
+        json=payload,
+        headers=headers,
+        timeout=settings.simulate_k2_timeout_seconds,
+    )
+    r.raise_for_status()
+    out = _k2_response_body_to_object(r)
+    text = _strip_k2_hidden_reasoning(_openai_style_assistant_text(out)).strip()
+    if not text:
+        raise ValueError("K2 explanation-only call returned empty content.")
+    lines = [line.strip(" -") for line in re.split(r"(?<=[.!?])\s+", text) if line.strip(" -")]
+    return lines[:2] if lines else []
+
+
+async def call_k2_timeline_batch(
+    httpx_client: httpx.AsyncClient,
+    *,
+    items: list[dict[str, Any]],
+) -> dict[tuple[int, int], dict[str, str]]:
+    if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No K2 fallback is available.")
+    if not items:
+        return {}
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+    }
+    payload: dict[str, Any] = {
+        "model": settings.ifm_k2_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": K2_TIMELINE_BATCH_PROMPT},
+            {"role": "user", "content": json.dumps(items, ensure_ascii=True)},
+        ],
+    }
+    r = await httpx_client.post(
+        settings.ifm_api_url,
+        json=payload,
+        headers=headers,
+        timeout=settings.simulate_k2_timeout_seconds,
+    )
+    r.raise_for_status()
+    out = _k2_response_body_to_object(r)
+    text = _openai_style_assistant_text(out)
+    if not text.strip():
+        raise ValueError("K2 timeline batch returned empty content.")
+    parsed = _extract_json_payload(text)
+    if isinstance(parsed, dict):
+        for key in ("results", "items", "data", "timeline", "output"):
+            candidate = parsed.get(key)
+            if isinstance(candidate, list):
+                parsed = candidate
+                break
+        else:
+            nested = _find_first_list_candidate(parsed)
+            if nested is not None:
+                parsed = nested
+    if not isinstance(parsed, list):
+        raise ValueError("K2 timeline batch did not return a JSON array.")
+
+    results: dict[tuple[int, int], dict[str, str]] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        if not {"agent_id", "round", "phase_label", "trigger_label", "post", "change_summary"} <= set(item):
+            continue
+        key = (int(item["agent_id"]), int(item["round"]))
+        results[key] = {
+            "phase_label": str(item["phase_label"]).strip(),
+            "trigger": str(item["trigger_label"]).strip(),
+            "post": _strip_k2_hidden_reasoning(str(item["post"])).strip(),
+            "change_summary": _strip_k2_hidden_reasoning(str(item["change_summary"])).strip(),
+        }
+
+    missing = sorted((int(item["agent_id"]), int(item["round"])) for item in items if (int(item["agent_id"]), int(item["round"])) not in results)
+    if missing:
+        raise ValueError(f"K2 timeline batch omitted entries: {missing[:8]}")
+    return results
+
+
+async def call_k2_action_center(
+    httpx_client: httpx.AsyncClient,
+    *,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
+        raise RuntimeError("IFM_API_KEY and IFM_API_URL are required. No K2 fallback is available.")
+
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.ifm_api_key}",
+    }
+    request_body: dict[str, Any] = {
+        "model": settings.ifm_k2_model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": K2_ACTION_CENTER_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+        ],
+    }
+    r = await httpx_client.post(
+        settings.ifm_api_url,
+        json=request_body,
+        headers=headers,
+        timeout=settings.simulate_k2_timeout_seconds,
+    )
+    r.raise_for_status()
+    out = _k2_response_body_to_object(r)
+    text = _openai_style_assistant_text(out)
+    if not text.strip():
+        raise ValueError("K2 action-center call returned empty content.")
+    parsed = _extract_json_payload(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("K2 action-center call did not return a JSON object.")
+    return parsed
+
+
 async def call_elevenlabs(
     httpx_client: httpx.AsyncClient,
     text: str,
+    *,
+    voice_context: dict[str, Any] | None = None,
 ) -> str:
     """
     Synthesize speech with ElevenLabs, save to /tmp/audio, return file path.
@@ -470,11 +838,13 @@ async def call_elevenlabs(
         "xi-api-key": settings.elevenlabs_api_key,
         "Content-Type": "application/json",
     }
+    voice_settings = _voice_settings_from_context(voice_context or {})
     r = await httpx_client.post(
         url,
         json={
             "text": text,
             "model_id": "eleven_multilingual_v2",
+            "voice_settings": voice_settings,
         },
         headers=headers,
         timeout=settings.simulate_k2_timeout_seconds,
@@ -533,6 +903,11 @@ async def call_k2_agent_conversation(
     speaker_context: str | None,
     outcome: dict[str, Any],
     traits: dict[str, float],
+    demographics: dict[str, Any] | None,
+    spread_notes: str | None,
+    tribe_state: dict[str, Any] | None,
+    calibrated_state: dict[str, Any] | None,
+    agent_profile: dict[str, Any] | None,
     scores: dict[str, Any],
     user_message: str,
     prior_turns: list[dict[str, Any]],
@@ -559,6 +934,11 @@ async def call_k2_agent_conversation(
                     f"Stored stance: {outcome.get('belief_state') or outcome.get('stance')}\n"
                     f"Stored confidence: {outcome.get('confidence')}\n"
                     f"Dominant signal: {outcome.get('dominant_signal')}\n"
+                    f"Demographics: {json.dumps(demographics or {}, ensure_ascii=True)}\n"
+                    f"Operator spread notes: {spread_notes or 'None recorded yet'}\n"
+                    f"TRIBE base state: {json.dumps(tribe_state or {}, ensure_ascii=True)}\n"
+                    f"Calibrated state: {json.dumps(calibrated_state or {}, ensure_ascii=True)}\n"
+                    f"Agent simulation profile: {json.dumps(agent_profile or {}, ensure_ascii=True)}\n"
                     f"Traits: {json.dumps(traits)}\n"
                     f"Scores: {json.dumps(scores)}\n"
                     f"Recent conversation:\n{history or 'No prior turns.'}\n\n"
@@ -579,7 +959,58 @@ async def call_k2_agent_conversation(
     )
     r.raise_for_status()
     out = _k2_response_body_to_object(r)
-    text = _openai_style_assistant_text(out).strip()
+    text = _strip_k2_hidden_reasoning(_openai_style_assistant_text(out)).strip()
     if not text:
         raise ValueError("K2 agent conversation returned empty content.")
     return text
+
+
+def _voice_settings_from_context(voice_context: dict[str, Any]) -> dict[str, float | bool]:
+    demographics = voice_context.get("demographics") or {}
+    outcome = voice_context.get("outcome") or {}
+    tribe = voice_context.get("tribe") or {}
+    calibrated = voice_context.get("calibrated") or {}
+    digital_habit = str(demographics.get("digital_media_habit") or "").lower()
+    age_band = str(demographics.get("age_band") or "").lower()
+    stance = str(outcome.get("belief_state") or outcome.get("stance") or "").lower()
+    confidence = float(outcome.get("confidence") or 0.55)
+    cognitive_load = float(tribe.get("cognitive_load") or calibrated.get("cognitive_load") or 0.5)
+    agitation = float(tribe.get("emotional_agitation") or calibrated.get("emotional_agitation") or 0.5)
+    defensive = float(tribe.get("defensive_posture") or calibrated.get("defensive_posture") or 0.4)
+    memory_strain = float(tribe.get("working_memory_strain") or calibrated.get("working_memory_strain") or 0.5)
+
+    stability = 0.48
+    similarity_boost = 0.76
+    style = 0.22
+    speed = 1.0
+
+    if "group-chat" in digital_habit or "public-feed" in digital_habit:
+        style += 0.12
+        stability -= 0.05
+    if "local-news" in digital_habit or "mixed verification" in digital_habit:
+        stability += 0.1
+        style -= 0.04
+    if "55-64" in age_band:
+        speed -= 0.05
+        stability += 0.06
+    elif "18-24" in age_band or "25-34" in age_band:
+        speed += 0.03
+        style += 0.04
+    if stance == "rejected":
+        stability += 0.05
+        style -= 0.03
+    elif stance == "adopted":
+        style += 0.05
+    stability += (defensive - 0.45) * 0.12
+    style += (agitation - 0.5) * 0.18
+    speed += (agitation - 0.5) * 0.08
+    speed -= (memory_strain - 0.5) * 0.06
+    similarity_boost += (cognitive_load - 0.5) * 0.08
+    style += max(-0.05, min(0.10, (confidence - 0.5) * 0.18))
+    return {
+        "stability": max(0.2, min(0.85, round(stability, 3))),
+        "similarity_boost": max(0.2, min(0.95, round(similarity_boost, 3))),
+        "style": max(0.0, min(0.75, round(style, 3))),
+        "speed": max(0.88, min(1.08, round(speed, 3))),
+        "use_speaker_boost": True,
+    }

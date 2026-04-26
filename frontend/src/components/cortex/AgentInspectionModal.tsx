@@ -10,7 +10,7 @@ const BrainViz = lazy(() =>
 
 const K2ThinkTrace = ({ lines }: { lines: string[] }) => (
   <div className="rounded-[24px] border border-white/[0.08] bg-bg-deep/55 p-3 max-h-40 overflow-y-auto">
-    <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.12em] text-pastel-2/90">K2 Think trace</div>
+    <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.12em] text-pastel-2/90">Interpretation of neural response model</div>
     <ol className="list-decimal list-inside space-y-1.5 font-mono text-[10px] text-text-secondary leading-relaxed">
       {lines.length === 0 ? (
         <li className="text-text-muted">No reasoning lines returned for this agent.</li>
@@ -115,8 +115,8 @@ export const AgentInspectionModal = ({
       </div>
 
       <div className="mb-3 rounded-[22px] border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-[10px] font-mono text-text-muted">
-        Each node is simulated independently. TRIBE generates this agent&apos;s cognitive state, then K2 Think explains
-        the outcome, conversation stance, and propagation behavior you see below.
+        Each node is simulated independently. TRIBE provides the base neural state, then Cortexia calibrates it through
+        role, demographics, social context, and local network pressure to produce the outcome you see below.
       </div>
 
       <div className="mb-3 rounded-[28px] border border-white/[0.08] bg-bg-elevated/35 p-3">
@@ -140,6 +140,38 @@ export const AgentInspectionModal = ({
 
       {payload && (
         <div className="mt-3 grid gap-3">
+          {payload.demographics && (
+            <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
+              <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Demographic profile</div>
+              <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.demographics.summary}</p>
+              <div className="mt-3 flex flex-wrap gap-2 font-mono text-[9px] uppercase tracking-[0.1em] text-text-muted">
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  age {payload.demographics.age_years}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.education_level}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.income_band}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.housing_status}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.language_profile}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.community_tenure}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.caregiving_load}
+                </span>
+                <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                  {payload.demographics.digital_media_habit}
+                </span>
+              </div>
+            </div>
+          )}
           <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-3">
             <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">Vulnerability</div>
             <p className="mt-2 text-sm leading-relaxed text-text-secondary">{payload.agent_insight.vulnerability}</p>
@@ -159,12 +191,52 @@ export const AgentInspectionModal = ({
                 {payload.round_history.map((item) => (
                   <div key={`${payload.id}-round-${item.round}`} className="rounded-[16px] border border-white/[0.06] bg-bg-deep/45 p-3">
                     <div className="flex items-center justify-between gap-3">
-                      <div className="text-xs font-medium text-text-primary">Round {item.round}</div>
-                      <div className="text-[11px] text-text-muted">
-                        {item.belief_state} · {(item.confidence * 100).toFixed(0)}%
+                      <div>
+                        <div className="text-xs font-medium text-text-primary">
+                          {item.phase_label ?? `Round ${item.round}`}
+                        </div>
+                        <div className="mt-1 text-[11px] text-text-muted">Round {item.round}</div>
+                      </div>
+                      <div className="text-right text-[11px] text-text-muted">
+                        <div>
+                          {item.belief_state} · {(item.confidence * 100).toFixed(0)}%
+                        </div>
+                        {item.confidence_delta != null && (
+                          <div className={item.confidence_delta >= 0 ? 'text-pastel-2/90' : 'text-pastel-4/90'}>
+                            {item.confidence_delta >= 0 ? '+' : ''}
+                            {(item.confidence_delta * 100).toFixed(0)} pts
+                          </div>
+                        )}
                       </div>
                     </div>
+                    {item.trigger && (
+                      <div className="mt-2 inline-flex rounded-full border border-white/[0.08] bg-white/[0.03] px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.12em] text-text-muted">
+                        {item.trigger}
+                      </div>
+                    )}
                     <p className="mt-2 text-xs leading-relaxed text-text-secondary">{item.post}</p>
+                    {item.change_summary && (
+                      <p className="mt-2 text-[11px] leading-relaxed text-text-muted">{item.change_summary}</p>
+                    )}
+                    {(item.supportive_pressure != null || item.skeptical_pressure != null || item.messenger_alignment != null) && (
+                      <div className="mt-3 flex flex-wrap gap-2 font-mono text-[9px] uppercase tracking-[0.1em] text-text-muted">
+                        {item.supportive_pressure != null && (
+                          <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                            support {item.supportive_pressure.toFixed(2)}
+                          </span>
+                        )}
+                        {item.skeptical_pressure != null && (
+                          <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                            pushback {item.skeptical_pressure.toFixed(2)}
+                          </span>
+                        )}
+                        {item.messenger_alignment != null && (
+                          <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-1">
+                            fit {item.messenger_alignment.toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

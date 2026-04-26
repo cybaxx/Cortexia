@@ -46,6 +46,8 @@ def init_pipeline_store() -> None:
               role TEXT NOT NULL,
               latitude REAL NOT NULL,
               longitude REAL NOT NULL,
+              demographics_json TEXT NOT NULL DEFAULT '{}',
+              spread_notes TEXT NOT NULL DEFAULT '',
               tribe_json TEXT NOT NULL,
               calibrated_json TEXT NOT NULL,
               traits_json TEXT NOT NULL,
@@ -55,6 +57,7 @@ def init_pipeline_store() -> None:
             )
             """
         )
+        _ensure_agent_outcome_columns(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_conversations (
@@ -90,6 +93,15 @@ def init_pipeline_store() -> None:
         conn.commit()
 
 
+def _ensure_agent_outcome_columns(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(agent_outcomes)").fetchall()
+    columns = {str(row[1]) for row in rows}
+    if "demographics_json" not in columns:
+        conn.execute("ALTER TABLE agent_outcomes ADD COLUMN demographics_json TEXT NOT NULL DEFAULT '{}'")
+    if "spread_notes" not in columns:
+        conn.execute("ALTER TABLE agent_outcomes ADD COLUMN spread_notes TEXT NOT NULL DEFAULT ''")
+
+
 def persist_case_run(
     *,
     domain: str,
@@ -108,6 +120,7 @@ def persist_case_run(
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        _ensure_agent_outcome_columns(conn)
         cursor = conn.execute(
             """
             INSERT INTO case_runs (
@@ -134,9 +147,9 @@ def persist_case_run(
             """
             INSERT INTO agent_outcomes (
               run_id, agent_id, name, role, latitude, longitude,
-              tribe_json, calibrated_json, traits_json, score_json, outcome_json
+              demographics_json, spread_notes, tribe_json, calibrated_json, traits_json, score_json, outcome_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -146,6 +159,8 @@ def persist_case_run(
                     row["role"],
                     row["latitude"],
                     row["longitude"],
+                    json.dumps(row.get("demographics") or {}),
+                    str(row.get("spread_notes") or ""),
                     json.dumps(row["tribe"]),
                     json.dumps(row["calibrated"]),
                     json.dumps(row["traits"]),
@@ -236,6 +251,7 @@ def fetch_agent_outcome(run_id: int, agent_id: int) -> dict[str, Any] | None:
         return None
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
+        _ensure_agent_outcome_columns(conn)
         row = conn.execute(
             "SELECT * FROM agent_outcomes WHERE run_id = ? AND agent_id = ?",
             (run_id, agent_id),
@@ -249,12 +265,50 @@ def fetch_agent_outcome(run_id: int, agent_id: int) -> dict[str, Any] | None:
             "role": row["role"],
             "latitude": row["latitude"],
             "longitude": row["longitude"],
+            "demographics": json.loads(row["demographics_json"]) if row["demographics_json"] else {},
+            "spread_notes": row["spread_notes"] or "",
             "tribe": json.loads(row["tribe_json"]),
             "calibrated": json.loads(row["calibrated_json"]),
             "traits": json.loads(row["traits_json"]),
             "scores": json.loads(row["score_json"]),
             "outcome": json.loads(row["outcome_json"]),
         }
+
+
+def list_run_agents(run_id: int, limit: int = 250) -> list[dict[str, Any]]:
+    path = _db_path()
+    if not path.exists():
+        return []
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_agent_outcome_columns(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM agent_outcomes
+            WHERE run_id = ?
+            ORDER BY agent_id ASC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "agent_id": row["agent_id"],
+                "name": row["name"],
+                "role": row["role"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "demographics": json.loads(row["demographics_json"]) if row["demographics_json"] else {},
+                "spread_notes": row["spread_notes"] or "",
+                "tribe": json.loads(row["tribe_json"]),
+                "calibrated": json.loads(row["calibrated_json"]),
+                "traits": json.loads(row["traits_json"]),
+                "scores": json.loads(row["score_json"]),
+                "outcome": json.loads(row["outcome_json"]),
+            }
+            for row in rows
+        ]
 
 
 def append_agent_conversation(
@@ -280,6 +334,22 @@ def append_agent_conversation(
         )
         conn.commit()
         return int(cursor.lastrowid)
+
+
+def update_agent_spread_notes(*, run_id: int, agent_id: int, spread_notes: str) -> None:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        _ensure_agent_outcome_columns(conn)
+        conn.execute(
+            """
+            UPDATE agent_outcomes
+            SET spread_notes = ?
+            WHERE run_id = ? AND agent_id = ?
+            """,
+            (spread_notes, run_id, agent_id),
+        )
+        conn.commit()
 
 
 def list_agent_conversations(run_id: int, agent_id: int, limit: int = 12) -> list[dict[str, Any]]:

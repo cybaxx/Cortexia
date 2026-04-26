@@ -22,8 +22,12 @@ from app.pipeline_store import (
     fetch_case_run,
     init_pipeline_store,
     list_agent_conversations,
+    list_run_agents,
     list_recent_runs,
+    update_agent_spread_notes,
 )
+from app.population_store import fetch_population_agent, init_population_store, list_population
+from app.services.action_center import action_center_provider_status, build_action_center_research
 from app.services.ai_clients import call_elevenlabs, call_k2_agent_conversation, transcribe_audio_with_elevenlabs
 from app.services.api_simulation import run_simulation_http
 
@@ -35,10 +39,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_pipeline_store()
+    init_population_store()
     logger.info("Cortexia API ready; CORS=%s", settings.cors_origin_list)
     yield
 
@@ -98,6 +102,21 @@ class SimulateIn(BaseModel):
 
 class AgentConversationIn(BaseModel):
     message: str = Field(min_length=2, max_length=1200)
+
+
+class AgentSpreadNotesIn(BaseModel):
+    spread_notes: str = Field(default="", max_length=8000)
+
+
+class ActionCenterResearchIn(BaseModel):
+    domain: str = "public_health"
+    city_id: str = "la"
+    case_goal: str = ""
+    scenario: str = Field(min_length=8, max_length=6000)
+    spread_risk: str | None = None
+    key_finding: str | None = None
+    dominant_pathway: str | None = None
+    notes: str | None = None
 
 
 @app.get("/api/health")
@@ -188,6 +207,34 @@ async def api_simulate(body: SimulateIn) -> dict[str, object]:
         raise HTTPException(status_code=500, detail=f"Simulation failed: {exc}") from exc
 
 
+@app.get("/api/action-center/status")
+async def api_action_center_status() -> dict[str, Any]:
+    return {"providers": action_center_provider_status()}
+
+
+@app.post("/api/action-center/research")
+async def api_action_center_research(body: ActionCenterResearchIn) -> dict[str, Any]:
+    async with httpx.AsyncClient() as httpx_client:
+        try:
+            return await build_action_center_research(
+                httpx_client,
+                domain=body.domain,
+                city_id=body.city_id,
+                case_goal=body.case_goal,
+                scenario=body.scenario,
+                spread_risk=body.spread_risk,
+                key_finding=body.key_finding,
+                dominant_pathway=body.dominant_pathway,
+                notes=body.notes,
+            )
+        except httpx.HTTPError as exc:
+            logger.exception("Action Center upstream HTTP failure")
+            raise HTTPException(status_code=502, detail=f"Action Center upstream failed: {exc}") from exc
+        except Exception as exc:
+            logger.exception("Action Center research failed")
+            raise HTTPException(status_code=500, detail=f"Action Center research failed: {exc}") from exc
+
+
 @app.get("/api/runs/recent")
 async def api_recent_runs(limit: int = Query(default=8, ge=1, le=25)) -> dict[str, list[dict[str, Any]]]:
     """
@@ -205,6 +252,41 @@ async def api_case_run(run_id: int) -> dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found.")
     return record
+
+
+@app.get("/api/populations/{city_id}/agents")
+async def api_population_agents(city_id: str, limit: int = Query(default=120, ge=1, le=400)) -> dict[str, Any]:
+    return {"agents": list_population(city_id, limit)}
+
+
+@app.get("/api/populations/{city_id}/agents/{agent_id}")
+async def api_population_agent(city_id: str, agent_id: int) -> dict[str, Any]:
+    agent = fetch_population_agent(city_id, agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Population agent not found.")
+    return agent
+
+
+@app.get("/api/runs/{run_id}/agents")
+async def api_run_agents(run_id: int, limit: int = Query(default=180, ge=1, le=400)) -> dict[str, Any]:
+    return {"agents": list_run_agents(run_id, limit)}
+
+
+@app.get("/api/runs/{run_id}/agents/{agent_id}/profile")
+async def api_run_agent_profile(run_id: int, agent_id: int) -> dict[str, Any]:
+    agent = fetch_agent_outcome(run_id, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent or run not found.")
+    return agent
+
+
+@app.put("/api/runs/{run_id}/agents/{agent_id}/notes")
+async def api_run_agent_notes(run_id: int, agent_id: int, body: AgentSpreadNotesIn) -> dict[str, Any]:
+    agent = fetch_agent_outcome(run_id, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent or run not found.")
+    update_agent_spread_notes(run_id=run_id, agent_id=agent_id, spread_notes=body.spread_notes.strip())
+    return {"run_id": run_id, "agent_id": agent_id, "spread_notes": body.spread_notes.strip()}
 
 
 @app.get("/api/runs/{run_id}/agents/{agent_id}/conversation")
@@ -254,11 +336,34 @@ async def api_agent_conversation(run_id: int, agent_id: int, body: AgentConversa
                     else "neutral",
                 },
                 traits=agent["traits"],
+                demographics=agent.get("demographics") or payload_agent.get("demographics"),
+                spread_notes=agent.get("spread_notes") or "",
+                tribe_state=agent.get("tribe") or {},
+                calibrated_state=agent.get("calibrated") or {},
+                agent_profile={
+                    "brain_summary": payload_agent.get("brain_summary"),
+                    "tribe_neurological_metrics": payload_agent.get("tribe_neurological_metrics"),
+                    "brain_regions": payload_agent.get("brain_regions"),
+                    "agent_insight": payload_agent.get("agent_insight"),
+                    "round_history": payload_agent.get("round_history"),
+                },
                 scores=agent["scores"],
                 user_message=body.message,
                 prior_turns=prior_turns,
             )
-            audio_path = await call_elevenlabs(httpx_client, reply)
+            audio_path = await call_elevenlabs(
+                httpx_client,
+                reply,
+                voice_context={
+                    "demographics": agent.get("demographics") or payload_agent.get("demographics"),
+                    "tribe": agent.get("tribe") or {},
+                    "calibrated": agent.get("calibrated") or {},
+                    "outcome": {
+                        "belief_state": payload_agent.get("belief_state"),
+                        "confidence": payload_agent.get("k2_decision_confidence"),
+                    },
+                },
+            )
         except httpx.HTTPError as exc:
             logger.exception("Agent conversation upstream HTTP failure")
             raise HTTPException(status_code=502, detail=f"Agent conversation upstream failed: {exc}") from exc

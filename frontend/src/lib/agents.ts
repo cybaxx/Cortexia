@@ -10,6 +10,8 @@ export interface Agent {
   cognitiveLoad: number;      // 0..1
   emotionalAgitation: number; // 0..1
   defensivePosture: number;   // 0..1
+  confidence?: number;
+  dominantSignal?: string;
 }
 
 export interface InfluenceArc {
@@ -72,9 +74,9 @@ export function generateArcs(agents: Agent[], count = 35): InfluenceArc[] {
 
 /** Map node colors: strict Indigo/Coral/Gray palette. */
 export const COLORS = {
-  neutral: [188, 231, 219, 168] as [number, number, number, number], // Mint mist
-  strain: [255, 191, 166, 220] as [number, number, number, number],  // Peach reactance
-  adopt: [160, 214, 255, 224] as [number, number, number, number],   // Sky adoption
+  neutral: [192, 184, 176, 214] as [number, number, number, number],
+  strain: [232, 133, 106, 224] as [number, number, number, number],
+  adopt: [74, 158, 255, 224] as [number, number, number, number],
 };
 
 export function beliefToAgentState(b: 'adopted' | 'rejected' | 'neutral'): AgentState {

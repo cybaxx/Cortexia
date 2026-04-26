@@ -64,6 +64,7 @@ interface CortexState {
 
   agentOverrides: Record<number, AgentParamPatch>;
   agentSimulationById: Record<number, AgentSimulationPayload>;
+  selectedAgentId: number | null;
 
   setScreen: (screen: Screen) => void;
   setStage: (stage: WorkspaceStage) => void;
@@ -75,6 +76,7 @@ interface CortexState {
   setAudioUpload: (audioUpload: AudioUploadState | null) => void;
   patchAgent: (id: number, partial: AgentParamPatch) => void;
   getAgentPayload: (id: number) => AgentSimulationPayload | undefined;
+  setSelectedAgentId: (id: number | null) => void;
   runSimulation: () => Promise<void>;
   exportCase: (format?: 'json' | 'markdown' | 'pdf') => void;
   loadRecentRuns: () => Promise<void>;
@@ -143,6 +145,7 @@ function applySimulationResponse(set: (partial: Partial<CortexState>) => void, r
     evidenceGraph: response.evidence_graph ?? null,
     swarmDynamics: response.swarm_dynamics ?? null,
     agentSimulationById: byId,
+    selectedAgentId: null,
     status: 'ready',
     stage: 'spread',
   });
@@ -159,6 +162,26 @@ function applyPersistedRun(set: (partial: Partial<CortexState>) => void, record:
         record.evidence.edited_analysis_text?.trim() || record.response.evidence_trace.analysis_text,
     },
   });
+}
+
+function invalidateSimulationResult(state: CortexState): Partial<CortexState> {
+  if (!state.latestResponse && !state.caseSummary && !state.spreadModel && !state.mechanisms) {
+    return {};
+  }
+  return {
+    status: 'idle',
+    apiError: null,
+    latestResponse: null,
+    caseSummary: null,
+    spreadModel: null,
+    mechanisms: null,
+    interventionPlaybook: [],
+    evidenceTrace: null,
+    evidenceGraph: null,
+    swarmDynamics: null,
+    agentSimulationById: {},
+    selectedAgentId: null,
+  };
 }
 
 export const useCortexStore = create<CortexState>((set, get) => ({
@@ -188,6 +211,7 @@ export const useCortexStore = create<CortexState>((set, get) => ({
 
   agentOverrides: {},
   agentSimulationById: {},
+  selectedAgentId: null,
 
   setScreen: (screen) => set({ screen }),
   setStage: (stage) => set({ stage }),
@@ -206,15 +230,28 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       agentSimulationById: {},
       apiError: null,
     }),
-  setCityId: (cityId) => set({ cityId }),
-  setCaseGoal: (caseGoal) => set({ caseGoal }),
-  setMessageComplexity: (messageComplexity) => set({ messageComplexity }),
+  setCityId: (cityId) =>
+    set((state) => ({
+      cityId,
+      ...invalidateSimulationResult(state),
+    })),
+  setCaseGoal: (caseGoal) =>
+    set((state) => ({
+      caseGoal,
+      ...invalidateSimulationResult(state),
+    })),
+  setMessageComplexity: (messageComplexity) =>
+    set((state) => ({
+      messageComplexity,
+      ...invalidateSimulationResult(state),
+    })),
   setEvidenceField: (key, value) =>
     set((state) => ({
       evidence: {
         ...state.evidence,
         [key]: value,
       },
+      ...invalidateSimulationResult(state),
     })),
   setAudioUpload: (audioUpload) => set({ audioUpload }),
 
@@ -224,6 +261,7 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     })),
 
   getAgentPayload: (id) => get().agentSimulationById[id],
+  setSelectedAgentId: (selectedAgentId) => set({ selectedAgentId }),
 
   runSimulation: async () => {
     const { useCase, cityId, caseGoal, evidence, messageComplexity } = get();
@@ -240,6 +278,7 @@ export const useCortexStore = create<CortexState>((set, get) => ({
 
     set({
       status: 'running',
+      stage: 'spread',
       apiError: null,
       latestResponse: null,
       caseSummary: null,

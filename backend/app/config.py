@@ -53,6 +53,30 @@ class Settings(BaseSettings):
         description="ElevenLabs Speech-to-Text model id.",
     )
 
+    # Action Center live research providers
+    tavily_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("tavily_api_key", "TAVILY_API_KEY"),
+        description="Tavily API key for live web research in the final Action Center step.",
+    )
+    firecrawl_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("firecrawl_api_key", "FIRECRAWL_API_KEY"),
+        description="Firecrawl API key for structured extraction in the final Action Center step.",
+    )
+    action_center_max_sources: int = Field(
+        default=6,
+        ge=2,
+        le=12,
+        description="Maximum number of live web sources to pull into the Action Center dossier.",
+    )
+    action_center_timeout_seconds: float = Field(
+        default=35.0,
+        gt=5.0,
+        le=120.0,
+        description="Timeout for Action Center provider calls such as Tavily and Firecrawl.",
+    )
+
     # TRIBE v2 on Modal (same as `tribe_modal_deployment_url()` in app.constants)
     tribe_modal_url: str = Field(
         default="",
@@ -70,7 +94,7 @@ class Settings(BaseSettings):
 
     # One-shot HTTP simulation (Modal + K2)
     simulate_population_size: int = Field(
-        default=110,
+        default=72,
         ge=24,
         le=220,
         description="Synthetic agent count generated for each /api/simulate request.",

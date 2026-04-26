@@ -94,17 +94,20 @@ This section ties the blueprint to the code as it exists today; update it when t
 
 | Blueprint concept | Code / file |
 |-------------------|-------------|
-| `POST /api/simulate` | `backend/app/main.py` `SimulateIn` (`catalyst_text`, `city_id`, `source_url`, `use_case`, `message_complexity`) |
-| `target_city` | Implemented as `city_id` (presets in `backend/app/city_presets.py`, `frontend/src/data/cities.ts`) |
-| K2 Think client | `backend/app/services/ai_clients.py` `call_k2_think` (K2 base URL and model in `app.config`) |
-| Tribe (BSV) | `call_tribe_modal` in `ai_clients.py`; Modal app in `modal_app.py` |
-| Per-agent HTTP simulation bundle | `backend/app/services/api_simulation.py` `run_simulation_http` |
-| Frontend inject + map + inspection | `SimulationInputPanel`, `MapView`, `AgentInspectionModal`; state + `postSimulate` in `frontend/src/lib/api/simulate.ts` and `store/cortex.ts` |
-| WebSocket (optional broadcast) | `backend/app/main.py` `/api/simulation/ws` |
-| **Gap vs target** | Full simulation may still run **in-process** on FastAPI for `/api/simulate` instead of a non-blocking Modal fan-out; DB logging of every `POST /api/simulate` is not yet mandatory in the handler |
+| `POST /api/simulate` | `backend/app/main.py` — `SimulateIn` (`evidence`, `city_id`, `domain`, `case_goal`, `message_complexity`) |
+| `target_city` | `city_id` — presets in `backend/app/city_presets.py`, `frontend/src/data/cities.ts` |
+| K2 Think client | `backend/app/services/ai_clients.py` — batch think, timeline, agent chat (URL/model in `app.config`) |
+| Tribe (BSV) | `call_tribe_modal_batch` in `ai_clients.py` — **`TRIBE_RUNTIME_MODE=framework`** → `app/services/tribe_framework.py` (vendored `tribe_neural`); **`modal`** → `modal_app.py` HTTPS batch |
+| Per-agent TRIBE personalization (framework) | `tribe_framework.py` — copy/modulate `roi_stats` from demographics + role, recompute `compute_composites`, derive BSV; `tribe_meta.per_agent` for composite biases in `api_simulation.py` |
+| Per-agent HTTP simulation bundle | `backend/app/services/api_simulation.py` — `run_simulation_http` |
+| Population listing | `backend/app/population_store.py` — `GET /api/populations/{city_id}/agents` |
+| Action Center (live research) | `backend/app/services/action_center.py` — `GET /api/action-center/status`, `POST /api/action-center/research` |
+| Frontend dashboard + map + inspection | `SimulationDashboard`, `MapView`, `AgentInspectionModal`, `AgentVoiceWorkspace`; `frontend/src/lib/api/simulate.ts`, `store/cortex.ts` |
+| **Gap vs target** | `/api/simulate` still runs **in-process** on FastAPI; optional non-blocking Modal fan-out for the full simulation remains a product decision |
 
 ---
 
 ## 7. Changelog
 
 - **2026-04-25:** Initial blueprint committed as project documentation.
+- **2026-04-26:** Implementation map updated for TRIBE framework mode, `tribe_meta.per_agent`, population and Action Center routes.

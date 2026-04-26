@@ -216,6 +216,45 @@ class LangChainAgentDecisionEngine:
 
 
 @dataclass
+class HybridLangGraphDecisionEngine:
+    """Combines a base heuristic engine with an LLM engine for key actors."""
+
+    base_engine: AgentDecisionEngine
+    llm_engine: AgentDecisionEngine
+    key_actor_ids: set[str]
+
+    def decide(
+        self,
+        *,
+        agent_id: str,
+        agent_profile: dict[str, Any],
+        scenario: str,
+        visible_messages: list[BaseMessage],
+        tick: int,
+    ) -> AgentAction:
+        if agent_id in self.key_actor_ids:
+            try:
+                return self.llm_engine.decide(
+                    agent_id=agent_id,
+                    agent_profile=agent_profile,
+                    scenario=scenario,
+                    visible_messages=visible_messages,
+                    tick=tick,
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("LLM engine failed for agent %s. Falling back to heuristic. Error: %s", agent_id, e)
+
+        return self.base_engine.decide(
+            agent_id=agent_id,
+            agent_profile=agent_profile,
+            scenario=scenario,
+            visible_messages=visible_messages,
+            tick=tick,
+        )
+
+
+@dataclass
 class RuleBasedDemoDecisionEngine:
     """Local deterministic engine for the runnable example."""
 

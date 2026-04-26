@@ -28,8 +28,8 @@ import httpx
 from app.city_presets import get_city
 from app.config import get_settings
 from app.pipeline_store import persist_case_run
-from app.services.ai_clients import BSV, call_k2_think, call_tribe_modal_batch
-from app.services.langgraph_multi_agent_sim import AgentAction, run_simulation_loop
+from app.services.ai_clients import BSV, call_k2_batch_think, call_k2_explanation_only, call_k2_timeline_batch, call_tribe_modal_batch
+from app.services.langgraph_multi_agent_sim import AgentAction, run_simulation_loop, HybridLangGraphDecisionEngine, make_chat_openai_decision_engine
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -157,6 +157,25 @@ _ACTION_RE = re.compile(r"<action>\s*(Adopted|Rejected)\s*</action>", re.IGNOREC
 _CONFIDENCE_RE = re.compile(r"<confidence>\s*([01](?:\.\d+)?)\s*</confidence>", re.IGNORECASE)
 _SIGNAL_RE = re.compile(r"<signal>\s*([a-z_]+)\s*</signal>", re.IGNORECASE)
 
+ROI_DISPLAY_LABELS: dict[str, str] = {
+    "fear_salience": "Threat and fear response",
+    "reward_limbic": "Reward and opportunity detection",
+    "deliberation": "Analytical thinking and rational control",
+    "social_default": "Awareness of others and social pressure",
+    "attention": "Uncertainty and vigilance",
+    "action_motor": "Urge to act",
+}
+
+CONNECTIVITY_DISPLAY_LABELS: dict[str, str] = {
+    "fear_social": "Fear ↔ social awareness",
+    "fear_deliberation": "Fear ↔ analytical thinking",
+    "fear_reward": "Fear ↔ reward detection",
+    "reward_delib": "Reward ↔ analytical thinking",
+    "reward_social": "Reward ↔ social awareness",
+    "action_fear": "Action urge ↔ fear",
+    "action_reward": "Action urge ↔ reward",
+}
+
 
 class _ReadableHTMLParser(HTMLParser):
     def __init__(self) -> None:
@@ -184,12 +203,26 @@ class _ReadableHTMLParser(HTMLParser):
 
 
 @dataclass(frozen=True)
+class _Demographics:
+    age_band: str
+    age_years: int
+    education_level: str
+    income_band: str
+    housing_status: str
+    language_profile: str
+    community_tenure: str
+    caregiving_load: str
+    digital_media_habit: str
+
+
+@dataclass(frozen=True)
 class _Virt:
     id: int
     name: str
     role: str
     lat: float
     lng: float
+    demographics: _Demographics
 
 
 @dataclass(frozen=True)
@@ -214,6 +247,8 @@ class _Traits:
 class _NetworkEdge:
     source_id: int
     target_id: int
+    weight: float
+    compatibility: float
 
 
 @dataclass
@@ -221,6 +256,241 @@ class _HeuristicLangGraphDecisionEngine:
     """Deterministic per-agent interaction engine for the UI-facing propagation loop."""
 
     agent_lookup: dict[str, dict[str, Any]]
+
+    def _variant(self, agent_id: str, tick: int, options: list[str]) -> str:
+        idx = int((_seeded(int(agent_id) * 31 + tick * 17) * len(options)) % max(1, len(options)))
+        return options[idx]
+
+    def _role_voice(self, role: str) -> str:
+        lowered = role.lower()
+        if any(token in lowered for token in ("journal",)):
+            return "reporting"
+        if any(token in lowered for token in ("policy", "organizer")):
+            return "civic"
+        if any(token in lowered for token in ("analyst", "engineer", "research")):
+            return "evidence"
+        if any(token in lowered for token in ("health", "educator", "responder")):
+            return "public_service"
+        if any(token in lowered for token in ("small business", "operations")):
+            return "practical"
+        return "general"
+
+    def _traits(self, payload: dict[str, Any]) -> dict[str, float]:
+        raw = payload.get("traits") or {}
+        return {key: float(value) for key, value in raw.items() if isinstance(value, (int, float))}
+
+    def _demographics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw = payload.get("demographics") or {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _connection_profile(self, agent_profile: dict[str, Any], other_id: str | None) -> dict[str, Any]:
+        profiles = agent_profile.get("connection_profiles") or {}
+        if other_id is None:
+            return {}
+        profile = profiles.get(str(other_id)) or {}
+        return profile if isinstance(profile, dict) else {}
+
+    def _neighbor_weight(self, agent_profile: dict[str, Any], other_id: str | None) -> float:
+        return _clamp(float(self._connection_profile(agent_profile, other_id).get("weight", 0.42)), 0.2, 1.0)
+
+    def _neighbor_role(self, agent_profile: dict[str, Any], other_id: str | None) -> str:
+        return str(self._connection_profile(agent_profile, other_id).get("role") or "")
+
+    def _role_requirement(self, payload: dict[str, Any], latest_neighbor_role: str | None = None) -> str:
+        traits = self._traits(payload)
+        demographics = self._demographics(payload)
+        evidence_literacy = traits.get("evidence_literacy", 0.5)
+        institutional_trust = traits.get("institutional_trust", 0.5)
+        role = str(payload.get("role") or "").lower()
+        neighbor_role = (latest_neighbor_role or "").lower()
+        media_habit = str(demographics.get("digital_media_habit") or "").lower()
+        caregiving_load = str(demographics.get("caregiving_load") or "").lower()
+        if evidence_literacy >= 0.62:
+            return "a source chain I can verify"
+        if "group-chat" in media_habit or "public-feed" in media_habit:
+            return "something stronger than a forwarded version"
+        if "primary caregiver" in caregiving_load:
+            return "something concrete enough to act on without second-guessing"
+        if any(token in role for token in ("policy", "organizer", "analyst")) or any(
+            token in neighbor_role for token in ("policy", "journal", "analyst")
+        ):
+            return "a traceable public record"
+        if any(token in role for token in ("health", "educator", "responder")):
+            return "trusted guidance I could act on"
+        if institutional_trust >= 0.58:
+            return "documentation that would exist if this were real"
+        return "evidence that does more than repeat the claim"
+
+    def _role_context_clause(self, payload: dict[str, Any], latest_neighbor_name: str | None, latest_neighbor_role: str | None) -> str:
+        role = str(payload.get("role") or "").lower()
+        demographics = self._demographics(payload)
+        neighbor = latest_neighbor_name or "someone nearby"
+        tenure = str(demographics.get("community_tenure") or "").lower()
+        if any(token in role for token in ("policy", "organizer", "analyst")):
+            return f"a city-scale claim like this should leave a public trail, and {neighbor} still has not shown one"
+        if any(token in role for token in ("health", "educator", "responder")):
+            return f"nothing in what {neighbor} passed along reaches the threshold for something I could responsibly repeat"
+        if any(token in role for token in ("engineer", "research", "journal")):
+            return f"{neighbor} is adding circulation, not verification"
+        if "deeply rooted" in tenure or "long-term" in tenure:
+            return f"the story still does not match what someone with long neighborhood memory would expect to see"
+        if latest_neighbor_role:
+            return f"hearing it through a {latest_neighbor_role.lower()} still does not make it sturdier"
+        return "the message keeps expanding without getting more concrete"
+
+    def _focus_area(self, payload: dict[str, Any]) -> str:
+        role = str(payload.get("role") or "").lower()
+        demographics = self._demographics(payload)
+        if any(token in role for token in ("policy", "analyst", "journal", "organizer")):
+            return "public record"
+        if any(token in role for token in ("health", "educator", "responder")):
+            return "actionability"
+        if any(token in role for token in ("engineer", "research")):
+            return "verification chain"
+        if str(demographics.get("digital_media_habit") or "").lower() == "group-chat heavy":
+            return "forwarded provenance"
+        return "local plausibility"
+
+    def _personal_anchor(self, payload: dict[str, Any]) -> str:
+        demographics = self._demographics(payload)
+        tenure = str(demographics.get("community_tenure") or "").lower()
+        media_habit = str(demographics.get("digital_media_habit") or "").lower()
+        age_band = str(demographics.get("age_band") or "").lower()
+        caregiving_load = str(demographics.get("caregiving_load") or "").lower()
+        language_profile = str(demographics.get("language_profile") or "").lower()
+        cues: list[str] = []
+        if "group-chat" in media_habit:
+            cues.append("group-chat circulation alone is not enough for me to trust it")
+        elif "public-feed" in media_habit:
+            cues.append("feed velocity is outpacing the underlying proof")
+        elif "local-news" in media_habit:
+            cues.append("if this were solid, I would expect it to echo through more than neighborhood chatter")
+        elif "mixed" in media_habit:
+            cues.append("cross-checking across channels still is not giving this a firmer backbone")
+
+        if "long-term" in tenure or "deeply rooted" in tenure:
+            cues.append("my read is shaped by long neighborhood memory, and this still does not line up")
+        elif "established" in tenure:
+            cues.append("with some local memory behind me, I still expect cleaner proof than this")
+        elif "recent arrival" in tenure:
+            cues.append("without deeper local context, I lean harder on verifiable records than repetition")
+
+        if "primary caregiver" in caregiving_load:
+            cues.append("anything I pass along has to be actionable enough for real-world decisions")
+        elif "shared caregiver" in caregiving_load:
+            cues.append("I filter this through whether it would hold up under everyday family decisions")
+
+        if language_profile and language_profile != "english-dominant":
+            cues.append("the message still does not translate into a dependable, repeatable fact pattern")
+        if age_band in {"18-24", "25-34"}:
+            cues.append("I need more than ambient circulation before I would attach my name to it")
+        elif age_band in {"55-64", "65+"}:
+            cues.append("experience makes me look for durable proof, not just another retelling")
+
+        if not cues:
+            return "I still need a clearer factual backbone before I treat it as settled"
+
+        agent_id = int(payload.get("id") or 0)
+        first = cues[agent_id % len(cues)]
+        if len(cues) == 1:
+            return first
+        second = cues[(agent_id // 3 + 1) % len(cues)]
+        if second == first:
+            second = cues[(agent_id + 1) % len(cues)]
+        return f"{first}; {second}"
+
+    def _pressure_word(self, state: str, weighted_bias: float, signal: str) -> str:
+        if state == "adopted":
+            if signal == "social_proof":
+                return "normalized"
+            return "plausible"
+        if state == "neutral":
+            return "unresolved"
+        if signal == "defensive_reactance":
+            return "agenda-driven"
+        if weighted_bias >= 0.72:
+            return "unsupported"
+        return "unverified"
+
+    def _channel_descriptor(self, payload: dict[str, Any], latest_neighbor_role: str | None) -> str:
+        demographics = self._demographics(payload)
+        habit = str(demographics.get("digital_media_habit") or "").lower()
+        if latest_neighbor_role:
+            return latest_neighbor_role.lower()
+        if "group-chat" in habit:
+            return "group chat"
+        if "public-feed" in habit:
+            return "public feed"
+        if "local-news" in habit:
+            return "local news"
+        return "neighborhood circulation"
+
+    def _compose_agent_statement(
+        self,
+        payload: dict[str, Any],
+        state: str,
+        tick: int,
+        *,
+        latest_neighbor_name: str | None,
+        latest_neighbor_role: str | None,
+        weighted_bias: float,
+        visible_text: str,
+        confidence_band: str,
+        visible_count: int,
+        visible_authors: list[str],
+    ) -> str:
+        requirement = self._role_requirement(payload, latest_neighbor_role)
+        context_clause = self._role_context_clause(payload, latest_neighbor_name, latest_neighbor_role)
+        demographics = self._demographics(payload)
+        signal = str(payload.get("dominant_signal") or "")
+        focus = self._focus_area(payload)
+        channel = self._channel_descriptor(payload, latest_neighbor_role)
+        anchor = self._pressure_word(state, weighted_bias, signal)
+        media_habit = str(demographics.get("digital_media_habit") or "").lower()
+        repeat_exposure = max(0, visible_count - len(set(visible_authors)))
+        source_mentions = visible_text.count("source")
+        evidence_mentions = visible_text.count("evidence")
+        record_mentions = visible_text.count("record")
+        personal_anchor = self._personal_anchor(payload)
+        opener = (
+            f"At first pass, the {focus} still looked {anchor}."
+            if tick == 0
+            else f"After another round through {channel}, the {focus} still looks {anchor}."
+        )
+        if latest_neighbor_name:
+            opener = (
+                f"{latest_neighbor_name} pushed the claim into view, but the {focus} still looks {anchor}."
+                if tick == 0
+                else f"Even after {latest_neighbor_name} circled back, the {focus} still looks {anchor}."
+                if tick == 1
+                else f"A third pass from {latest_neighbor_name} still leaves the {focus} looking {anchor}."
+            )
+        middle = (
+            f"I still need {requirement}."
+            if state != "adopted"
+            else f"The message is clearing enough of the {focus} check for me to keep it in play."
+        )
+        if "group-chat" in media_habit and state != "adopted":
+            middle = f"It still behaves more like a forwarded version than something anchored by dependable sourcing."
+        if tick >= 2 and confidence_band == "high" and "source" in visible_text and state != "adopted":
+            middle = f"More repetition is not fixing the core deficit: there is still no {requirement}."
+        elif tick >= 2 and state != "adopted" and (source_mentions + evidence_mentions + record_mentions) == 0:
+            middle = f"By this point I would expect at least {requirement}, and the network is still only recirculating the same claim."
+        elif tick >= 1 and state != "adopted" and repeat_exposure > 0:
+            middle = f"The repetition is rising faster than the verification: I still need {requirement}."
+        closer = (
+            f"{_upper_first(context_clause)}."
+            if state != "adopted"
+            else f"The channel fit and local repetition are starting to outweigh my initial hesitation."
+        )
+        if state != "adopted":
+            if tick >= 2 and visible_count >= 2:
+                closer = f"{_upper_first(context_clause)}. { _upper_first(personal_anchor) }. The loop is getting louder, but it is not getting sturdier."
+            elif tick == 1 and visible_count == 1:
+                closer = f"{_upper_first(context_clause)}. { _upper_first(personal_anchor) }. One more retelling still does not move it past my threshold."
+            else:
+                closer = f"{_upper_first(context_clause)}. { _upper_first(personal_anchor) }."
+        return " ".join(part.strip() for part in (opener, middle, closer) if part.strip())
 
     def decide(
         self,
@@ -233,23 +503,45 @@ class _HeuristicLangGraphDecisionEngine:
     ) -> AgentAction:
         payload = self.agent_lookup[agent_id]
         state = str(payload["belief_state"])
-        signal = str(payload["dominant_signal"])
         confidence = float(payload.get("confidence", 0.5))
         connections = [str(item) for item in (agent_profile.get("connections") or [])]
+        confidence_band = "high" if confidence >= 0.55 else "medium" if confidence >= 0.4 else "low"
 
         if not visible_messages:
             if tick == 0 and state == "adopted":
                 return AgentAction(
                     author_id=agent_id,
                     action_type="post_public",
-                    content=f"{payload['name']} is leaning into the claim: {scenario[:120]}",
+                    content=self._compose_agent_statement(
+                        payload,
+                        state,
+                        tick,
+                        latest_neighbor_name=None,
+                        latest_neighbor_role=None,
+                        weighted_bias=0.42,
+                        visible_text="",
+                        confidence_band=confidence_band,
+                        visible_count=0,
+                        visible_authors=[],
+                    ),
                     rationale="Initial adopter seeds the narrative publicly.",
                 )
             if tick == 0 and state == "rejected" and confidence >= 0.62:
                 return AgentAction(
                     author_id=agent_id,
                     action_type="post_public",
-                    content=f"{payload['name']} warns that the claim feels overstated or misleading.",
+                    content=self._compose_agent_statement(
+                        payload,
+                        state,
+                        tick,
+                        latest_neighbor_name=None,
+                        latest_neighbor_role=None,
+                        weighted_bias=0.42,
+                        visible_text="",
+                        confidence_band=confidence_band,
+                        visible_count=0,
+                        visible_authors=[],
+                    ),
                     rationale="High-confidence rejector broadcasts skepticism.",
                 )
             return AgentAction(
@@ -262,6 +554,13 @@ class _HeuristicLangGraphDecisionEngine:
         visible_authors = [str(message.name or message.additional_kwargs.get("author_id") or "") for message in visible_messages]
         visible_text = " ".join(str(message.content) for message in visible_messages).lower()
         latest_author = next((author for author in reversed(visible_authors) if author and author != agent_id), None)
+        latest_neighbor_name = (
+            self.agent_lookup.get(str(latest_author), {}).get("name")
+            if latest_author is not None
+            else None
+        )
+        latest_neighbor_role = self._neighbor_role(agent_profile, latest_author) if latest_author else None
+        latest_neighbor_weight = self._neighbor_weight(agent_profile, latest_author) if latest_author else 0.42
 
         if state == "adopted":
             if latest_author and latest_author in connections:
@@ -269,22 +568,52 @@ class _HeuristicLangGraphDecisionEngine:
                     author_id=agent_id,
                     action_type="talk_to_agent",
                     target_agent_id=latest_author,
-                    content="This lines up with what I already suspected. Are others around you repeating it too?",
+                    content=self._compose_agent_statement(
+                        payload,
+                        state,
+                        tick,
+                        latest_neighbor_name=latest_neighbor_name,
+                        latest_neighbor_role=latest_neighbor_role,
+                        weighted_bias=latest_neighbor_weight,
+                        visible_text=visible_text,
+                        confidence_band=confidence_band,
+                        visible_count=len(visible_messages),
+                        visible_authors=visible_authors,
+                    ),
                     rationale="Adopter reinforces the claim through a direct tie.",
                 )
             return AgentAction(
                 author_id=agent_id,
                 action_type="post_public",
-                content="More people in my network are echoing this. It feels increasingly credible locally.",
+                content=self._compose_agent_statement(
+                    payload,
+                    state,
+                    tick,
+                    latest_neighbor_name=latest_neighbor_name,
+                    latest_neighbor_role=latest_neighbor_role,
+                    weighted_bias=latest_neighbor_weight,
+                    visible_text=visible_text,
+                    confidence_band=confidence_band,
+                    visible_count=len(visible_messages),
+                    visible_authors=visible_authors,
+                ),
                 rationale="Adopter escalates from private signal to public propagation.",
             )
 
         if state == "rejected":
             if latest_author and latest_author in connections:
-                if signal == "cognitive_overload":
-                    content = "This still sounds too compressed and overstated for me to trust. What is the actual source?"
-                else:
-                    content = "I’m not convinced. This reads more like pressure than evidence."
+                content = self._compose_agent_statement(
+                    payload,
+                    state,
+                    tick,
+                    latest_neighbor_name=latest_neighbor_name,
+                    latest_neighbor_role=latest_neighbor_role,
+                    weighted_bias=latest_neighbor_weight,
+                    visible_text=visible_text,
+                    confidence_band=confidence_band,
+                    visible_count=len(visible_messages),
+                    visible_authors=visible_authors,
+                )
                 return AgentAction(
                     author_id=agent_id,
                     action_type="talk_to_agent",
@@ -295,15 +624,33 @@ class _HeuristicLangGraphDecisionEngine:
             return AgentAction(
                 author_id=agent_id,
                 action_type="post_public",
-                content="The claim is circulating, but the details still do not hold together for me.",
+                content=self._compose_agent_statement(
+                    payload,
+                    state,
+                    tick,
+                    latest_neighbor_name=None,
+                    latest_neighbor_role=None,
+                    weighted_bias=0.42,
+                    visible_text=visible_text,
+                    confidence_band=confidence_band,
+                    visible_count=len(visible_messages),
+                    visible_authors=visible_authors,
+                ),
                 rationale="Rejector issues a public corrective posture.",
             )
 
         if latest_author and latest_author in connections:
-            question = (
-                "I’m still undecided. Where did this start?"
-                if "source" not in visible_text
-                else "I’m not settled yet. Why are people around you buying this?"
+            question = self._compose_agent_statement(
+                payload,
+                state,
+                tick,
+                latest_neighbor_name=latest_neighbor_name,
+                latest_neighbor_role=latest_neighbor_role,
+                weighted_bias=latest_neighbor_weight,
+                visible_text=visible_text,
+                confidence_band=confidence_band,
+                visible_count=len(visible_messages),
+                visible_authors=visible_authors,
             )
             return AgentAction(
                 author_id=agent_id,
@@ -336,6 +683,12 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _seeded(i: int) -> float:
     x = math.sin(i * 9301 + 49297) * 233280
     return x - math.floor(x)
+
+
+def _upper_first(text: str) -> str:
+    if not text:
+        return text
+    return text[0].upper() + text[1:]
 
 
 def _extract_page_text(html_text: str) -> str:
@@ -383,7 +736,39 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
         raise RuntimeError(f"Source URL fetch failed: {exc}") from exc
 
 
+from app.population_store import fetch_population, save_population
+
 def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
+    existing_agents = fetch_population(city_id, count)
+    out: list[_Virt] = []
+
+    for item in existing_agents:
+        demo_dict = item["demographics"]
+        out.append(
+            _Virt(
+                id=item["id"],
+                name=item["name"],
+                role=item["role"],
+                lat=item["lat"],
+                lng=item["lng"],
+                demographics=_Demographics(
+                    age_band=demo_dict["age_band"],
+                    age_years=demo_dict["age_years"],
+                    education_level=demo_dict["education_level"],
+                    income_band=demo_dict["income_band"],
+                    housing_status=demo_dict["housing_status"],
+                    language_profile=demo_dict["language_profile"],
+                    community_tenure=demo_dict["community_tenure"],
+                    caregiving_load=demo_dict["caregiving_load"],
+                    digital_media_habit=demo_dict["digital_media_habit"],
+                ),
+            )
+        )
+
+    if len(out) >= count:
+        return out
+
+    # Generate missing agents
     city = get_city(city_id)
     zones = list(city.land_zones)
     zone_areas = [
@@ -397,8 +782,10 @@ def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
         running += area / total_area
         cumulative.append(running)
 
-    out: list[_Virt] = []
-    for i in range(count):
+    new_agents_data = []
+    start_id = len(out)
+
+    for i in range(start_id, count):
         zone_pick = _seeded(i + 8500)
         zone_idx = next((idx for idx, bound in enumerate(cumulative) if zone_pick <= bound), 0)
         zone = zones[max(0, zone_idx)]
@@ -406,16 +793,167 @@ def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
         r2 = _seeded(i + 1001)
         lng_inset = (zone.lng_max - zone.lng_min) * 0.08
         lat_inset = (zone.lat_max - zone.lat_min) * 0.08
-        out.append(
-            _Virt(
-                id=i,
-                name=f"{FIRST[i % len(FIRST)]} {LAST[(i * 3) % len(LAST)]}",
-                role=ROLES[i % len(ROLES)],
-                lng=zone.lng_min + lng_inset + r1 * max(0.0001, zone.lng_max - zone.lng_min - lng_inset * 2),
-                lat=zone.lat_min + lat_inset + r2 * max(0.0001, zone.lat_max - zone.lat_min - lat_inset * 2),
-            )
+        role = ROLES[i % len(ROLES)]
+        lat = zone.lat_min + lat_inset + r2 * max(0.0001, zone.lat_max - zone.lat_min - lat_inset * 2)
+        lng = zone.lng_min + lng_inset + r1 * max(0.0001, zone.lng_max - zone.lng_min - lng_inset * 2)
+        name = f"{FIRST[i % len(FIRST)]} {LAST[(i * 3) % len(LAST)]}"
+        
+        demographics = _generate_demographics(
+            agent_id=i,
+            role=role,
+            lat=lat,
+            lng=lng,
+            city_id=city_id,
         )
+
+        virt = _Virt(
+            id=i,
+            name=name,
+            role=role,
+            lat=lat,
+            lng=lng,
+            demographics=demographics,
+        )
+        out.append(virt)
+
+        new_agents_data.append({
+            "id": virt.id,
+            "name": virt.name,
+            "role": virt.role,
+            "lat": virt.lat,
+            "lng": virt.lng,
+            "demographics": {
+                "age_band": demographics.age_band,
+                "age_years": demographics.age_years,
+                "education_level": demographics.education_level,
+                "income_band": demographics.income_band,
+                "housing_status": demographics.housing_status,
+                "language_profile": demographics.language_profile,
+                "community_tenure": demographics.community_tenure,
+                "caregiving_load": demographics.caregiving_load,
+                "digital_media_habit": demographics.digital_media_habit,
+            }
+        })
+
+    if new_agents_data:
+        save_population(city_id, new_agents_data)
+
     return out
+
+def _weighted_pick(seed: float, options: list[tuple[str, float]]) -> str:
+    total = max(0.0001, sum(weight for _, weight in options))
+    cursor = 0.0
+    for label, weight in options:
+        cursor += weight / total
+        if seed <= cursor:
+            return label
+    return options[-1][0]
+
+
+def _age_band_for_role(role: str, agent_id: int) -> tuple[str, int]:
+    lowered = role.lower()
+    seed = _seeded(agent_id * 19 + 7)
+    if any(token in lowered for token in ("policy", "analyst", "research", "operations")):
+        band = _weighted_pick(seed, [("25-34", 0.28), ("35-44", 0.34), ("45-54", 0.24), ("55-64", 0.14)])
+    elif any(token in lowered for token in ("educator", "health", "journal", "responder")):
+        band = _weighted_pick(seed, [("25-34", 0.22), ("35-44", 0.31), ("45-54", 0.29), ("55-64", 0.18)])
+    else:
+        band = _weighted_pick(seed, [("18-24", 0.14), ("25-34", 0.3), ("35-44", 0.24), ("45-54", 0.18), ("55-64", 0.1), ("65+", 0.04)])
+    ranges = {
+        "18-24": (18, 24),
+        "25-34": (25, 34),
+        "35-44": (35, 44),
+        "45-54": (45, 54),
+        "55-64": (55, 64),
+        "65+": (65, 74),
+    }
+    lo, hi = ranges[band]
+    age_years = lo + int(_seeded(agent_id * 23 + 13) * (hi - lo + 1))
+    return band, age_years
+
+
+def _generate_demographics(*, agent_id: int, role: str, lat: float, lng: float, city_id: str) -> _Demographics:
+    city = get_city(city_id)
+    lat_span = max(0.001, max(zone.lat_max for zone in city.land_zones) - min(zone.lat_min for zone in city.land_zones))
+    lng_span = max(0.001, max(zone.lng_max for zone in city.land_zones) - min(zone.lng_min for zone in city.land_zones))
+    northness = _clamp((lat - min(zone.lat_min for zone in city.land_zones)) / lat_span)
+    eastness = _clamp((lng - min(zone.lng_min for zone in city.land_zones)) / lng_span)
+    lowered = role.lower()
+    age_band, age_years = _age_band_for_role(role, agent_id)
+    education_seed = _seeded(agent_id * 31 + 3)
+    if any(token in lowered for token in ("analyst", "research", "engineer", "journal")):
+        education = _weighted_pick(education_seed, [("Bachelor's", 0.32), ("Master's", 0.42), ("Professional/Doctoral", 0.18), ("Associate", 0.08)])
+    elif any(token in lowered for token in ("policy", "educator", "health")):
+        education = _weighted_pick(education_seed, [("Bachelor's", 0.4), ("Master's", 0.26), ("Associate", 0.2), ("Professional/Doctoral", 0.08), ("Some college", 0.06)])
+    else:
+        education = _weighted_pick(education_seed, [("High school", 0.18), ("Some college", 0.24), ("Associate", 0.18), ("Bachelor's", 0.24), ("Master's", 0.12), ("Professional/Doctoral", 0.04)])
+
+    income_seed = _seeded(agent_id * 37 + 9)
+    role_income_bias = 0.12 if any(token in lowered for token in ("engineer", "policy", "research")) else 0.06 if any(token in lowered for token in ("health", "educator", "operations")) else -0.02
+    income_position = _clamp(0.18 + eastness * 0.22 + northness * 0.12 + role_income_bias + (income_seed - 0.5) * 0.22)
+    if income_position >= 0.72:
+        income_band = "Upper middle income"
+    elif income_position >= 0.52:
+        income_band = "Middle income"
+    elif income_position >= 0.34:
+        income_band = "Lower middle income"
+    else:
+        income_band = "Economically strained"
+
+    housing_seed = _seeded(agent_id * 41 + 5)
+    if income_band == "Economically strained":
+        housing_status = _weighted_pick(housing_seed, [("Stable renter", 0.48), ("Multigenerational household", 0.28), ("Housing insecure", 0.24)])
+    elif income_band == "Upper middle income":
+        housing_status = _weighted_pick(housing_seed, [("Homeowner", 0.54), ("Stable renter", 0.3), ("Multigenerational household", 0.16)])
+    else:
+        housing_status = _weighted_pick(housing_seed, [("Stable renter", 0.42), ("Homeowner", 0.34), ("Multigenerational household", 0.18), ("Housing insecure", 0.06)])
+
+    language_profile = _weighted_pick(
+        _seeded(agent_id * 43 + 17),
+        [
+            ("English-dominant", 0.46),
+            ("Bilingual English-Spanish", 0.34),
+            ("English plus household language", 0.14),
+            ("Multilingual household", 0.06),
+        ],
+    )
+    community_tenure = _weighted_pick(
+        _seeded(agent_id * 47 + 21),
+        [
+            ("Recent arrival", 0.14),
+            ("Established resident", 0.36),
+            ("Long-term resident", 0.34),
+            ("Deeply rooted local", 0.16),
+        ],
+    )
+    caregiving_load = _weighted_pick(
+        _seeded(agent_id * 53 + 27),
+        [
+            ("Low caregiving load", 0.42),
+            ("Shared caregiving", 0.38),
+            ("Primary caregiver", 0.2),
+        ],
+    )
+    digital_media_habit = _weighted_pick(
+        _seeded(agent_id * 59 + 31),
+        [
+            ("Local-news heavy", 0.26),
+            ("Group-chat heavy", 0.24),
+            ("Public-feed heavy", 0.24),
+            ("Mixed verification habit", 0.26),
+        ],
+    )
+    return _Demographics(
+        age_band=age_band,
+        age_years=age_years,
+        education_level=education,
+        income_band=income_band,
+        housing_status=housing_status,
+        language_profile=language_profile,
+        community_tenure=community_tenure,
+        caregiving_load=caregiving_load,
+        digital_media_habit=digital_media_habit,
+    )
 
 
 def _keyword_density(text: str, words: tuple[str, ...]) -> float:
@@ -573,11 +1111,76 @@ def _model_fidelity_factor(source_excerpt: str | None) -> tuple[float, list[str]
     return _clamp(fidelity, 0.25, 0.9), notes
 
 
+def _demographic_conditioning_vector(demographics: _Demographics) -> dict[str, float]:
+    education_support = {
+        "High school": 0.12,
+        "Some college": 0.24,
+        "Associate": 0.34,
+        "Bachelor's": 0.48,
+        "Master's": 0.6,
+        "Professional/Doctoral": 0.7,
+    }.get(demographics.education_level, 0.3)
+    economic_strain = {
+        "Upper middle income": 0.12,
+        "Middle income": 0.26,
+        "Lower middle income": 0.48,
+        "Economically strained": 0.72,
+    }.get(demographics.income_band, 0.4)
+    housing_flux = {
+        "Homeowner": 0.12,
+        "Stable renter": 0.28,
+        "Multigenerational household": 0.34,
+        "Housing insecure": 0.7,
+    }.get(demographics.housing_status, 0.3)
+    language_bridge = {
+        "English-dominant": 0.1,
+        "Bilingual English-Spanish": 0.44,
+        "English plus household language": 0.3,
+        "Multilingual household": 0.56,
+    }.get(demographics.language_profile, 0.2)
+    community_embeddedness = {
+        "Recent arrival": 0.14,
+        "Established resident": 0.42,
+        "Long-term resident": 0.66,
+        "Deeply rooted local": 0.84,
+    }.get(demographics.community_tenure, 0.4)
+    caregiving_pressure = {
+        "Low caregiving load": 0.12,
+        "Shared caregiving": 0.36,
+        "Primary caregiver": 0.68,
+    }.get(demographics.caregiving_load, 0.2)
+    media_velocity = {
+        "Local-news heavy": 0.2,
+        "Group-chat heavy": 0.58,
+        "Public-feed heavy": 0.66,
+        "Mixed verification habit": 0.32,
+    }.get(demographics.digital_media_habit, 0.3)
+    age_index = {
+        "18-24": 0.32,
+        "25-34": 0.46,
+        "35-44": 0.56,
+        "45-54": 0.62,
+        "55-64": 0.66,
+        "65+": 0.6,
+    }.get(demographics.age_band, 0.5)
+    return {
+        "education_support": education_support,
+        "economic_strain": economic_strain,
+        "housing_flux": housing_flux,
+        "language_bridge": language_bridge,
+        "community_embeddedness": community_embeddedness,
+        "caregiving_pressure": caregiving_pressure,
+        "media_velocity": media_velocity,
+        "age_index": age_index,
+    }
+
+
 def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
     role = agent.role.lower()
     city = get_city(city_id)
     northness = _clamp((agent.lat - min(zone.lat_min for zone in city.land_zones)) / max(0.001, max(zone.lat_max for zone in city.land_zones) - min(zone.lat_min for zone in city.land_zones)))
     eastness = _clamp((agent.lng - min(zone.lng_min for zone in city.land_zones)) / max(0.001, max(zone.lng_max for zone in city.land_zones) - min(zone.lng_min for zone in city.land_zones)))
+    demographics = _demographic_conditioning_vector(agent.demographics)
 
     analytical = 1.0 if any(token in role for token in ("analyst", "engineer", "research")) else 0.0
     service = 1.0 if any(token in role for token in ("health", "educator", "responder")) else 0.0
@@ -587,9 +1190,32 @@ def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
         "analytical": analytical,
         "service": service,
         "civic": civic,
-        "peripheral_pressure": abs(0.5 - northness) * 0.35 + abs(0.5 - eastness) * 0.35,
-        "institutional_trust": _clamp(0.42 + service * 0.16 + civic * 0.08 - analytical * 0.04),
-        "identity_salience": _clamp(0.34 + civic * 0.18 + analytical * 0.07),
+        "peripheral_pressure": _clamp(abs(0.5 - northness) * 0.32 + abs(0.5 - eastness) * 0.32 + demographics["housing_flux"] * 0.08),
+        "institutional_trust": _clamp(
+            0.38
+            + service * 0.14
+            + civic * 0.08
+            - analytical * 0.03
+            + demographics["community_embeddedness"] * 0.12
+            + demographics["education_support"] * 0.06
+            - demographics["economic_strain"] * 0.11
+            - demographics["media_velocity"] * 0.04
+        ),
+        "identity_salience": _clamp(
+            0.28
+            + civic * 0.18
+            + analytical * 0.05
+            + demographics["community_embeddedness"] * 0.18
+            + demographics["caregiving_pressure"] * 0.08
+        ),
+        "education_support": demographics["education_support"],
+        "economic_strain": demographics["economic_strain"],
+        "housing_flux": demographics["housing_flux"],
+        "language_bridge": demographics["language_bridge"],
+        "community_embeddedness": demographics["community_embeddedness"],
+        "caregiving_pressure": demographics["caregiving_pressure"],
+        "media_velocity": demographics["media_velocity"],
+        "age_index": demographics["age_index"],
     }
 
 
@@ -597,12 +1223,48 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
     cond = _agent_conditioning(agent, city_id)
     seeded_shift = lambda offset: (_seeded(agent.id * 29 + offset) - 0.5) * 0.12
     return _Traits(
-        evidence_literacy=_clamp(0.48 + cond["analytical"] * 0.22 + cond["service"] * 0.08 + seeded_shift(7)),
-        peer_susceptibility=_clamp(0.42 + cond["civic"] * 0.16 + cond["peripheral_pressure"] * 0.18 + seeded_shift(11)),
-        identity_sensitivity=_clamp(0.36 + cond["identity_salience"] * 0.34 + seeded_shift(13)),
+        evidence_literacy=_clamp(
+            0.34
+            + cond["analytical"] * 0.18
+            + cond["service"] * 0.07
+            + cond["education_support"] * 0.34
+            + (0.06 if agent.demographics.digital_media_habit == "Local-news heavy" else 0.03 if agent.demographics.digital_media_habit == "Mixed verification habit" else -0.02)
+            + seeded_shift(7)
+        ),
+        peer_susceptibility=_clamp(
+            0.28
+            + cond["civic"] * 0.12
+            + cond["peripheral_pressure"] * 0.14
+            + cond["language_bridge"] * 0.18
+            + cond["media_velocity"] * 0.22
+            + seeded_shift(11)
+        ),
+        identity_sensitivity=_clamp(
+            0.28
+            + cond["identity_salience"] * 0.26
+            + cond["community_embeddedness"] * 0.18
+            + cond["caregiving_pressure"] * 0.08
+            + seeded_shift(13)
+        ),
         institutional_trust=_clamp(cond["institutional_trust"] + seeded_shift(17)),
-        analytic_scrutiny=_clamp(0.44 + cond["analytical"] * 0.28 + seeded_shift(19)),
-        baseline_openness=_clamp(0.46 + cond["service"] * 0.08 + cond["civic"] * 0.04 - cond["peripheral_pressure"] * 0.06 + seeded_shift(23)),
+        analytic_scrutiny=_clamp(
+            0.28
+            + cond["analytical"] * 0.26
+            + cond["education_support"] * 0.24
+            + cond["age_index"] * 0.08
+            + (0.05 if agent.demographics.digital_media_habit == "Local-news heavy" else -0.03 if agent.demographics.digital_media_habit == "Public-feed heavy" else 0.0)
+            + seeded_shift(19)
+        ),
+        baseline_openness=_clamp(
+            0.4
+            + cond["service"] * 0.07
+            + cond["civic"] * 0.04
+            + cond["language_bridge"] * 0.08
+            + cond["community_embeddedness"] * 0.05
+            - cond["economic_strain"] * 0.07
+            - cond["peripheral_pressure"] * 0.05
+            + seeded_shift(23)
+        ),
     )
 
 
@@ -633,13 +1295,18 @@ def _apply_lfcm_calibration(
         case_features["complexity"] * 0.22
         + cond["analytical"] * 0.06
         + cond["peripheral_pressure"] * 0.04
+        + cond["economic_strain"] * 0.05
+        + cond["caregiving_pressure"] * 0.04
         - cond["institutional_trust"] * 0.03
+        - cond["education_support"] * 0.04
         + (_seeded(agent.id * 17 + 11) - 0.5) * 0.04
     )
     emotional_delta = (
         case_features["threat"] * 0.16
         + case_features["identity"] * 0.08
         + cond["identity_salience"] * 0.06
+        + cond["economic_strain"] * 0.04
+        + cond["community_embeddedness"] * 0.03
         - case_features["prosocial"] * 0.05
         + (_seeded(agent.id * 17 + 23) - 0.5) * 0.05
     )
@@ -648,12 +1315,17 @@ def _apply_lfcm_calibration(
         + case_features["institutional"] * (0.09 - cond["institutional_trust"] * 0.06)
         + case_features["identity"] * cond["identity_salience"] * 0.10
         + complexity * 0.04
+        + cond["media_velocity"] * 0.04
+        + cond["housing_flux"] * 0.03
         + (_seeded(agent.id * 17 + 37) - 0.5) * 0.05
     )
     memory_delta = (
         case_features["complexity"] * 0.15
         + cond["analytical"] * 0.03
+        + cond["caregiving_pressure"] * 0.05
+        + cond["age_index"] * 0.03
         - case_features["prosocial"] * 0.04
+        - cond["education_support"] * 0.03
         + (_seeded(agent.id * 17 + 51) - 0.5) * 0.04
     )
 
@@ -870,6 +1542,140 @@ def _signal_summary(signal: SignalType, state: str, regions: dict[str, float]) -
     return f"Empathic and reflective regions stay balanced, leaving the agent relatively open and ending at {state}."
 
 
+def _interpret_composite(metric_id: str, value: float) -> str:
+    if metric_id == "arousal":
+        return "Highly activated" if value >= 0.9 else "Moderately activated" if value >= 0.55 else "Relatively calm"
+    if metric_id == "valence":
+        return "Negatively valenced" if value <= -0.2 else "Positively valenced" if value >= 0.2 else "Mixed affect"
+    if metric_id == "dominance":
+        return "Emotion outweighs control" if value <= -0.2 else "Rational control is present" if value >= 0.2 else "Balanced control"
+    if metric_id == "approach_avoid":
+        return "Avoidance-oriented" if value <= -0.2 else "Approach-oriented" if value >= 0.2 else "No strong directional pull"
+    if metric_id == "regulation":
+        return "Poor emotional regulation" if value <= -0.15 else "Good emotional regulation" if value >= 0.15 else "Regulation is limited"
+    if metric_id == "herding":
+        return "Highly socially influenced" if value >= 0.75 else "Moderately socially influenced" if value >= 0.45 else "Relatively independent"
+    if metric_id == "confidence":
+        return "Strong neural read" if value >= 1.2 else "Moderate neural read" if value >= 0.7 else "Uncertain neural read"
+    if metric_id == "reactivity":
+        return "Thinking precedes emotion" if value <= -1 else "Emotion precedes thinking" if value >= 1 else "Thought and emotion rise together"
+    return "Context-dependent"
+
+
+def _augment_tribe_meta(tribe_meta: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(tribe_meta, dict) or not tribe_meta:
+        return {}
+
+    roi_stats = tribe_meta.get("roi_stats") if isinstance(tribe_meta.get("roi_stats"), dict) else {}
+    connectivity = tribe_meta.get("connectivity") if isinstance(tribe_meta.get("connectivity"), dict) else {}
+    composites = tribe_meta.get("composites") if isinstance(tribe_meta.get("composites"), dict) else {}
+
+    roi_ranked = sorted(
+        (
+            {
+                "id": roi_id,
+                "label": ROI_DISPLAY_LABELS.get(roi_id, roi_id.replace("_", " ").title()),
+                "peak": round(float(stats.get("peak", 0.0)), 3),
+                "auc": round(float(stats.get("auc", 0.0)), 3),
+                "trajectory": str(stats.get("trajectory") or "unknown"),
+                "onset_seconds": round(float(stats.get("onset_tr", 0.0)) * 2.0, 1),
+                "sustained": bool(stats.get("sustained", False)),
+            }
+            for roi_id, stats in roi_stats.items()
+            if isinstance(stats, dict)
+        ),
+        key=lambda item: item["peak"] * (1.0 + item["auc"]) ** 0.5,
+        reverse=True,
+    )
+    weakest_ranked = list(reversed(roi_ranked))
+
+    processing_sequence = sorted(
+        (
+            {
+                "id": roi_id,
+                "label": ROI_DISPLAY_LABELS.get(roi_id, roi_id.replace("_", " ").title()),
+                "onset_seconds": round(float(stats.get("onset_tr", 0.0)) * 2.0, 1),
+            }
+            for roi_id, stats in roi_stats.items()
+            if isinstance(stats, dict)
+        ),
+        key=lambda item: item["onset_seconds"],
+    )
+
+    strongest_link = None
+    if connectivity:
+        ranked_links = sorted(
+            (
+                {
+                    "id": pair_id,
+                    "label": CONNECTIVITY_DISPLAY_LABELS.get(pair_id, pair_id.replace("_", " ").title()),
+                    "r": round(float(values.get("r", 0.0)), 3),
+                    "p": round(float(values.get("p", 1.0)), 4),
+                }
+                for pair_id, values in connectivity.items()
+                if isinstance(values, dict)
+            ),
+            key=lambda item: abs(item["r"]),
+            reverse=True,
+        )
+        strongest_link = ranked_links[0] if ranked_links else None
+
+    composite_order = [
+        ("arousal", "Arousal"),
+        ("valence", "Valence"),
+        ("dominance", "Dominance"),
+        ("approach_avoid", "Approach / avoid"),
+        ("regulation", "Regulation"),
+        ("herding", "Herding"),
+        ("reactivity", "Reactivity"),
+        ("confidence", "Read confidence"),
+    ]
+    composite_highlights = [
+        {
+            "id": comp_id,
+            "label": label,
+            "value": round(float(composites.get(comp_id, 0.0)), 3),
+            "interpretation": _interpret_composite(comp_id, float(composites.get(comp_id, 0.0))),
+        }
+        for comp_id, label in composite_order
+        if comp_id in composites
+    ]
+
+    narrative_flags: list[str] = []
+    if float(composites.get("arousal", 0.0)) >= 0.85:
+        narrative_flags.append("The stimulus is strongly activating, so agents start closer to vigilance than calm.")
+    if float(composites.get("herding", 0.0)) >= 0.6:
+        narrative_flags.append("Social default activity is elevated, so messenger fit and local repetition should matter more.")
+    if float(composites.get("regulation", 0.0)) <= -0.1:
+        narrative_flags.append("Regulation is weak, so contradictions are more likely to collapse into rejection than careful evaluation.")
+    if float(composites.get("approach_avoid", 0.0)) <= -0.2:
+        narrative_flags.append("The global stance tilts toward avoidance, which makes spread harder unless peer lift is unusually strong.")
+    if float(composites.get("reactivity", 0.0)) <= -1.0:
+        narrative_flags.append("Analytical processing activates before emotion, which favors verification over impulsive uptake.")
+
+    surface_summary = {
+        "dominant_response": roi_ranked[0] if roi_ranked else None,
+        "weakest_response": weakest_ranked[0] if weakest_ranked else None,
+        "processing_sequence": processing_sequence[:6],
+        "strongest_link": strongest_link,
+        "composite_highlights": composite_highlights,
+        "narrative_flags": narrative_flags[:4],
+    }
+
+    enriched = dict(tribe_meta)
+    enriched["surface_summary"] = surface_summary
+    enriched["segments_preview"] = roi_ranked[:4]
+    enriched["segment_count"] = len(roi_ranked)
+    per_agent = tribe_meta.get("per_agent")
+    if isinstance(per_agent, dict) and per_agent:
+        enriched["per_agent_count"] = len(per_agent)
+        enriched["tribe_personalization_note"] = (
+            "surface_summary uses the shared stimulus baseline; per_agent.composites "
+            "are demographics-conditioned and drive per-agent BSV and herding/approach/regulation/reactivity biases."
+        )
+    return enriched
+
+
 def _role_cohort(role: str) -> str:
     lowered = role.lower()
     if any(token in lowered for token in ("analyst", "engineer", "research")):
@@ -885,10 +1691,55 @@ def _distance_sq(a: _Virt, b: _Virt) -> float:
     return (a.lat - b.lat) ** 2 + (a.lng - b.lng) ** 2
 
 
+def _role_social_style(role: str) -> str:
+    lowered = role.lower()
+    if any(token in lowered for token in ("analyst", "engineer", "research")):
+        return "analytical"
+    if any(token in lowered for token in ("educator", "healthcare", "first responder")):
+        return "public_service"
+    if any(token in lowered for token in ("organizer", "policy", "journalist")):
+        return "civic"
+    if any(token in lowered for token in ("small business", "operations")):
+        return "pragmatic"
+    return "general"
+
+
+def _role_compatibility(a_role: str, b_role: str) -> float:
+    a_style = _role_social_style(a_role)
+    b_style = _role_social_style(b_role)
+    if a_style == b_style:
+        return 0.92
+    paired_styles = {a_style, b_style}
+    if paired_styles in (
+        {"civic", "public_service"},
+        {"civic", "pragmatic"},
+        {"analytical", "public_service"},
+        {"analytical", "civic"},
+    ):
+        return 0.74
+    if paired_styles in (
+        {"general", "civic"},
+        {"general", "public_service"},
+        {"general", "pragmatic"},
+        {"general", "analytical"},
+    ):
+        return 0.66
+    return 0.54
+
+
+def _network_edge_weight(a: _Virt, b: _Virt) -> tuple[float, float]:
+    distance = math.sqrt(_distance_sq(a, b))
+    distance_score = _clamp(1.0 - distance / 0.115, 0.25, 1.0)
+    compatibility = _role_compatibility(a.role, b.role)
+    shared_cohort_bonus = 0.06 if _role_cohort(a.role) == _role_cohort(b.role) else 0.0
+    weight = _clamp(distance_score * 0.58 + compatibility * 0.36 + shared_cohort_bonus, 0.25, 0.98)
+    return weight, compatibility
+
+
 def _build_network_edges(population: list[_Virt], degree: int = 4) -> list[_NetworkEdge]:
     """Construct a sparse undirected adjacency list from local geographic proximity."""
 
-    edges: set[tuple[int, int]] = set()
+    edges: dict[tuple[int, int], tuple[float, float]] = {}
     for agent in population:
         nearest = sorted(
             (other for other in population if other.id != agent.id),
@@ -896,8 +1747,14 @@ def _build_network_edges(population: list[_Virt], degree: int = 4) -> list[_Netw
         )[:degree]
         for other in nearest:
             a, b = sorted((agent.id, other.id))
-            edges.add((a, b))
-    return [_NetworkEdge(source_id=a, target_id=b) for a, b in sorted(edges)]
+            weight, compatibility = _network_edge_weight(agent, other)
+            prior = edges.get((a, b))
+            if prior is None or weight > prior[0]:
+                edges[(a, b)] = (weight, compatibility)
+    return [
+        _NetworkEdge(source_id=a, target_id=b, weight=weight, compatibility=compatibility)
+        for (a, b), (weight, compatibility) in sorted(edges.items())
+    ]
 
 
 def _intervention_hint(signal: SignalType) -> str:
@@ -915,12 +1772,118 @@ def _state_from_score(score: float, claim_credibility: float) -> str:
     return "neutral"
 
 
+def _state_from_context(
+    *,
+    score: float,
+    claim_credibility: float,
+    traits: _Traits | dict[str, Any] | None = None,
+    signal: SignalType | str | None = None,
+    supportive_context: float = 0.0,
+    messenger_alignment: float = 0.0,
+) -> str:
+    adopt_threshold = 0.72 if claim_credibility < 0.18 else 0.66 if claim_credibility < 0.3 else 0.61
+    reject_threshold = 0.31 if claim_credibility < 0.18 else 0.34 if claim_credibility < 0.3 else 0.43
+
+    if traits is not None:
+        if isinstance(traits, _Traits):
+            evidence_literacy = float(traits.evidence_literacy)
+            peer_susceptibility = float(traits.peer_susceptibility)
+            institutional_trust = float(traits.institutional_trust)
+            analytic_scrutiny = float(traits.analytic_scrutiny)
+            baseline_openness = float(traits.baseline_openness)
+        else:
+            evidence_literacy = float(traits.get("evidence_literacy", 0.5))
+            peer_susceptibility = float(traits.get("peer_susceptibility", 0.5))
+            institutional_trust = float(traits.get("institutional_trust", 0.5))
+            analytic_scrutiny = float(traits.get("analytic_scrutiny", 0.5))
+            baseline_openness = float(traits.get("baseline_openness", 0.5))
+
+        adopt_threshold += analytic_scrutiny * 0.045 + evidence_literacy * 0.03
+        adopt_threshold -= peer_susceptibility * 0.04 + baseline_openness * 0.05
+        adopt_threshold -= (1.0 - institutional_trust) * 0.018
+
+        reject_threshold += analytic_scrutiny * 0.02 + evidence_literacy * 0.018
+        reject_threshold -= peer_susceptibility * 0.028 + baseline_openness * 0.035
+        reject_threshold -= (1.0 - institutional_trust) * 0.018
+
+    supportive_lift = supportive_context * 0.05 + messenger_alignment * 0.06
+    adopt_threshold -= supportive_lift
+    reject_threshold -= supportive_lift * 0.82
+
+    if signal == "social_proof":
+        adopt_threshold -= 0.022 + messenger_alignment * 0.01
+        reject_threshold -= 0.016
+    elif signal == "empathic_resonance":
+        adopt_threshold -= 0.014
+        reject_threshold -= 0.01
+    elif signal == "memory_alignment":
+        adopt_threshold -= 0.01
+    elif signal == "cognitive_overload":
+        adopt_threshold += 0.014
+        reject_threshold += 0.006
+    elif signal == "defensive_reactance":
+        adopt_threshold += 0.02
+        reject_threshold += 0.008
+
+    adopt_threshold = _clamp(adopt_threshold, 0.48, 0.82)
+    reject_threshold = _clamp(reject_threshold, 0.18, adopt_threshold - 0.08)
+
+    if score >= adopt_threshold:
+        return "adopted"
+    if score <= reject_threshold:
+        return "rejected"
+    return "neutral"
+
+
 def _sentiment_for_state(state: str) -> str:
     if state == "adopted":
         return "positive"
     if state == "rejected":
         return "negative"
     return "neutral"
+
+
+def _round_phase_label(round_number: int, action_type: str | None, target_agent_id: int | None) -> str:
+    mode = "direct exchange" if action_type == "talk_to_agent" and target_agent_id is not None else "public circulation"
+    stage = "first read" if round_number == 1 else "network update" if round_number == 2 else "settled position"
+    return f"{stage} · {mode}"
+
+
+def _round_trigger_label(
+    *,
+    authored_post: dict[str, Any] | None,
+    weighted_support: float,
+    weighted_pushback: float,
+    total_visible: int,
+) -> str:
+    if authored_post and authored_post.get("target_agent_id") is not None:
+        return f"direct tie · push {weighted_pushback:.2f} · support {weighted_support:.2f}"
+    if total_visible == 0:
+        return "no local signal"
+    if weighted_support > weighted_pushback:
+        return f"support-led circulation · {weighted_support:.2f}"
+    if weighted_pushback > weighted_support:
+        return f"pushback-led circulation · {weighted_pushback:.2f}"
+    return f"mixed neighborhood signal · {total_visible} visible"
+
+
+def _change_summary(
+    *,
+    state: str,
+    score: float,
+    previous_score: float,
+    supportive_ratio: float,
+    skeptical_ratio: float,
+    messenger_alignment: float,
+) -> str:
+    delta = score - previous_score
+    movement = "flat" if abs(delta) < 0.015 else "up" if delta > 0 else "down"
+    dominant = "support" if supportive_ratio > skeptical_ratio else "pushback" if skeptical_ratio > supportive_ratio else "balance"
+    return (
+        f"score {previous_score:.2f} → {score:.2f}; movement {movement}; "
+        f"support {supportive_ratio:.2f}; pushback {skeptical_ratio:.2f}; fit {messenger_alignment:.2f}; "
+        f"state {state}; dominant pressure {dominant}."
+    )
 
 
 def _round_post_text(
@@ -1106,6 +2069,7 @@ def _build_swarm_dynamics_langgraph(
     analysis_text: str,
     population: list[_Virt],
     agents: list[dict[str, Any]],
+    claim_credibility: float,
 ) -> dict[str, Any]:
     """Run a real LangGraph propagation loop and convert it into the UI payload shape."""
 
@@ -1114,9 +2078,24 @@ def _build_swarm_dynamics_langgraph(
     network_edges = _build_network_edges(population)
 
     connections_by_id: dict[int, set[int]] = {agent.id: set() for agent in population}
+    connection_profiles_by_id: dict[int, dict[str, dict[str, Any]]] = {agent.id: {} for agent in population}
     for edge in network_edges:
         connections_by_id[edge.source_id].add(edge.target_id)
         connections_by_id[edge.target_id].add(edge.source_id)
+        source_role = population_by_id[edge.source_id].role
+        target_role = population_by_id[edge.target_id].role
+        connection_profiles_by_id[edge.source_id][str(edge.target_id)] = {
+            "weight": round(edge.weight, 3),
+            "compatibility": round(edge.compatibility, 3),
+            "role": target_role,
+            "cohort": _role_cohort(target_role),
+        }
+        connection_profiles_by_id[edge.target_id][str(edge.source_id)] = {
+            "weight": round(edge.weight, 3),
+            "compatibility": round(edge.compatibility, 3),
+            "role": source_role,
+            "cohort": _role_cohort(source_role),
+        }
 
     graph_agents: dict[str, dict[str, Any]] = {}
     for virt in population:
@@ -1130,8 +2109,39 @@ def _build_swarm_dynamics_langgraph(
             "belief_state": payload["belief_state"],
             "dominant_signal": payload["dominant_signal"],
             "confidence": payload["k2_decision_confidence"],
+            "traits": (payload.get("_pipeline") or {}).get("traits", {}),
+            "conditioning": (payload.get("_pipeline") or {}).get("conditioning", {}),
+            "demographics": payload.get("demographics", {}),
+            "baseline_score": float((payload.get("_pipeline") or {}).get("baseline_score", 0.5)),
+            "target_score": float((payload.get("_pipeline") or {}).get("final_score", 0.5)),
             "connections": [str(other_id) for other_id in sorted(connections_by_id[virt.id])],
+            "connection_profiles": connection_profiles_by_id[virt.id],
         }
+
+    sorted_by_degree = sorted(
+        graph_agents.keys(),
+        key=lambda aid: len(graph_agents[aid]["connections"]),
+        reverse=True
+    )
+    key_actor_ids = set(sorted_by_degree[:5])
+
+    base_engine = _HeuristicLangGraphDecisionEngine(agent_lookup=graph_agents)
+    
+    try:
+        import logging
+        llm_engine = make_chat_openai_decision_engine(
+            model=settings.ifm_k2_model,
+            api_key=settings.ifm_api_key or "mock",
+            base_url=settings.ifm_api_url,
+        )
+        engine = HybridLangGraphDecisionEngine(
+            base_engine=base_engine,
+            llm_engine=llm_engine,
+            key_actor_ids=key_actor_ids,
+        )
+    except Exception as e:
+        logger.warning("Failed to initialize LangChain LLM engine for Hybrid orchestration. Falling back to heuristic engine. %s", e)
+        engine = base_engine
 
     final_state = run_simulation_loop(
         {
@@ -1143,7 +2153,7 @@ def _build_swarm_dynamics_langgraph(
             "pending_actions": [],
             "scenario_initialized": False,
         },
-        _HeuristicLangGraphDecisionEngine(agent_lookup=graph_agents),
+        engine,
     )
 
     per_agent_history: dict[int, list[dict[str, Any]]] = {agent.id: [] for agent in population}
@@ -1159,15 +2169,6 @@ def _build_swarm_dynamics_langgraph(
         target_agent_id = message.additional_kwargs.get("target_agent_id")
         agent_payload = agent_payload_by_id[str(author)]
         author_id = int(str(author))
-
-        history_row = {
-            "round": tick,
-            "belief_state": agent_payload["belief_state"],
-            "confidence": agent_payload["k2_decision_confidence"],
-            "sentiment": _sentiment_for_state(agent_payload["belief_state"]),
-            "post": str(message.content),
-        }
-        per_agent_history[author_id].append(history_row)
 
         round_post = {
             "agent_id": author_id,
@@ -1193,33 +2194,194 @@ def _build_swarm_dynamics_langgraph(
         )
 
     rounds: list[dict[str, Any]] = []
+    prev_scores: dict[int, float] = {}
+    prev_states: dict[int, str] = {}
+    for agent in population:
+        payload = agent_payload_by_id[str(agent.id)]
+        pipeline = payload.get("_pipeline") or {}
+        baseline_score = float(pipeline.get("baseline_score", 0.5))
+        prev_scores[agent.id] = baseline_score
+        prev_states[agent.id] = _state_from_score(baseline_score, claim_credibility)
+
     for tick in range(1, final_state["max_ticks"] + 1):
         posts = rounds_by_tick.get(tick, [])
-        if not posts:
-            continue
-        adopted = sum(1 for item in posts if item["belief_state"] == "adopted")
-        rejected = sum(1 for item in posts if item["belief_state"] == "rejected")
-        neutral = sum(1 for item in posts if item["belief_state"] == "neutral")
+        next_scores: dict[int, float] = {}
+        next_states: dict[int, str] = {}
+        enriched_posts: list[dict[str, Any]] = []
+
+        for virt in population:
+            profile = graph_agents[str(virt.id)]
+            traits = profile.get("traits") or {}
+            peer_susceptibility = float(traits.get("peer_susceptibility", 0.5))
+            scrutiny = float(traits.get("analytic_scrutiny", 0.5))
+            openness = float(traits.get("baseline_openness", 0.5))
+            identity_sensitivity = float(traits.get("identity_sensitivity", 0.5))
+            baseline_score = float(profile.get("baseline_score", 0.5))
+            target_score = float(profile.get("target_score", baseline_score))
+            direct_neighbors = {int(other_id) for other_id in profile.get("connections", []) if str(other_id).isdigit()}
+            connection_profiles = profile.get("connection_profiles") or {}
+            visible = [
+                post
+                for post in posts
+                if post["agent_id"] in direct_neighbors
+                and (post["action_type"] == "post_public" or post["target_agent_id"] == virt.id)
+            ]
+
+            supportive_weight = 0.0
+            skeptical_weight = 0.0
+            neutral_weight = 0.0
+            direct_support = False
+            direct_pushback = False
+            strongest_neighbor_weight = 0.0
+            aligned_messenger_weight = 0.0
+            for post in visible:
+                neighbor_profile = connection_profiles.get(str(post["agent_id"])) or {}
+                tie_weight = _clamp(float(neighbor_profile.get("weight", 0.42)), 0.2, 1.0)
+                compatibility = _clamp(float(neighbor_profile.get("compatibility", 0.55)), 0.2, 1.0)
+                directed_bonus = 1.18 if post["target_agent_id"] == virt.id else 1.0
+                action_bonus = 1.08 if post["action_type"] == "talk_to_agent" else 1.0
+                influence = tie_weight * (0.72 + compatibility * 0.38) * directed_bonus * action_bonus
+                strongest_neighbor_weight = max(strongest_neighbor_weight, influence)
+                if compatibility >= 0.74:
+                    aligned_messenger_weight += influence
+                prior_state = prev_states.get(post["agent_id"])
+                if prior_state == "adopted":
+                    supportive_weight += influence
+                    if post["target_agent_id"] == virt.id:
+                        direct_support = True
+                elif prior_state == "rejected":
+                    skeptical_weight += influence
+                    if post["target_agent_id"] == virt.id:
+                        direct_pushback = True
+                else:
+                    neutral_weight += influence
+
+            total_visible = len(visible)
+            total_weight = max(0.001, supportive_weight + skeptical_weight + neutral_weight)
+            supportive_ratio = supportive_weight / total_weight
+            skeptical_ratio = skeptical_weight / total_weight
+            neutral_ratio = neutral_weight / total_weight
+            messenger_alignment = aligned_messenger_weight / total_weight
+
+            score = _clamp(
+                prev_scores[virt.id] * 0.39
+                + baseline_score * 0.14
+                + target_score * 0.22
+                + supportive_ratio * (0.085 + peer_susceptibility * 0.12 + messenger_alignment * 0.11)
+                - skeptical_ratio * (0.045 + scrutiny * 0.095 + messenger_alignment * 0.04)
+                - neutral_ratio * 0.018
+                + openness * 0.038
+                - identity_sensitivity * (0.022 if claim_credibility < 0.3 else 0.0)
+                + messenger_alignment * 0.028
+                + strongest_neighbor_weight * (0.018 if supportive_weight > skeptical_weight else -0.012)
+                + (0.04 + messenger_alignment * 0.04 if direct_support else 0.0)
+                - (0.028 + messenger_alignment * 0.028 if direct_pushback else 0.0)
+            )
+            state = _state_from_context(
+                score=score,
+                claim_credibility=claim_credibility,
+                traits=traits,
+                signal=agent_payload["dominant_signal"],
+                supportive_context=supportive_ratio,
+                messenger_alignment=messenger_alignment,
+            )
+            confidence = round(
+                _clamp(
+                    0.32
+                    + abs(score - 0.5) * 0.92
+                    + min(0.08, total_visible * 0.015)
+                    + strongest_neighbor_weight * 0.05
+                    + (0.03 if direct_support or direct_pushback else 0.0),
+                    0.2,
+                    0.92,
+                ),
+                3,
+            )
+
+            authored_post = next((post for post in posts if post["agent_id"] == virt.id), None)
+            agent_payload = agent_payload_by_id[str(virt.id)]
+            history_row = {
+                "round": tick,
+                "phase_label": _round_phase_label(
+                    tick,
+                    authored_post["action_type"] if authored_post else None,
+                    authored_post["target_agent_id"] if authored_post else None,
+                ),
+                "belief_state": state,
+                "confidence": confidence,
+                "confidence_delta": round(confidence - per_agent_history[virt.id][-1]["confidence"], 3)
+                if per_agent_history[virt.id]
+                else round(confidence - float(profile.get("confidence", 0.5)), 3),
+                "sentiment": _sentiment_for_state(state),
+                "post": authored_post["post"] if authored_post else "[no outward action]",
+                "trigger": _round_trigger_label(
+                    authored_post=authored_post,
+                    weighted_support=supportive_weight,
+                    weighted_pushback=skeptical_weight,
+                    total_visible=total_visible,
+                ),
+                "change_summary": _change_summary(
+                    state=state,
+                    score=score,
+                    previous_score=prev_scores[virt.id],
+                    supportive_ratio=supportive_ratio,
+                    skeptical_ratio=skeptical_ratio,
+                    messenger_alignment=messenger_alignment,
+                ),
+                # Shares (0–1) match the support/pushback numbers embedded in change_summary.
+                "supportive_pressure": round(supportive_ratio, 3),
+                "skeptical_pressure": round(skeptical_ratio, 3),
+                "support_influence": round(supportive_weight, 3),
+                "pushback_influence": round(skeptical_weight, 3),
+                "messenger_alignment": round(messenger_alignment, 3),
+            }
+            per_agent_history[virt.id].append(history_row)
+
+            if authored_post:
+                enriched_posts.append(
+                    {
+                        **authored_post,
+                        "belief_state": state,
+                        "confidence": confidence,
+                        "sentiment": _sentiment_for_state(state),
+                        "dominant_signal": agent_payload["dominant_signal"],
+                        "weighted_support": round(supportive_weight, 3),
+                        "weighted_pushback": round(skeptical_weight, 3),
+                    }
+                )
+
+            next_scores[virt.id] = score
+            next_states[virt.id] = state
+
+        adopted = sum(1 for state in next_states.values() if state == "adopted")
+        rejected = sum(1 for state in next_states.values() if state == "rejected")
+        neutral = len(next_states) - adopted - rejected
         dominant_signal = max(
             ("cognitive_overload", "defensive_reactance", "social_proof", "memory_alignment", "empathic_resonance"),
-            key=lambda sig: sum(1 for item in posts if item["dominant_signal"] == sig),
+            key=lambda sig: sum(
+                1
+                for agent_id, agent_state in next_states.items()
+                if agent_state in {"adopted", "rejected", "neutral"} and agent_payload_by_id[str(agent_id)]["dominant_signal"] == sig
+            ),
         )
         talk_count = sum(1 for item in posts if item["action_type"] == "talk_to_agent")
         public_count = sum(1 for item in posts if item["action_type"] == "post_public")
         rounds.append(
             {
                 "round": tick,
-                "adoption_rate": round(adopted / max(1, len(posts)) * 100),
-                "rejection_rate": round(rejected / max(1, len(posts)) * 100),
-                "neutral_rate": round(neutral / max(1, len(posts)) * 100),
+                "adoption_rate": round(adopted / max(1, len(population)) * 100),
+                "rejection_rate": round(rejected / max(1, len(population)) * 100),
+                "neutral_rate": round(neutral / max(1, len(population)) * 100),
                 "dominant_mechanism": dominant_signal,
                 "notable_shift": (
-                    f"Tick {tick} produced {talk_count} direct neighbor conversations and {public_count} public broadcasts "
-                    f"across the explicit LangGraph network."
+                    f"Tick {tick} produced {talk_count} direct neighbor conversations and {public_count} public broadcasts, "
+                    f"with tie-weighted messenger influence determining whether support or pushback carried more force."
                 ),
-                "posts": posts[:8],
+                "posts": enriched_posts[:8],
             }
         )
+        prev_scores = next_scores
+        prev_states = next_states
 
     edge_payload = [
         {
@@ -1229,6 +2391,8 @@ def _build_swarm_dynamics_langgraph(
             "source_lat": population_by_id[edge.source_id].lat,
             "target_lng": population_by_id[edge.target_id].lng,
             "target_lat": population_by_id[edge.target_id].lat,
+            "weight": round(edge.weight, 3),
+            "compatibility": round(edge.compatibility, 3),
         }
         for edge in network_edges
     ]
@@ -1239,9 +2403,9 @@ def _build_swarm_dynamics_langgraph(
         "event_log": event_log,
         "network_edges": edge_payload,
         "narrative_summary": (
-            "This propagation layer is now driven by a LangGraph loop. "
-            "Agents only react to messages authored by directly connected neighbors, "
-            "and the map can render those live network edges."
+            "This propagation layer is driven by a LangGraph loop with per-tick stance updates. "
+            "Agents react only to messages authored by directly connected neighbors, and those neighbors now carry "
+            "different influence weights based on tie strength, role compatibility, and whether the exchange is direct or ambient."
         ),
     }
 
@@ -1259,6 +2423,7 @@ async def _run_agent_reasoning(
     resonance: float,
     regions: dict[str, float],
     traits: _Traits,
+    conditioning: dict[str, float],
     baseline_score: float,
     final_score: float,
     local_adoption_ratio: float,
@@ -1268,35 +2433,64 @@ async def _run_agent_reasoning(
 ) -> dict[str, Any]:
     signal = _dominant_signal(bsv, regions, supportive_neighbors)
     claim_credibility = float(claim_diagnostics["credibility"])
-    predetermined_state = _state_from_score(final_score, claim_credibility)
+    predetermined_state = _state_from_context(
+        score=final_score,
+        claim_credibility=claim_credibility,
+        traits=traits,
+        signal=signal,
+        supportive_context=local_adoption_ratio,
+        messenger_alignment=max(0.0, resonance * 0.65),
+    )
+    role_lens = _role_reasoning_lens(agent.role)
+    primary_decision_anchor = _primary_decision_anchor(
+        traits=traits,
+        claim_diagnostics=claim_diagnostics,
+        score_breakdown=score_breakdown,
+    )
+    social_context_label = _social_context_label(
+        supportive_neighbors,
+        total_neighbors,
+        local_adoption_ratio,
+    )
 
-    async with semaphore:
-        raw = await call_k2_think(
-            httpx_client,
-            name=agent.name,
-            role=f"{agent.role} in {DOMAIN_CONTEXT.get(domain, domain)}",
-            bsv=bsv,
-            adopted_neighbor_count=supportive_neighbors,
-            total_neighbors_in_radius=total_neighbors,
-            catalyst_text=(
-                f"{analysis_text}\n"
-                f"Case goal: {case_goal}\n"
-                f"Context: target domain={DOMAIN_CONTEXT.get(domain, domain)}; "
-                f"dominant mechanism={_signal_label(signal)}; local resonance={resonance:.2f}; "
-                f"baseline uptake score={baseline_score:.2f}; final uptake score={final_score:.2f}; "
-                f"local adoption ratio={local_adoption_ratio:.2f}."
-            ),
-            claim_credibility=claim_credibility,
-            claim_risk=str(claim_diagnostics["risk_label"]),
-            computed_outcome=predetermined_state.title(),
-            adoption_score=final_score,
-            agent_traits=traits.__dict__,
-            score_breakdown=score_breakdown,
-        )
-
-    reasoning, _action, confidence, parsed_signal = _parse_k2_output(raw, signal)
     state = predetermined_state
-    confidence = _clamp((confidence * 0.46) + (abs(final_score - 0.5) * 2.0 * 0.24) + (claim_credibility * 0.06), 0.18, 0.78)
+    parsed_signal = signal
+    confidence = _clamp(0.42 + (abs(final_score - 0.5) * 0.54) + (claim_credibility * 0.08), 0.18, 0.78)
+    async with semaphore:
+        reasoning = await call_k2_explanation_only(
+            httpx_client,
+            agent_name=agent.name,
+            agent_role=agent.role,
+            role_lens=role_lens,
+            scenario=analysis_text,
+            case_goal=case_goal,
+            precomputed_outcome=state.title(),
+            dominant_signal=signal,
+            social_context_label=social_context_label,
+            primary_decision_anchor=primary_decision_anchor,
+            traits={
+                "evidence_literacy": round(float(traits.evidence_literacy), 3),
+                "peer_susceptibility": round(float(traits.peer_susceptibility), 3),
+                "identity_sensitivity": round(float(traits.identity_sensitivity), 3),
+                "institutional_trust": round(float(traits.institutional_trust), 3),
+                "analytic_scrutiny": round(float(traits.analytic_scrutiny), 3),
+                "baseline_openness": round(float(traits.baseline_openness), 3),
+                "demographic_summary": _demographic_profile_summary(agent.demographics),
+            },
+            demographics={
+                "age_band": agent.demographics.age_band,
+                "age_years": agent.demographics.age_years,
+                "education_level": agent.demographics.education_level,
+                "income_band": agent.demographics.income_band,
+                "housing_status": agent.demographics.housing_status,
+                "language_profile": agent.demographics.language_profile,
+                "community_tenure": agent.demographics.community_tenure,
+                "caregiving_load": agent.demographics.caregiving_load,
+                "digital_media_habit": agent.demographics.digital_media_habit,
+            },
+            bsv={key: round(float(value), 3) for key, value in bsv.items()},
+            score_breakdown={key: round(float(value), 3) for key, value in score_breakdown.items()},
+        )
 
     return {
         "id": agent.id,
@@ -1304,6 +2498,18 @@ async def _run_agent_reasoning(
         "role": agent.role,
         "longitude": agent.lng,
         "latitude": agent.lat,
+        "demographics": {
+            "age_band": agent.demographics.age_band,
+            "age_years": agent.demographics.age_years,
+            "education_level": agent.demographics.education_level,
+            "income_band": agent.demographics.income_band,
+            "housing_status": agent.demographics.housing_status,
+            "language_profile": agent.demographics.language_profile,
+            "community_tenure": agent.demographics.community_tenure,
+            "caregiving_load": agent.demographics.caregiving_load,
+            "digital_media_habit": agent.demographics.digital_media_habit,
+            "summary": _demographic_profile_summary(agent.demographics),
+        },
         "belief_state": state,
         "k2_reasoning_trace": reasoning,
         "k2_decision_confidence": confidence,
@@ -1317,12 +2523,13 @@ async def _run_agent_reasoning(
             "working_memory_strain": float(bsv["working_memory_strain"]),
         },
         "agent_insight": {
-            "vulnerability": f"Most sensitive to {_signal_label(parsed_signal)} dynamics.",
+            "vulnerability": _demographic_vulnerability(agent.demographics, parsed_signal),
             "cause_of_state": reasoning[0] if reasoning else _signal_summary(parsed_signal, state, regions),
             "best_intervention": _intervention_hint(parsed_signal),
         },
         "_pipeline": {
             "traits": traits.__dict__,
+            "conditioning": {k: round(float(v), 3) for k, v in conditioning.items()},
             "baseline_score": round(baseline_score, 3),
             "final_score": round(final_score, 3),
             "local_adoption_ratio": round(local_adoption_ratio, 3),
@@ -1331,8 +2538,368 @@ async def _run_agent_reasoning(
     }
 
 
+def _fallback_reasoning_payload(
+    *,
+    item: dict[str, Any],
+    claim_credibility: float,
+) -> dict[str, Any]:
+    state = _state_from_score(item["final_score"], claim_credibility)
+    return {
+        "reasoning": [
+            _signal_summary(
+                item["default_signal"],
+                state,
+                item["regions"],
+            ),
+            (
+                f"{item['supportive_neighbors']} of {item['total_neighbors']} nearby agents reinforce the claim, "
+                f"while the modeled uptake score settles at {item['final_score']:.2f} after local exposure."
+            ),
+        ],
+        "confidence": round(
+            _clamp(
+                0.42
+                + abs(item["final_score"] - 0.5) * 0.54
+                + claim_credibility * 0.08,
+                0.18,
+                0.78,
+            ),
+            3,
+        ),
+        "signal": item["default_signal"],
+    }
+
+
+def _role_reasoning_lens(role: str) -> str:
+    lowered = role.lower()
+    if "journal" in lowered:
+        return "source verification and documentation standards"
+    if any(token in lowered for token in ("policy", "analyst", "civic")):
+        return "institutional process, public records, and governance plausibility"
+    if any(token in lowered for token in ("health", "educator", "responder")):
+        return "public-service duty, practical harm, and trustworthiness"
+    if any(token in lowered for token in ("engineer", "research")):
+        return "evidence quality, internal consistency, and analytical scrutiny"
+    if any(token in lowered for token in ("organizer", "small business", "operations")):
+        return "community impact, practical consequences, and local trust signals"
+    return "personal trust, plausibility, and local social proof"
+
+
+def _demographic_profile_summary(demographics: _Demographics) -> str:
+    return (
+        f"{demographics.age_band}, {demographics.education_level.lower()}, "
+        f"{demographics.housing_status.lower()}, {demographics.language_profile.lower()}"
+    )
+
+
+def _demographic_context_clause(demographics: _Demographics, agent_id: int) -> str:
+    clauses = [
+        f"They are {demographics.age_band.lower()} with a {demographics.education_level.lower()} background and {demographics.community_tenure.lower()} ties to the area.",
+        f"Their context includes {demographics.housing_status.lower()}, {demographics.caregiving_load.lower()}, and a {demographics.digital_media_habit.lower()} information habit.",
+        f"They move information through a {demographics.language_profile.lower()} setting, which changes how quickly neighborhood narratives reach them.",
+    ]
+    return clauses[agent_id % len(clauses)]
+
+
+def _demographic_vulnerability(demographics: _Demographics, signal: SignalType) -> str:
+    bridge = (
+        "cross-community circulation"
+        if demographics.language_profile in {"Bilingual English-Spanish", "Multilingual household"}
+        else "single-channel verification"
+    )
+    if signal == "cognitive_overload":
+        return (
+            f"Most sensitive to cognitive overload when {demographics.caregiving_load.lower()} and "
+            f"{demographics.digital_media_habit.lower()} compress attention."
+        )
+    if signal == "social_proof":
+        return (
+            f"Most sensitive to social proof through {bridge} in a {demographics.community_tenure.lower()} local context."
+        )
+    if signal == "defensive_reactance":
+        return (
+            f"Most sensitive to reactance when {demographics.housing_status.lower()} and {demographics.income_band.lower()} conditions raise the stakes of institutional ambiguity."
+        )
+    if signal == "memory_alignment":
+        return (
+            f"Most sensitive to familiar-story effects through {demographics.community_tenure.lower()} neighborhood memory."
+        )
+    return (
+        f"Most sensitive to empathic resonance under {demographics.caregiving_load.lower()} and {demographics.language_profile.lower()} community ties."
+    )
+
+
+def _primary_decision_anchor(
+    *,
+    traits: _Traits,
+    claim_diagnostics: dict[str, float | str],
+    score_breakdown: dict[str, float],
+) -> str:
+    if float(traits.analytic_scrutiny) >= 0.64 or float(traits.evidence_literacy) >= 0.66:
+        return "high evidence scrutiny"
+    if float(traits.peer_susceptibility) >= 0.62:
+        return "strong peer-normalization sensitivity"
+    if float(traits.identity_sensitivity) >= 0.62:
+        return "identity-threat sensitivity"
+    if float(traits.institutional_trust) <= 0.34:
+        return "low institutional trust"
+    if float(score_breakdown.get("prior_fit", 0.0)) <= 0.2:
+        return "weak prior fit"
+    if float(claim_diagnostics.get("credibility", 0.0)) <= 0.22:
+        return "low claim credibility"
+    return "cognitive overload under low-trust ambiguity"
+
+
+def _social_context_label(supportive_neighbors: int, total_neighbors: int, local_adoption_ratio: float) -> str:
+    if total_neighbors == 0:
+        return "isolated local context with no visible reinforcement"
+    if supportive_neighbors == 0:
+        return f"zero supportive neighbors out of {total_neighbors}"
+    if local_adoption_ratio >= 0.45:
+        return f"meaningful peer reinforcement ({supportive_neighbors} of {total_neighbors})"
+    return f"limited peer reinforcement ({supportive_neighbors} of {total_neighbors})"
+
+
+def _role_opening(role: str, role_lens: str, agent_id: int) -> str:
+    connector = "evaluates through" if agent_id % 2 == 0 else "filters through"
+    return f"As a {role.lower()}, this person {connector} {role_lens}."
+
+
+def _verification_gap(role: str, domain: str, analysis_text: str, agent_id: int) -> str:
+    lowered_role = role.lower()
+    if "journal" in lowered_role:
+        return "the story still lacks a verifiable source, attributable record, and checkable document trail"
+    if any(token in lowered_role for token in ("policy", "analyst", "civic")):
+        return "the claim still lacks the vote, hearing, memo, or process footprint that a real action would leave behind"
+    if any(token in lowered_role for token in ("health", "educator", "responder")):
+        return "the warning still arrives without the kind of vetted guidance or accountable sourcing this role would act on"
+    if any(token in lowered_role for token in ("engineer", "research")):
+        return "the evidence chain still has too many inference jumps and too few checkable anchors"
+    return "the story still asks for belief faster than it provides proof"
+
+
+def _secondary_driver_phrase(
+    *,
+    signal: SignalType,
+    social_context_label: str,
+    primary_decision_anchor: str,
+    bsv: BSV,
+    score_breakdown: dict[str, float],
+    agent_id: int,
+) -> str:
+    if signal == "cognitive_overload":
+        return (
+            f"Cognitive load is {bsv['cognitive_load']:.2f} and working-memory strain is {bsv['working_memory_strain']:.2f}, "
+            "so unresolved gaps remain unresolved instead of being integrated."
+        )
+    if signal == "defensive_reactance":
+        return (
+            f"The message is being processed as agenda-driven, and {primary_decision_anchor} converts uncertainty into active pushback."
+        )
+    if signal == "social_proof":
+        return f"Social context matters here, but {social_context_label} does not create enough local momentum to stabilize the claim."
+    if signal == "memory_alignment":
+        return "Prior fit stays weak, so the claim does not map cleanly onto anything already trusted enough to repeat."
+    return f"There is some openness in the background state, but {social_context_label} and the weak factual footing still keep acceptance from locking in."
+
+
+def _resolution_phrase(
+    *,
+    state: str,
+    social_context_label: str,
+    credibility: float,
+    primary_decision_anchor: str,
+    gap: str,
+    score_breakdown: dict[str, float],
+    agent_id: int,
+) -> str:
+    prior_fit = float(score_breakdown.get("prior_fit", 0.0))
+    if state == "adopted":
+        return f"That mix of messenger fit, {primary_decision_anchor}, and {social_context_label} is enough to carry the claim into adoption."
+    if state == "neutral":
+        return "The claim never becomes trustworthy, but it also does not fully collapse, so the result settles into a wait-and-see posture."
+
+    if credibility <= 0.22:
+        return f"Credibility at {credibility:.2f} leaves {social_context_label} with too little force to rescue the claim."
+    if prior_fit <= 0.2:
+        return f"Weak prior fit gives the story nowhere stable to land, so {social_context_label} cannot convert attention into belief."
+    return f"Because {gap}, and because {social_context_label} adds too little lift, the claim resolves to rejection."
+
+
+def _compose_agent_reasoning(
+    *,
+    agent: _Virt,
+    domain: str,
+    analysis_text: str,
+    signal: SignalType,
+    state: str,
+    role_lens: str,
+    social_context_label: str,
+    primary_decision_anchor: str,
+    bsv: BSV,
+    traits: _Traits,
+    score_breakdown: dict[str, float],
+    claim_diagnostics: dict[str, float | str],
+) -> list[str]:
+    opening = _role_opening(agent.role, role_lens, agent.id)
+    gap = _verification_gap(agent.role, domain, analysis_text, agent.id)
+    demographic_clause = _demographic_context_clause(agent.demographics, agent.id)
+    second = _secondary_driver_phrase(
+        signal=signal,
+        social_context_label=social_context_label,
+        primary_decision_anchor=primary_decision_anchor,
+        bsv=bsv,
+        score_breakdown=score_breakdown,
+        agent_id=agent.id,
+    )
+    credibility = float(claim_diagnostics["credibility"])
+    closer = _resolution_phrase(
+        state=state,
+        social_context_label=social_context_label,
+        credibility=credibility,
+        primary_decision_anchor=primary_decision_anchor,
+        gap=gap,
+        score_breakdown=score_breakdown,
+        agent_id=agent.id,
+    )
+    first = (
+        f"{opening} {demographic_clause} In this case, {gap}."
+        if "In this case" not in opening
+        else f"{opening} {demographic_clause} {gap}."
+    )
+    return [first, second, closer]
+
+
+def _build_k2_batch_payload_item(
+    *,
+    analysis_text: str,
+    domain: str,
+    case_goal: str,
+    claim_diagnostics: dict[str, float | str],
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    agent = item["agent"]
+    traits: _Traits = item["traits"]
+    state = _state_from_score(item["final_score"], float(claim_diagnostics["credibility"]))
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "role": agent.role,
+        "role_lens": _role_reasoning_lens(agent.role),
+        "domain_context": DOMAIN_CONTEXT.get(domain, domain),
+        "scenario": _compress_ws(analysis_text)[:700],
+        "case_goal": case_goal,
+        "precomputed_outcome": state.title(),
+        "dominant_signal_hint": item["default_signal"],
+        "primary_decision_anchor": _primary_decision_anchor(
+            traits=traits,
+            claim_diagnostics=claim_diagnostics,
+            score_breakdown=item["score_breakdown"],
+        ),
+        "claim_credibility": round(float(claim_diagnostics["credibility"]), 3),
+        "claim_harm": round(float(claim_diagnostics["harm"]), 3),
+        "claim_virality": round(float(claim_diagnostics.get("virality", 0.0)), 3),
+        "local_adoption_ratio": round(float(item["local_adoption_ratio"]), 3),
+        "supportive_neighbors": int(item["supportive_neighbors"]),
+        "total_neighbors": int(item["total_neighbors"]),
+        "social_context_label": _social_context_label(
+            int(item["supportive_neighbors"]),
+            int(item["total_neighbors"]),
+            float(item["local_adoption_ratio"]),
+        ),
+        "baseline_score": round(float(item["baseline_score"]), 3),
+        "final_score": round(float(item["final_score"]), 3),
+        "traits": {
+            "evidence_literacy": round(float(traits.evidence_literacy), 3),
+            "peer_susceptibility": round(float(traits.peer_susceptibility), 3),
+            "identity_sensitivity": round(float(traits.identity_sensitivity), 3),
+            "institutional_trust": round(float(traits.institutional_trust), 3),
+            "analytic_scrutiny": round(float(traits.analytic_scrutiny), 3),
+            "baseline_openness": round(float(traits.baseline_openness), 3),
+        },
+        "bsv": {key: round(float(value), 3) for key, value in item["bsv"].items()},
+        "brain_regions": {key: round(float(value), 3) for key, value in item["regions"].items()},
+        "score_breakdown": {key: round(float(value), 3) for key, value in item["score_breakdown"].items()},
+    }
+
+
+async def _resolve_k2_reasoning_map(
+    httpx_client: httpx.AsyncClient,
+    *,
+    analysis_text: str,
+    domain: str,
+    case_goal: str,
+    claim_diagnostics: dict[str, float | str],
+    computed_agents: list[dict[str, Any]],
+    chunk_size: int = 8,
+) -> dict[int, dict[str, Any]]:
+    requests = [
+        _build_k2_batch_payload_item(
+            analysis_text=analysis_text,
+            domain=domain,
+            case_goal=case_goal,
+            claim_diagnostics=claim_diagnostics,
+            item=item,
+        )
+        for item in computed_agents
+    ]
+    reasoning_map: dict[int, dict[str, Any]] = {}
+    for chunk in _chunked(requests, chunk_size):
+        reasoning_map.update(
+            await call_k2_batch_think(
+                httpx_client,
+                agents=chunk,
+            )
+        )
+    return reasoning_map
+
+
 def _chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def _timeline_prompt_item(agent: dict[str, Any], round_item: dict[str, Any]) -> dict[str, Any]:
+    demographics = agent.get("demographics") or {}
+    pipeline = agent.get("_pipeline") or {}
+    return {
+        "agent_id": int(agent["id"]),
+        "round": int(round_item["round"]),
+        "name": agent["name"],
+        "role": agent["role"],
+        "belief_state": round_item["belief_state"],
+        "confidence": round(float(round_item["confidence"]), 3),
+        "confidence_delta": round(float(round_item.get("confidence_delta") or 0.0), 3),
+        "dominant_signal": agent["dominant_signal"],
+        "demographics": demographics,
+        "traits": pipeline.get("traits", {}),
+        "conditioning": pipeline.get("conditioning", {}),
+        "trigger_metrics": {
+            "supportive_pressure": round_item.get("supportive_pressure"),
+            "skeptical_pressure": round_item.get("skeptical_pressure"),
+            "messenger_alignment": round_item.get("messenger_alignment"),
+        },
+        "existing_phase_label": round_item.get("phase_label"),
+        "existing_trigger": round_item.get("trigger"),
+        "existing_post": round_item.get("post"),
+        "existing_change_summary": round_item.get("change_summary"),
+    }
+
+
+async def _render_timeline_language(
+    httpx_client: httpx.AsyncClient,
+    *,
+    agents: list[dict[str, Any]],
+    chunk_size: int = 12,
+) -> dict[tuple[int, int], dict[str, str]]:
+    items: list[dict[str, Any]] = []
+    for agent in agents:
+        for round_item in agent.get("round_history", []):
+            items.append(_timeline_prompt_item(agent, round_item))
+
+    rendered: dict[tuple[int, int], dict[str, str]] = {}
+    for chunk in _chunked(items, chunk_size):
+        rendered.update(await call_k2_timeline_batch(httpx_client, items=chunk))
+    return rendered
 
 
 def _materialize_agent_result(
@@ -1341,6 +2908,7 @@ def _materialize_agent_result(
     bsv: BSV,
     regions: dict[str, float],
     traits: _Traits,
+    conditioning: dict[str, float],
     baseline_score: float,
     final_score: float,
     local_adoption_ratio: float,
@@ -1366,6 +2934,18 @@ def _materialize_agent_result(
         "role": agent.role,
         "longitude": agent.lng,
         "latitude": agent.lat,
+        "demographics": {
+            "age_band": agent.demographics.age_band,
+            "age_years": agent.demographics.age_years,
+            "education_level": agent.demographics.education_level,
+            "income_band": agent.demographics.income_band,
+            "housing_status": agent.demographics.housing_status,
+            "language_profile": agent.demographics.language_profile,
+            "community_tenure": agent.demographics.community_tenure,
+            "caregiving_load": agent.demographics.caregiving_load,
+            "digital_media_habit": agent.demographics.digital_media_habit,
+            "summary": _demographic_profile_summary(agent.demographics),
+        },
         "belief_state": state,
         "k2_reasoning_trace": reasoning,
         "k2_decision_confidence": confidence,
@@ -1379,12 +2959,13 @@ def _materialize_agent_result(
             "working_memory_strain": float(bsv["working_memory_strain"]),
         },
         "agent_insight": {
-            "vulnerability": f"Most sensitive to {_signal_label(parsed_signal)} dynamics.",
+            "vulnerability": _demographic_vulnerability(agent.demographics, parsed_signal),
             "cause_of_state": reasoning[0] if reasoning else _signal_summary(parsed_signal, state, regions),
             "best_intervention": _intervention_hint(parsed_signal),
         },
         "_pipeline": {
             "traits": traits.__dict__,
+            "conditioning": {k: round(float(v), 3) for k, v in conditioning.items()},
             "baseline_score": round(baseline_score, 3),
             "final_score": round(final_score, 3),
             "local_adoption_ratio": round(local_adoption_ratio, 3),
@@ -1845,6 +3426,7 @@ async def run_simulation_http(
 ) -> dict[str, object]:
     population = _build_virtual_population(city_id, settings.simulate_population_size)
     stage_trace: list[dict[str, float | str]] = []
+    pipeline_started = time.perf_counter()
 
     async def _timed(stage: str, awaitable: Any) -> Any:
         logger.info("Simulation stage start: %s", stage)
@@ -1864,13 +3446,52 @@ async def run_simulation_http(
             analysis_text, _ = _build_analysis_text(evidence, source_excerpt)
             case_features = _case_feature_vector(analysis_text, case_goal, domain, message_complexity)
             claim_diagnostics = _claim_diagnostics(analysis_text, domain, source_excerpt)
-            batch_agents = [{"id": agent.id, "role": agent.role, "latitude": agent.lat, "longitude": agent.lng} for agent in population]
+            batch_agents = [
+                {
+                    "id": agent.id,
+                    "role": agent.role,
+                    "latitude": agent.lat,
+                    "longitude": agent.lng,
+                    "demographics": {
+                        "age_band": agent.demographics.age_band,
+                        "age_years": agent.demographics.age_years,
+                        "education_level": agent.demographics.education_level,
+                        "income_band": agent.demographics.income_band,
+                        "housing_status": agent.demographics.housing_status,
+                        "language_profile": agent.demographics.language_profile,
+                        "community_tenure": agent.demographics.community_tenure,
+                        "caregiving_load": agent.demographics.caregiving_load,
+                        "digital_media_habit": agent.demographics.digital_media_habit,
+                    },
+                }
+                for agent in population
+            ]
             tribe_batch = await _timed(
                 "tribe_batch",
                 call_tribe_modal_batch(httpx_client, analysis_text, batch_agents),
             )
             tribe_results = tribe_batch["agents"]
-            tribe_meta = tribe_batch.get("tribe_meta") or {}
+            tribe_meta = _augment_tribe_meta(tribe_batch.get("tribe_meta") or {})
+            tribe_composites = tribe_meta.get("composites") if isinstance(tribe_meta.get("composites"), dict) else {}
+            baseline_herding = float(tribe_composites.get("herding", 0.0))
+            baseline_approach = float(tribe_composites.get("approach_avoid", 0.0))
+            baseline_regulation = float(tribe_composites.get("regulation", 0.0))
+            baseline_reactivity = float(tribe_composites.get("reactivity", 0.0))
+            per_agent_surface = tribe_meta.get("per_agent")
+            if not isinstance(per_agent_surface, dict):
+                per_agent_surface = {}
+
+            def _agent_composite_biases(agent_id: int) -> tuple[float, float, float, float]:
+                entry = per_agent_surface.get(str(agent_id))
+                if isinstance(entry, dict) and isinstance(entry.get("composites"), dict):
+                    comp = entry["composites"]
+                    return (
+                        float(comp.get("herding", baseline_herding)),
+                        float(comp.get("approach_avoid", baseline_approach)),
+                        float(comp.get("regulation", baseline_regulation)),
+                        float(comp.get("reactivity", baseline_reactivity)),
+                    )
+                return baseline_herding, baseline_approach, baseline_regulation, baseline_reactivity
 
             missing_ids = [str(agent.id) for agent in population if str(agent.id) not in tribe_results]
             if missing_ids:
@@ -1893,17 +3514,26 @@ async def run_simulation_http(
             ]
             regions_by_id = {region.agent_id: region for region in calibrated_regions}
 
+            conditioning_map = {agent.id: _agent_conditioning(agent, city_id) for agent in population}
             trait_map = {agent.id: _agent_traits(agent, city_id) for agent in population}
             baseline_scores: dict[int, float] = {}
             baseline_breakdowns: dict[int, dict[str, float]] = {}
             for agent in population:
                 raw_region = regions_by_id[agent.id]
+                herding_bias, approach_bias, regulation_bias, reactivity_bias = _agent_composite_biases(agent.id)
                 baseline_score, breakdown = _baseline_uptake_score(
                     analysis_text=analysis_text,
                     domain=domain,
                     bsv=raw_region.bsv,
                     traits=trait_map[agent.id],
                     claim_diagnostics=claim_diagnostics,
+                )
+                baseline_score = _clamp(
+                    baseline_score
+                    + max(0.0, herding_bias - 0.45) * trait_map[agent.id].peer_susceptibility * 0.05
+                    + max(0.0, approach_bias) * trait_map[agent.id].baseline_openness * 0.045
+                    - max(0.0, -regulation_bias) * trait_map[agent.id].analytic_scrutiny * 0.03
+                    + (0.02 if reactivity_bias <= -1.0 else -0.012 if reactivity_bias >= 1.0 else 0.0),
                 )
                 baseline_scores[agent.id] = baseline_score
                 baseline_breakdowns[agent.id] = breakdown
@@ -1934,6 +3564,14 @@ async def run_simulation_http(
                     bsv=adjusted_bsv,
                     claim_diagnostics=claim_diagnostics,
                 )
+                fh, fa, fr, fre = _agent_composite_biases(agent.id)
+                final_score = _clamp(
+                    final_score
+                    + max(0.0, fh - 0.45) * local_adoption_ratio * 0.08
+                    + max(0.0, fa) * resonance * 0.05
+                    - max(0.0, -fr) * adjusted_bsv["defensive_posture"] * 0.035
+                    + (0.018 if fre <= -1.0 else -0.014 if fre >= 1.0 else 0.0),
+                )
                 regions = _derive_brain_regions(
                     adjusted_bsv,
                     role=agent.role,
@@ -1950,6 +3588,7 @@ async def run_simulation_http(
                         "bsv": adjusted_bsv,
                         "regions": regions,
                         "traits": trait_map[agent.id],
+                        "conditioning": conditioning_map[agent.id],
                         "baseline_score": baseline_scores[agent.id],
                         "final_score": final_score,
                         "local_adoption_ratio": local_adoption_ratio,
@@ -1957,57 +3596,146 @@ async def run_simulation_http(
                         "default_signal": signal,
                         "supportive_neighbors": nearby_adopters,
                         "total_neighbors": nearby_total,
+                        "resonance": resonance,
                     }
                 )
 
-            agents = [
-                _materialize_agent_result(
-                    agent=item["agent"],
-                    bsv=item["bsv"],
-                    regions=item["regions"],
-                    traits=item["traits"],
-                    baseline_score=item["baseline_score"],
-                    final_score=item["final_score"],
-                    local_adoption_ratio=item["local_adoption_ratio"],
-                    score_breakdown=item["score_breakdown"],
-                    claim_credibility=float(claim_diagnostics["credibility"]),
-                    raw_reasoning={
-                        "reasoning": [
-                            _signal_summary(
-                                item["default_signal"],
-                                _state_from_score(item["final_score"], float(claim_diagnostics["credibility"])),
-                                item["regions"],
+            claim_credibility = float(claim_diagnostics["credibility"])
+            agents: list[dict[str, Any]]
+            if settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+                try:
+                    elapsed = time.perf_counter() - pipeline_started
+                    remaining_budget = settings.simulate_total_timeout_seconds - elapsed
+                    reasoning_timeout = min(30.0, max(0.0, remaining_budget - 28.0))
+                    if reasoning_timeout < 5.0:
+                        raise TimeoutError(
+                            f"Skipping K2 batch reasoning because only {remaining_budget:.2f}s remain in the pipeline budget."
+                        )
+                    reasoning_map = await _timed(
+                        "agent_reasoning",
+                        asyncio.wait_for(
+                            _resolve_k2_reasoning_map(
+                                httpx_client,
+                                analysis_text=analysis_text,
+                                domain=domain,
+                                case_goal=case_goal,
+                                claim_diagnostics=claim_diagnostics,
+                                computed_agents=computed_agents,
                             ),
-                            (
-                                f"{item['supportive_neighbors']} of {item['total_neighbors']} nearby agents reinforce the claim, "
-                                f"while the modeled uptake score settles at {item['final_score']:.2f} after local exposure."
-                            ),
-                        ],
-                        "confidence": round(
-                            _clamp(
-                                0.42
-                                + abs(item["final_score"] - 0.5) * 0.54
-                                + float(claim_diagnostics["credibility"]) * 0.08,
-                                0.18,
-                                0.78,
-                            ),
-                            3,
+                            timeout=reasoning_timeout,
                         ),
-                        "signal": item["default_signal"],
-                    },
-                    default_signal=item["default_signal"],
-                )
-                for item in computed_agents
-            ]
+                    )
+                    agents = [
+                        _materialize_agent_result(
+                            agent=item["agent"],
+                            bsv=item["bsv"],
+                            regions=item["regions"],
+                            traits=item["traits"],
+                            conditioning=item["conditioning"],
+                            baseline_score=item["baseline_score"],
+                            final_score=item["final_score"],
+                            local_adoption_ratio=item["local_adoption_ratio"],
+                            score_breakdown=item["score_breakdown"],
+                            claim_credibility=claim_credibility,
+                            raw_reasoning=reasoning_map.get(
+                                item["agent"].id,
+                                _fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
+                            ),
+                            default_signal=item["default_signal"],
+                        )
+                        for item in computed_agents
+                    ]
+                except Exception as exc:
+                    logger.exception("Agent reasoning render failed; falling back to local explanatory traces.")
+                    stage_trace.append(
+                        {
+                            "stage": "agent_reasoning",
+                            "seconds": 0.0,
+                            "status": "fallback",
+                            "error": str(exc)[:240],
+                        }
+                    )
+                    agents = [
+                        _materialize_agent_result(
+                            agent=item["agent"],
+                            bsv=item["bsv"],
+                            regions=item["regions"],
+                            traits=item["traits"],
+                            conditioning=item["conditioning"],
+                            baseline_score=item["baseline_score"],
+                            final_score=item["final_score"],
+                            local_adoption_ratio=item["local_adoption_ratio"],
+                            score_breakdown=item["score_breakdown"],
+                            claim_credibility=claim_credibility,
+                            raw_reasoning=_fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
+                            default_signal=item["default_signal"],
+                        )
+                        for item in computed_agents
+                    ]
+            else:
+                agents = [
+                    _materialize_agent_result(
+                        agent=item["agent"],
+                        bsv=item["bsv"],
+                        regions=item["regions"],
+                        traits=item["traits"],
+                        conditioning=item["conditioning"],
+                        baseline_score=item["baseline_score"],
+                        final_score=item["final_score"],
+                        local_adoption_ratio=item["local_adoption_ratio"],
+                        score_breakdown=item["score_breakdown"],
+                        claim_credibility=claim_credibility,
+                        raw_reasoning=_fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
+                        default_signal=item["default_signal"],
+                    )
+                    for item in computed_agents
+                ]
             agents.sort(key=lambda agent: agent["id"])
             swarm_dynamics = _build_swarm_dynamics_langgraph(
                 analysis_text=analysis_text,
                 population=population,
                 agents=agents,
+                claim_credibility=claim_credibility,
             )
             per_agent_history = swarm_dynamics["per_agent_history"]
             for agent in agents:
                 agent["round_history"] = per_agent_history.get(agent["id"], [])
+
+            if settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+                try:
+                    elapsed = time.perf_counter() - pipeline_started
+                    remaining_budget = settings.simulate_total_timeout_seconds - elapsed
+                    timeline_timeout = min(24.0, max(0.0, remaining_budget - 12.0))
+                    if timeline_timeout < 3.0:
+                        raise TimeoutError(
+                            f"Skipping timeline language because only {remaining_budget:.2f}s remain in the pipeline budget."
+                        )
+                    timeline_language = await _timed(
+                        "timeline_language",
+                        asyncio.wait_for(
+                            _render_timeline_language(httpx_client, agents=agents, chunk_size=8),
+                            timeout=timeline_timeout,
+                        ),
+                    )
+                    for agent in agents:
+                        for round_item in agent.get("round_history", []):
+                            rendered = timeline_language.get((int(agent["id"]), int(round_item["round"])))
+                            if not rendered:
+                                continue
+                            round_item["phase_label"] = rendered["phase_label"]
+                            round_item["trigger"] = rendered["trigger"]
+                            round_item["post"] = rendered["post"]
+                            round_item["change_summary"] = rendered["change_summary"]
+                except Exception as exc:
+                    logger.exception("Timeline language render failed; keeping structural fallback text.")
+                    stage_trace.append(
+                        {
+                            "stage": "timeline_language",
+                            "seconds": 0.0,
+                            "status": "fallback",
+                            "error": str(exc)[:240],
+                        }
+                    )
 
             fidelity_factor, _ = _model_fidelity_factor(source_excerpt)
             payload = _build_workspace_payload(
@@ -2055,6 +3783,7 @@ async def run_simulation_http(
                             "role": agent["role"],
                             "latitude": agent["latitude"],
                             "longitude": agent["longitude"],
+                            "demographics": agent.get("demographics", {}),
                             "tribe": tribe_results[str(agent["id"])],
                             "calibrated": regions_by_id[agent["id"]].bsv,
                             "traits": agent["_pipeline"]["traits"],
