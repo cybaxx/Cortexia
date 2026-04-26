@@ -151,8 +151,10 @@ export function generateAgentsForCity(
     const r1 = seeded(i + 1);
     const r2 = seeded(i + 1001);
     const r3 = seeded(i + 2001);
-    const lng = zone.lngMin + r1 * (zone.lngMax - zone.lngMin);
-    const lat = zone.latMin + r2 * (zone.latMax - zone.latMin);
+    const lngInset = (zone.lngMax - zone.lngMin) * 0.08;
+    const latInset = (zone.latMax - zone.latMin) * 0.08;
+    const lng = zone.lngMin + lngInset + r1 * Math.max(0.0001, zone.lngMax - zone.lngMin - lngInset * 2);
+    const lat = zone.latMin + latInset + r2 * Math.max(0.0001, zone.latMax - zone.latMin - latInset * 2);
 
     let state: AgentState = 'neutral';
     if (r3 > 0.78) state = 'strain';

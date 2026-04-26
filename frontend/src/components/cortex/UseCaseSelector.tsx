@@ -35,9 +35,17 @@ export const UseCaseSelector = () => {
         animate={{ opacity: 1, y: 0 }}
         className="relative z-10 max-w-4xl w-full"
       >
-        <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-text-muted text-center">
-          Cortexia · Cognitive impact lab
-        </p>
+        <div className="mb-4 flex items-center justify-center gap-3">
+          <div className="grid h-12 w-12 place-items-center rounded-[20px] border border-white/[0.08] bg-[linear-gradient(180deg,rgba(18,18,24,0.95),rgba(10,11,17,0.98))] shadow-[0_12px_36px_rgba(8,12,20,0.22)]">
+            <img src="/cortexia-mark.svg" alt="Cortexia logo" className="h-7 w-7 object-contain" />
+          </div>
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-pastel-1 text-left">
+              Cortexia
+            </p>
+            <p className="text-sm text-text-secondary">Misinformation research OS</p>
+          </div>
+        </div>
         <h1 className="text-center text-2xl sm:text-3xl font-semibold tracking-tight mt-2">
           Choose a domain
         </h1>

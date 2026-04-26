@@ -32,6 +32,20 @@ function badgeTone(risk: string) {
   return 'text-pastel-1 border-pastel-1/25 bg-[hsl(var(--pastel-1)/0.10)]';
 }
 
+function BrandMark() {
+  return (
+    <div className="inline-flex items-center gap-3">
+      <div className="grid h-10 w-10 place-items-center rounded-2xl border border-white/[0.08] bg-[linear-gradient(180deg,rgba(18,18,24,0.95),rgba(10,11,17,0.98))] shadow-[0_12px_36px_rgba(8,12,20,0.22)]">
+        <img src="/cortexia-mark.svg" alt="Cortexia logo" className="h-6 w-6 object-contain" />
+      </div>
+      <div>
+        <div className="brand-kicker">Cortexia</div>
+        <div className="text-sm font-semibold text-text-primary">Misinformation Research OS</div>
+      </div>
+    </div>
+  );
+}
+
 export const CaseWorkspace = () => {
   const useCase = useCortexStore((s) => s.useCase);
   const stage = useCortexStore((s) => s.stage);
@@ -70,12 +84,10 @@ export const CaseWorkspace = () => {
     <div className="min-h-screen bg-bg-deep text-text-primary">
       <div className="mx-auto flex min-h-screen max-w-[1600px] gap-5 px-4 pb-5 pt-4">
         <main className="min-w-0 flex-1">
-          <header className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.92] px-6 py-5 shadow-[0_16px_60px_rgba(8,12,20,0.26)]">
+          <header className="brand-shell rounded-[34px] px-6 py-5">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div>
-                <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-text-muted">
-                  Cortexia · Research Workspace
-                </div>
+                <BrandMark />
                 <h1 className="mt-2 text-2xl font-semibold tracking-tight">
                   {domain?.label ?? 'Case Workspace'}
                 </h1>
@@ -91,9 +103,9 @@ export const CaseWorkspace = () => {
                 <button
                   type="button"
                   onClick={() => setScreen('useCases')}
-                  className="rounded-full border border-white/[0.08] px-4 py-2 text-sm text-text-secondary transition-colors hover:border-white/[0.16] hover:text-text-primary"
+                  className="brand-chip rounded-full px-4 py-2 text-[15px] font-medium transition-colors hover:border-white/[0.16] hover:text-white"
                 >
-                  Switch domain
+                  Home
                 </button>
               </div>
             </div>
@@ -109,7 +121,7 @@ export const CaseWorkspace = () => {
                     onClick={() => setStage(item.id)}
                     className={`rounded-[24px] border px-4 py-3 text-left transition-all ${
                       active
-                        ? 'border-pastel-2/35 bg-[hsl(var(--pastel-2)/0.12)]'
+                        ? 'brand-chip shadow-[0_12px_34px_rgba(8,12,20,0.18)]'
                         : 'border-white/[0.08] bg-white/[0.03] hover:border-white/[0.16]'
                     }`}
                   >
@@ -146,7 +158,7 @@ export const CaseWorkspace = () => {
         </main>
 
         <aside className="sticky top-4 h-[calc(100vh-2rem)] w-[360px] shrink-0">
-          <div className="flex h-full flex-col overflow-hidden rounded-[34px] border border-white/[0.12] bg-[linear-gradient(180deg,rgba(18,24,34,0.98),rgba(12,18,28,0.98))] shadow-[0_24px_120px_rgba(8,12,20,0.45)]">
+          <div className="brand-shell flex h-full flex-col overflow-hidden rounded-[34px]">
             <div className="border-b border-white/[0.08] px-5 py-4">
               <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-text-muted">Case summary</div>
               <h2 className="mt-2 text-lg font-semibold text-text-primary">
@@ -159,7 +171,7 @@ export const CaseWorkspace = () => {
             </div>
 
             <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5 cortex-scroll">
-              <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
+              <div className="brand-card rounded-[24px] p-4">
                 <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Run state</div>
                 <div className="mt-2 flex items-center gap-3">
                   <span className={`h-2.5 w-2.5 rounded-full ${status === 'running' ? 'bg-pastel-2 animate-pulse' : status === 'error' ? 'bg-pastel-3' : 'bg-pastel-1'}`} />
@@ -172,38 +184,18 @@ export const CaseWorkspace = () => {
                 )}
               </div>
 
-              {caseSummary && (
-                <div className="grid grid-cols-2 gap-3">
-                  <MetricCard label="Confidence" value={`${Math.round(caseSummary.overall_confidence * 100)}%`} />
-                  <MetricCard label="Region" value={caseSummary.target_region} />
-                </div>
-              )}
-
-              {evidenceTrace && (
-                <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
-                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Evidence trace</div>
-                  <div className="mt-3 space-y-3">
-                    {evidenceTrace.claims.slice(0, 3).map((claim) => (
-                      <div key={claim.id} className="rounded-[18px] border border-white/[0.06] bg-bg-deep/40 p-3">
-                        <div className="text-sm leading-relaxed text-text-primary">{claim.text}</div>
-                        <div className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-[11px] ${badgeTone(claim.risk)}`}>
-                          {claim.risk} claim
-                        </div>
-                      </div>
-                    ))}
-                    <div className="flex flex-wrap gap-2">
-                      {evidenceTrace.themes.map((theme) => (
-                        <span key={theme} className="rounded-full border border-white/[0.08] px-3 py-1 text-xs text-text-secondary">
-                          {theme}
-                        </span>
-                      ))}
-                    </div>
+              {caseSummary && spreadModel && (
+                <div className="brand-card rounded-[24px] p-4">
+                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">At a glance</div>
+                  <div className="mt-3 grid grid-cols-2 gap-3">
+                    <MetricCard label="Claim adoption" value={`${spreadModel.belief_adoption_rate}%`} />
+                    <MetricCard label="Credibility" value={`${spreadModel.scientific_credibility ?? 0}%`} />
                   </div>
                 </div>
               )}
 
               {interventionPlaybook.length > 0 && (
-                <div className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
+                <div className="brand-card rounded-[24px] p-4">
                   <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Recommended next step</div>
                   <div className="mt-2 text-sm font-medium text-text-primary">{caseSummary?.recommended_next_step}</div>
                   <p className="mt-2 text-sm leading-relaxed text-text-secondary">
@@ -245,6 +237,15 @@ export const CaseWorkspace = () => {
                 >
                   Export Brief
                 </button>
+                <button
+                  type="button"
+                  onClick={() => exportCase('pdf')}
+                  disabled={!latestResponse}
+                  className="col-span-2 inline-flex items-center justify-center gap-2 rounded-[18px] border border-pastel-2/20 bg-[hsl(var(--pastel-2)/0.08)] px-3 py-2 text-sm text-white/90 disabled:opacity-40"
+                >
+                  <Download className="h-4 w-4" />
+                  Export Slides PDF
+                </button>
               </div>
             </div>
           </div>
@@ -256,8 +257,8 @@ export const CaseWorkspace = () => {
 
 function MetricCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-[22px] border border-white/[0.08] bg-white/[0.04] p-4">
-      <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">{label}</div>
+    <div className="brand-card rounded-[22px] p-4">
+      <div className="brand-kicker">{label}</div>
       <div className="mt-2 text-lg font-semibold text-text-primary">{value}</div>
     </div>
   );
@@ -283,6 +284,7 @@ function EvidenceStage({
   const evidence = useCortexStore((s) => s.evidence);
   const setEvidenceField = useCortexStore((s) => s.setEvidenceField);
   const status = useCortexStore((s) => s.status);
+  const useCase = useCortexStore((s) => s.useCase);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [transcribing, setTranscribing] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -355,10 +357,21 @@ function EvidenceStage({
   return (
     <div className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
       <div className="space-y-5">
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
-          <div className="grid gap-4 md:grid-cols-2">
+        <section className="brand-shell rounded-[34px] p-6">
+          <div className="mb-5 flex items-center gap-3">
+            <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-white/92">Input</div>
+            <div className="h-px flex-1 bg-white/[0.08]" />
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="space-y-2">
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Domain</span>
+              <div className="flex h-12 items-center rounded-[20px] border border-white/[0.08] bg-bg-elevated px-4 text-sm text-white/95">
+                {getUseCase(useCase)?.label ?? 'Research case'}
+              </div>
+            </div>
             <label className="space-y-2">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Target region</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Target City</span>
               <select
                 value={cityId}
                 onChange={(e) => setCityId(e.target.value)}
@@ -372,7 +385,7 @@ function EvidenceStage({
               </select>
             </label>
             <label className="space-y-2">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Signal complexity</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Signal Complexity</span>
               <select
                 value={String(messageComplexity)}
                 onChange={(e) => setMessageComplexity(Number(e.target.value))}
@@ -386,7 +399,7 @@ function EvidenceStage({
           </div>
 
           <label className="mt-4 block space-y-2">
-            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Case goal</span>
+            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Case Goal</span>
             <textarea
               value={caseGoal}
               onChange={(e) => setCaseGoal(e.target.value)}
@@ -395,28 +408,31 @@ function EvidenceStage({
           </label>
         </section>
 
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+        <section className="brand-shell rounded-[34px] p-6">
           <div className="flex items-center gap-3">
             <FileText className="h-5 w-5 text-pastel-1" />
             <div>
               <h3 className="text-lg font-semibold">Evidence intake</h3>
-              <p className="text-sm text-text-secondary">Collect raw text, source context, and optional audio transcript.</p>
+              <p className="text-sm text-white/72">Collect raw text, source context, and optional audio transcript.</p>
             </div>
           </div>
 
           <div className="mt-5 space-y-4">
             <label className="block space-y-2">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Raw text input</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Your Message</span>
               <textarea
                 value={evidence.text_input}
                 onChange={(e) => setEvidenceField('text_input', e.target.value)}
                 className="min-h-[140px] w-full rounded-[24px] border border-white/[0.08] bg-bg-elevated px-4 py-3 text-sm leading-relaxed text-text-primary"
                 placeholder="Paste the narrative, quote, claim, or excerpt you want to analyze."
               />
+              <p className="text-sm leading-relaxed text-white/72">
+                Paste a narrative, quote, claim, or excerpt. Cortexia will parse the core claims, model how the information moves, and turn that into intervention options.
+              </p>
             </label>
 
             <label className="block space-y-2">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Source URL</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Source URL</span>
               <input
                 value={evidence.source_url ?? ''}
                 onChange={(e) => setEvidenceField('source_url', e.target.value)}
@@ -426,7 +442,7 @@ function EvidenceStage({
             </label>
 
             <label className="block space-y-2">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Speaker context</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Speaker Context</span>
               <input
                 value={evidence.speaker_context ?? ''}
                 onChange={(e) => setEvidenceField('speaker_context', e.target.value)}
@@ -437,12 +453,12 @@ function EvidenceStage({
           </div>
         </section>
 
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+        <section className="brand-shell rounded-[34px] p-6">
           <div className="flex items-center gap-3">
             <AudioLines className="h-5 w-5 text-pastel-2" />
             <div>
               <h3 className="text-lg font-semibold">Audio evidence</h3>
-              <p className="text-sm text-text-secondary">Upload or record audio, then transcribe it with ElevenLabs.</p>
+              <p className="text-sm text-white/72">Upload or record audio, then transcribe it with ElevenLabs.</p>
             </div>
           </div>
 
@@ -498,7 +514,7 @@ function EvidenceStage({
           </div>
 
           <label className="mt-4 block space-y-2">
-            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Transcript</span>
+            <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Transcript</span>
             <textarea
               value={evidence.transcript ?? ''}
               onChange={(e) => {
@@ -516,12 +532,12 @@ function EvidenceStage({
       </div>
 
       <div className="space-y-5">
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+        <section className="brand-shell rounded-[34px] p-6">
           <div className="flex items-center gap-3">
             <ShieldAlert className="h-5 w-5 text-pastel-3" />
             <div>
               <h3 className="text-lg font-semibold">Canonical analysis text</h3>
-              <p className="text-sm text-text-secondary">This is the final text the spread model will analyze.</p>
+              <p className="text-sm text-white/72">This is the final text the spread model will analyze.</p>
             </div>
           </div>
           <textarea
@@ -530,15 +546,15 @@ function EvidenceStage({
             className="mt-5 min-h-[280px] w-full rounded-[24px] border border-white/[0.08] bg-bg-elevated px-4 py-3 text-sm leading-relaxed text-text-primary"
             placeholder="Refine the transcript and source excerpt into the analysis text you want Cortexia to model."
           />
-          <div className="mt-4 text-sm text-text-secondary">
+          <div className="mt-4 text-sm text-white/72">
             {canModel
               ? `${analysisPreview.length} characters ready for modeling.`
               : 'Add enough evidence to build a model-ready case.'}
           </div>
         </section>
 
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
-          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Research preview</div>
+        <section className="brand-shell rounded-[34px] p-6">
+          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-white/88">Research preview</div>
           <div className="mt-4 rounded-[24px] border border-white/[0.08] bg-white/[0.03] p-4">
             <div className="text-sm font-semibold text-text-primary">What Cortexia will do next</div>
             <ul className="mt-3 space-y-2 text-sm leading-relaxed text-text-secondary">
@@ -555,12 +571,12 @@ function EvidenceStage({
           )}
         </section>
 
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+        <section className="brand-shell rounded-[34px] p-6">
           <div className="flex items-center gap-3">
             <Link2 className="h-5 w-5 text-pastel-2" />
             <div>
               <h3 className="text-lg font-semibold">Regional map preview</h3>
-              <p className="text-sm text-text-secondary">
+              <p className="text-sm text-white/72">
                 The map stays in the product. Once you model the case, this regional view becomes the live spread canvas.
               </p>
             </div>
@@ -577,6 +593,8 @@ function EvidenceStage({
 function SpreadStage() {
   const spreadModel = useCortexStore((s) => s.spreadModel);
   const latestResponse = useCortexStore((s) => s.latestResponse);
+  const caseSummary = useCortexStore((s) => s.caseSummary);
+  const interventionPlaybook = useCortexStore((s) => s.interventionPlaybook);
 
   if (!spreadModel || !latestResponse) {
     return <EmptyStage title="Spread Model" body="Model the case to unlock spread diagnostics." />;
@@ -585,19 +603,33 @@ function SpreadStage() {
   return (
     <div className="grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
       <div className="space-y-5">
-        <section className="grid gap-4 md:grid-cols-4">
-          <MetricCard label="Spread risk" value={String(spreadModel.risk_score)} />
-          <MetricCard label="Adoption rate" value={`${spreadModel.belief_adoption_rate}%`} />
-          <MetricCard label="Population reached" value={`${spreadModel.population_reached}%`} />
-          <MetricCard label="Avg load" value={spreadModel.avg_cognitive_load.toFixed(2)} />
+        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="max-w-3xl">
+              <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Core finding</div>
+              <h3 className="mt-2 text-2xl font-semibold text-text-primary">Will this claim spread?</h3>
+              <p className="mt-3 text-base leading-relaxed text-text-secondary">
+                {spreadModel.core_story ?? spreadModel.network_summary}
+              </p>
+            </div>
+            <div className={`rounded-full border px-4 py-2 text-sm font-medium ${badgeTone(spreadModel.spread_risk)}`}>
+              {spreadModel.spread_risk} risk
+            </div>
+          </div>
+          <div className="mt-5 grid gap-4 md:grid-cols-4">
+            <MetricCard label="Risk score" value={String(spreadModel.risk_score)} />
+            <MetricCard label="Claim adoption" value={`${spreadModel.belief_adoption_rate}%`} />
+            <MetricCard label="Claim rejection" value={`${spreadModel.claim_rejection_rate ?? 0}%`} />
+            <MetricCard label="Credibility" value={`${spreadModel.scientific_credibility ?? 0}%`} />
+          </div>
         </section>
 
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-4">
+        <section className="brand-shell rounded-[34px] p-4">
           <div className="mb-4 flex items-center justify-between gap-4 px-2">
             <div>
               <h3 className="text-lg font-semibold">Spread map</h3>
               <p className="text-sm text-text-secondary">
-                Geographic view of modeled adoption, rejection, and concentration of risk with cleaner nodes and lower-noise pathways.
+                Geographic view of where the claim is most likely to take hold, where resistance forms, and where intervention should start.
               </p>
             </div>
             <div className={`rounded-full border px-3 py-1 text-xs font-medium ${badgeTone(spreadModel.spread_risk)}`}>
@@ -611,20 +643,22 @@ function SpreadStage() {
       </div>
 
       <div className="space-y-5">
-        <DataCard title="Map reading guide">
-          <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4">
-            <div className="text-sm font-semibold text-text-primary">What to look for</div>
-            <ul className="mt-3 space-y-2 text-sm leading-relaxed text-text-secondary">
-              <li>Dense peach circles indicate neighborhoods where corrective framing is failing.</li>
-              <li>Pastel blue nodes are agents more likely to adopt the corrective narrative.</li>
-              <li>Click any node to open its mechanism-level readout and intervention hint.</li>
-            </ul>
+        <DataCard title="What this means">
+          <div className="brand-card rounded-[20px] p-4">
+            <div className="text-sm font-semibold text-text-primary">{caseSummary?.key_finding}</div>
+            <p className="mt-3 text-sm leading-relaxed text-text-secondary">{spreadModel.network_summary}</p>
+            {interventionPlaybook[0] && (
+              <div className="mt-4 rounded-[18px] border border-pastel-2/20 bg-[hsl(var(--pastel-2)/0.08)] p-3">
+                <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Start here</div>
+                <p className="mt-2 text-sm leading-relaxed text-text-primary">{interventionPlaybook[0].title}</p>
+              </div>
+            )}
           </div>
         </DataCard>
 
-        <DataCard title="High-risk segments">
-          {spreadModel.high_risk_segments.slice(0, 4).map((segment) => (
-            <div key={`${segment.label}-${segment.dominant_driver}`} className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4">
+        <DataCard title="Most susceptible audiences">
+          {spreadModel.high_risk_segments.slice(0, 3).map((segment) => (
+            <div key={`${segment.label}-${segment.dominant_driver}`} className="brand-card rounded-[20px] p-4">
               <div className="flex items-center justify-between gap-3">
                 <div className="text-sm font-semibold text-text-primary">{segment.label}</div>
                 <span className={`rounded-full border px-2.5 py-1 text-[11px] ${badgeTone(segment.risk_level)}`}>
@@ -636,9 +670,9 @@ function SpreadStage() {
           ))}
         </DataCard>
 
-        <DataCard title="Belief pathways">
-          {spreadModel.belief_adoption_pathways.map((pathway) => (
-            <div key={pathway.id} className="flex items-center justify-between gap-3 rounded-[18px] border border-white/[0.08] bg-white/[0.04] p-3">
+        <DataCard title="Mechanisms driving uptake">
+          {spreadModel.belief_adoption_pathways.slice(0, 3).map((pathway) => (
+            <div key={pathway.id} className="brand-card flex items-center justify-between gap-3 rounded-[18px] p-3">
               <div>
                 <div className="text-sm font-medium text-text-primary">{pathway.label}</div>
                 <div className="text-xs text-text-secondary">{pathway.description}</div>
@@ -667,12 +701,12 @@ function MechanismsStage() {
   return (
     <div className="grid gap-5 xl:grid-cols-[1.1fr_0.9fr]">
       <div className="space-y-5">
-        <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+        <section className="brand-shell rounded-[34px] p-6">
           <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Mechanism summary</div>
           <h3 className="mt-3 text-xl font-semibold">{mechanisms.mechanism_summary}</h3>
           <div className="mt-5 grid gap-4 md:grid-cols-2">
             {mechanisms.dominant_cognitive_drivers.map((driver) => (
-              <div key={driver.signal} className="rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
+              <div key={driver.signal} className="brand-card rounded-[24px] p-4">
                 <div className="flex items-center justify-between gap-3">
                   <div className="text-sm font-semibold text-text-primary">{driver.signal.replaceAll('_', ' ')}</div>
                   <div className="text-sm font-semibold text-pastel-2">{Math.round(driver.share * 100)}%</div>
@@ -685,7 +719,7 @@ function MechanismsStage() {
 
         <DataCard title="Evidence links">
           {mechanisms.evidence_links.map((link) => (
-            <div key={link.label} className="rounded-[18px] border border-white/[0.08] bg-white/[0.04] p-3">
+            <div key={link.label} className="brand-card rounded-[18px] p-3">
               <div className="text-sm text-text-primary">{link.label}</div>
               <div className="mt-1 text-xs text-text-secondary">{link.type} · {link.risk}</div>
             </div>
@@ -696,7 +730,7 @@ function MechanismsStage() {
       <div className="space-y-5">
         <DataCard title="Representative agents">
           {topAgents.map((agent) => (
-            <div key={agent.id} className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4">
+            <div key={agent.id} className="brand-card rounded-[20px] p-4">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-semibold text-text-primary">{agent.name}</div>
@@ -714,7 +748,7 @@ function MechanismsStage() {
 
         <DataCard title="Confidence notes">
           {mechanisms.confidence_notes.map((note) => (
-            <div key={note} className="rounded-[18px] border border-white/[0.08] bg-white/[0.04] p-3 text-sm text-text-secondary">
+            <div key={note} className="brand-card rounded-[18px] p-3 text-sm text-text-secondary">
               {note}
             </div>
           ))}
@@ -737,7 +771,7 @@ function InterventionsStage() {
       <section className="grid gap-5 xl:grid-cols-[1.1fr_0.9fr]">
         <div className="space-y-5">
           {interventionPlaybook.map((item) => (
-            <div key={item.id} className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+            <div key={item.id} className="brand-shell rounded-[34px] p-6">
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">Intervention</div>
@@ -756,7 +790,7 @@ function InterventionsStage() {
                 <InterventionField label="Time horizon" value={item.time_horizon} />
                 <InterventionField label="Expected effect" value={item.expected_effect} />
               </div>
-              <div className="mt-4 rounded-[24px] border border-white/[0.08] bg-white/[0.04] p-4">
+              <div className="brand-card mt-4 rounded-[24px] p-4">
                 <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">Message strategy</div>
                 <p className="mt-2 text-sm leading-relaxed text-text-primary">{item.message_strategy}</p>
               </div>
@@ -767,7 +801,7 @@ function InterventionsStage() {
         <div className="space-y-5">
           <DataCard title="Supporting evidence">
             {interventionPlaybook[0].supporting_evidence.map((line) => (
-              <div key={line} className="rounded-[18px] border border-white/[0.08] bg-white/[0.04] p-3 text-sm text-text-secondary">
+              <div key={line} className="brand-card rounded-[18px] p-3 text-sm text-text-secondary">
                 {line}
               </div>
             ))}
@@ -775,7 +809,7 @@ function InterventionsStage() {
 
           {evidenceTrace && (
             <DataCard title="Case brief">
-              <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4">
+              <div className="brand-card rounded-[20px] p-4">
                 <div className="text-sm font-semibold text-text-primary">Themes</div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {evidenceTrace.themes.map((theme) => (
@@ -785,7 +819,7 @@ function InterventionsStage() {
                   ))}
                 </div>
               </div>
-              <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4 text-sm leading-relaxed text-text-secondary">
+              <div className="brand-card rounded-[20px] p-4 text-sm leading-relaxed text-text-secondary">
                 {evidenceTrace.analysis_text}
               </div>
             </DataCard>
@@ -798,8 +832,8 @@ function InterventionsStage() {
 
 function InterventionField({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-[20px] border border-white/[0.08] bg-white/[0.04] p-4">
-      <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-text-muted">{label}</div>
+    <div className="brand-card rounded-[20px] p-4">
+      <div className="brand-kicker">{label}</div>
       <div className="mt-2 text-sm leading-relaxed text-text-primary">{value}</div>
     </div>
   );
@@ -807,9 +841,11 @@ function InterventionField({ label, value }: { label: string; value: string }) {
 
 function DataCard({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-6">
+    <section className="brand-shell rounded-[34px] p-6">
       <div className="mb-4 flex items-center gap-3">
-        <Network className="h-5 w-5 text-pastel-2" />
+        <div className="grid h-9 w-9 place-items-center rounded-2xl border border-white/[0.08] bg-[linear-gradient(135deg,hsl(var(--pastel-2)/0.16),hsl(var(--pastel-1)/0.10))]">
+          <Network className="h-4.5 w-4.5 text-pastel-2" />
+        </div>
         <h3 className="text-lg font-semibold">{title}</h3>
       </div>
       <div className="space-y-3">{children}</div>
@@ -819,7 +855,7 @@ function DataCard({ title, children }: { title: string; children: ReactNode }) {
 
 function EmptyStage({ title, body }: { title: string; body: string }) {
   return (
-    <section className="rounded-[34px] border border-white/[0.1] bg-bg-surface/[0.9] p-8">
+    <section className="brand-shell rounded-[34px] p-8">
       <h3 className="text-xl font-semibold">{title}</h3>
       <p className="mt-3 max-w-xl text-sm leading-relaxed text-text-secondary">{body}</p>
     </section>

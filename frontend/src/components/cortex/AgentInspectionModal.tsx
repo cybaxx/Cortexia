@@ -1,40 +1,10 @@
 import { X } from 'lucide-react';
-import { Suspense, lazy, type CSSProperties } from 'react';
-import { Slider } from '@/components/ui/slider';
+import { Suspense, lazy } from 'react';
 import type { Agent } from '@/lib/agents';
 import type { AgentSimulationPayload } from '@/types/simulation';
-import { useCortexStore } from '@/store/cortex';
 
 const BrainViz = lazy(() =>
   import('./BrainViz').then((module) => ({ default: module.BrainViz })),
-);
-
-const ParamRow = ({
-  label,
-  value,
-  onChange,
-  accentVar,
-}: {
-  label: string;
-  value: number;
-  onChange: (v: number) => void;
-  accentVar: string;
-}) => (
-  <div className="space-y-1">
-    <div className="flex justify-between font-mono text-[9px] text-text-secondary">
-      <span className="uppercase tracking-wider">{label}</span>
-      <span className="text-text-primary">{value.toFixed(2)}</span>
-    </div>
-    <Slider
-      value={[value]}
-      min={0}
-      max={1}
-      step={0.01}
-      onValueChange={([v]) => onChange(v)}
-      className="[&_.bg-primary]:bg-[var(--param-slider)]"
-      style={{ ['--param-slider' as string]: `hsl(var(${accentVar}))` } as CSSProperties}
-    />
-  </div>
 );
 
 const K2ThinkTrace = ({ lines }: { lines: string[] }) => (
@@ -67,13 +37,10 @@ export const AgentInspectionModal = ({
   onClose: () => void;
   payload?: AgentSimulationPayload;
 }) => {
-  const patchAgent = useCortexStore((s) => s.patchAgent);
   return (
     <div
-      className="pointer-events-auto absolute z-50 w-[min(34rem,96vw)] max-h-[min(82vh,720px)] overflow-y-auto overscroll-contain rounded-[32px] border border-white/[0.12] p-4 shadow-[0_32px_120px_rgba(6,10,20,0.52)]"
+      className="pointer-events-auto absolute left-1/2 top-6 z-50 w-[min(34rem,calc(100%-3rem))] max-h-[calc(100%-3rem)] -translate-x-1/2 overflow-y-auto overscroll-contain rounded-[32px] border border-white/[0.12] p-4 shadow-[0_32px_120px_rgba(6,10,20,0.52)]"
       style={{
-        left: Math.min(x + 12, (typeof window !== 'undefined' ? window.innerWidth : 720) - 560),
-        top: y + 12,
         background:
           'linear-gradient(180deg, rgba(18,26,36,0.97) 0%, rgba(14,20,30,0.98) 100%)',
         backdropFilter: 'blur(14px)',
@@ -104,8 +71,8 @@ export const AgentInspectionModal = ({
       </div>
 
       <div className="mb-3 rounded-[22px] border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-[10px] font-mono text-text-muted">
-        Each node is now simulated independently. The regional brain map below is generated from this agent&apos;s own
-        TRIBE state, local context, and K2 decision path.
+        Each node is simulated independently. The regional brain map below reflects this agent&apos;s calibrated TRIBE
+        state, local network context, and detailed K2 decision path.
       </div>
 
       <div className="mb-3 rounded-[28px] border border-white/[0.08] bg-bg-elevated/35 p-3">
@@ -143,32 +110,6 @@ export const AgentInspectionModal = ({
           </div>
         </div>
       )}
-
-      <div className="mt-4 space-y-3">
-        <ParamRow
-          label="Cognitive load (local override)"
-          value={agent.cognitiveLoad}
-          onChange={(v) => patchAgent(agent.id, { cognitiveLoad: v })}
-          accentVar="--pastel-1"
-        />
-        <ParamRow
-          label="Emotional agitation (local override)"
-          value={agent.emotionalAgitation}
-          onChange={(v) => patchAgent(agent.id, { emotionalAgitation: v })}
-          accentVar="--pastel-3"
-        />
-        <ParamRow
-          label="Defensive posture (local override)"
-          value={agent.defensivePosture}
-          onChange={(v) => patchAgent(agent.id, { defensivePosture: v })}
-          accentVar="--pastel-2"
-        />
-      </div>
-
-      <div className="mt-3 border-t border-white/[0.06] pt-3 font-mono text-[9px] text-text-muted">
-        ID 0x{agent.id.toString(16).padStart(4, '0')} · lat {agent.position[1].toFixed(3)} · lng{' '}
-        {agent.position[0].toFixed(3)}
-      </div>
     </div>
   );
 };

@@ -3,6 +3,7 @@ import type { UseCaseId } from '@/data/useCases';
 import { getUseCase } from '@/data/useCases';
 import type { Agent } from '@/lib/agents';
 import { postSimulate } from '@/lib/api/simulate';
+import { exportCasePdf } from '@/lib/exportCasePdf';
 import type {
   AgentSimulationPayload,
   CaseSummary,
@@ -28,7 +29,7 @@ export interface AudioUploadState {
 
 export interface ExportState {
   lastExportAt?: number | null;
-  exportFormat: 'json' | 'markdown';
+  exportFormat: 'json' | 'markdown' | 'pdf';
 }
 
 export type AgentParamPatch = Partial<
@@ -70,7 +71,7 @@ interface CortexState {
   patchAgent: (id: number, partial: AgentParamPatch) => void;
   getAgentPayload: (id: number) => AgentSimulationPayload | undefined;
   runSimulation: () => Promise<void>;
-  exportCase: (format?: 'json' | 'markdown') => void;
+  exportCase: (format?: 'json' | 'markdown' | 'pdf') => void;
   resetWorkspace: () => void;
   workspaceTitle: () => string;
 }
@@ -235,6 +236,8 @@ export const useCortexStore = create<CortexState>((set, get) => ({
 
     if (format === 'json') {
       downloadBlob('cortexia-case.json', JSON.stringify(response, null, 2), 'application/json');
+    } else if (format === 'pdf') {
+      exportCasePdf(response);
     } else {
       downloadBlob('cortexia-case.md', buildMarkdownExport(response), 'text/markdown');
     }

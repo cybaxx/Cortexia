@@ -11,24 +11,26 @@ All colors MUST be HSL.
 
 @layer base {
   :root {
-    /* Cortexia enterprise palette (dark by default) */
-    --bg-deep: 222 32% 7%;          /* #0b0f19 */
-    --bg-surface: 220 26% 12%;      /* #111827 */
-    --bg-elevated: 220 22% 16%;
+    /* Cortexia brand palette */
+    --bg-deep: 222 36% 6%;
+    --bg-surface: 222 28% 11%;
+    --bg-elevated: 223 23% 16%;
     --bg-border: 0 0% 100%;         /* used with /8 opacity */
 
-    --text-primary: 220 14% 96%;    /* #f3f4f6 */
-    --text-secondary: 218 11% 65%;  /* #9ca3af */
-    --text-muted: 220 9% 46%;
+    --text-primary: 18 20% 96%;
+    --text-secondary: 18 12% 74%;
+    --text-muted: 18 8% 52%;
 
-    /* Three pastel accents on dark (dashboard spec) */
-    --pastel-1: 164 43% 76%;
-    --pastel-2: 202 78% 80%;
-    --pastel-3: 21 82% 79%;
-    /* Semantic accents aligned to pastels for status + map */
-    --accent-strain: 21 76% 74%;
-    --accent-adopt: 202 78% 78%;
-    --neutral-agent: 164 18% 30%;
+    /* Brand trio */
+    --pastel-1: 18 92% 74%;
+    --pastel-2: 18 66% 84%;
+    --pastel-3: 201 74% 82%;
+    --accent-strain: 18 90% 72%;
+    --accent-adopt: 201 74% 82%;
+    --neutral-agent: 18 12% 34%;
+    --brand-glow: radial-gradient(circle at top left, hsl(var(--pastel-1) / 0.14), transparent 28%),
+      radial-gradient(circle at 82% 12%, hsl(var(--pastel-3) / 0.10), transparent 22%),
+      radial-gradient(circle at 50% 100%, hsl(var(--pastel-2) / 0.08), transparent 30%);
 
     --background: var(--bg-deep);
     --foreground: var(--text-primary);
@@ -126,7 +128,9 @@ All colors MUST be HSL.
   }
 
   body {
-    background-color: hsl(var(--bg-deep));
+    background:
+      var(--brand-glow),
+      linear-gradient(180deg, hsl(var(--bg-deep)) 0%, hsl(223 39% 5%) 100%);
     color: hsl(var(--text-primary));
     font-family: 'Manrope', system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
@@ -143,3 +147,48 @@ All colors MUST be HSL.
 .cortex-scroll::-webkit-scrollbar { width: 4px; }
 .cortex-scroll::-webkit-scrollbar-track { background: transparent; }
 .cortex-scroll::-webkit-scrollbar-thumb { background: hsl(var(--bg-border) / 0.12); border-radius: 2px; }
+
+@layer components {
+  .brand-shell {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid hsl(var(--bg-border) / 0.08);
+    background:
+      linear-gradient(180deg, hsl(var(--bg-surface) / 0.94), hsl(var(--bg-surface) / 0.90)),
+      var(--brand-glow);
+    box-shadow:
+      inset 0 1px 0 hsl(var(--bg-border) / 0.05),
+      0 18px 70px rgba(6, 10, 20, 0.28);
+  }
+
+  .brand-shell::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto auto 0;
+    height: 1px;
+    width: 100%;
+    background: linear-gradient(90deg, hsl(var(--pastel-1) / 0.0), hsl(var(--pastel-2) / 0.42), hsl(var(--pastel-3) / 0.0));
+    pointer-events: none;
+  }
+
+  .brand-chip {
+    border: 1px solid hsl(var(--bg-border) / 0.08);
+    background: linear-gradient(135deg, hsl(var(--pastel-2) / 0.10), hsl(var(--pastel-3) / 0.08));
+    color: hsl(var(--text-primary));
+  }
+
+  .brand-kicker {
+    color: hsl(var(--pastel-2));
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+  }
+
+  .brand-card {
+    border: 1px solid hsl(var(--bg-border) / 0.08);
+    background:
+      linear-gradient(180deg, hsl(var(--bg-elevated) / 0.78), hsl(var(--bg-surface) / 0.66));
+    box-shadow: inset 0 1px 0 hsl(var(--bg-border) / 0.04);
+  }
+}

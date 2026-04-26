@@ -52,6 +52,7 @@ export const MapView = () => {
   });
   const [pinned, setPinned] = useState<{ agent: Agent; x: number; y: number } | null>(null);
   const mapRef = useRef<MapRef>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const baseAgents = useMemo(
     () => generateAgentsForCity(city.landZones, 110),
@@ -97,12 +98,24 @@ export const MapView = () => {
 
   const handleDeckClick = useCallback((info: { object?: unknown; x?: number; y?: number }) => {
     const object = info.object as Agent | undefined;
-    if (object && info.x != null && info.y != null) {
-      setPinned({ agent: object, x: info.x, y: info.y });
+    if (object) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      const centerX = rect ? rect.width / 2 : info.x ?? 0;
+      const centerY = rect ? rect.height / 2 : info.y ?? 0;
+
+      setViewState((vs) => ({
+        ...vs,
+        longitude: object.position[0],
+        latitude: object.position[1],
+        zoom: Math.max(vs.zoom, c.zoom + 0.25),
+        transitionDuration: 900,
+      }));
+
+      setPinned({ agent: object, x: centerX, y: centerY });
     } else {
       setPinned(null);
     }
-  }, []);
+  }, [c.zoom]);
 
   const layers = [
     ...(hasServerAgents
@@ -158,7 +171,7 @@ export const MapView = () => {
   }, [agentSimulationById, baseAgents, overrides, pinned]);
 
   return (
-    <div className="relative h-full min-h-[420px] bg-bg-deep">
+    <div ref={containerRef} className="relative h-full min-h-[420px] bg-bg-deep">
       {!MAPBOX_TOKEN && (
         <div className="absolute inset-0 z-10 flex items-center justify-center px-4 text-center">
           <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-4 py-3 font-mono text-[10px] text-text-secondary">

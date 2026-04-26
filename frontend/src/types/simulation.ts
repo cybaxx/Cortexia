@@ -128,6 +128,8 @@ export interface SpreadModel {
   risk_score: number;
   spread_risk: 'Low' | 'Moderate' | 'High';
   belief_adoption_rate: number;
+  claim_rejection_rate?: number;
+  scientific_credibility?: number;
   population_reached: number;
   avg_cognitive_load: number;
   avg_defensive_activation: number;
@@ -135,6 +137,7 @@ export interface SpreadModel {
   belief_adoption_pathways: BeliefPathway[];
   hotspots: Hotspot[];
   network_summary: string;
+  core_story?: string;
 }
 
 export interface MechanismDriver {

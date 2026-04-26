@@ -66,6 +66,16 @@ THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
     "threat": ("threat", "danger", "harm", "attack", "fear"),
 }
 
+LOW_CREDIBILITY_PATTERNS: tuple[tuple[str, float], ...] = (
+    ("alcohol is good for you", 0.62),
+    ("smoking is good for you", 0.78),
+    ("vaccines are poison", 0.72),
+    ("cures cancer", 0.48),
+    ("miracle cure", 0.42),
+    ("safe for everyone", 0.22),
+    ("harmless", 0.16),
+)
+
 INTERVENTION_LIBRARY: dict[SignalType, dict[str, str]] = {
     "defensive_reactance": {
         "recommended_channel": "trusted community forums and local surrogates",
@@ -245,37 +255,185 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
 
 def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
     city = get_city(city_id)
-    half = city.span / 2
+    zones = list(city.land_zones)
+    zone_areas = [
+        max(0.000001, (zone.lng_max - zone.lng_min) * (zone.lat_max - zone.lat_min))
+        for zone in zones
+    ]
+    total_area = sum(zone_areas)
+    cumulative: list[float] = []
+    running = 0.0
+    for area in zone_areas:
+        running += area / total_area
+        cumulative.append(running)
+
     out: list[_Virt] = []
     for i in range(count):
+        zone_pick = _seeded(i + 8500)
+        zone_idx = next((idx for idx, bound in enumerate(cumulative) if zone_pick <= bound), 0)
+        zone = zones[max(0, zone_idx)]
         r1 = _seeded(i + 1)
         r2 = _seeded(i + 1001)
+        lng_inset = (zone.lng_max - zone.lng_min) * 0.08
+        lat_inset = (zone.lat_max - zone.lat_min) * 0.08
         out.append(
             _Virt(
                 id=i,
                 name=f"{FIRST[i % len(FIRST)]} {LAST[(i * 3) % len(LAST)]}",
                 role=ROLES[i % len(ROLES)],
-                lng=city.longitude - half + r1 * city.span,
-                lat=city.latitude - half * 0.8 + r2 * city.span * 0.8,
+                lng=zone.lng_min + lng_inset + r1 * max(0.0001, zone.lng_max - zone.lng_min - lng_inset * 2),
+                lat=zone.lat_min + lat_inset + r2 * max(0.0001, zone.lat_max - zone.lat_min - lat_inset * 2),
             )
         )
     return out
 
 
-def _noise_bsv(base: BSV, agent_id: int, message_complexity: float) -> BSV:
-    message_complexity = _clamp(message_complexity)
-    jitter = 0.16 * (0.35 + message_complexity)
+def _keyword_density(text: str, words: tuple[str, ...]) -> float:
+    lowered = text.lower()
+    hits = sum(lowered.count(word) for word in words)
+    return _clamp(hits / 4.0)
 
-    def value(key: str, offset: int) -> float:
-        raw = float(base[key])  # type: ignore[index]
-        delta = (_seeded(agent_id * 17 + offset) - 0.5) * jitter
-        return _clamp(raw + delta)
+
+def _case_feature_vector(analysis_text: str, case_goal: str, domain: str, message_complexity: float) -> dict[str, float]:
+    joined = f"{analysis_text}\n{case_goal}\n{domain}"
+    return {
+        "threat": _keyword_density(joined, ("threat", "attack", "danger", "fear", "forced", "mandatory")),
+        "identity": _keyword_density(joined, ("maga", "community", "people", "look down", "republican", "democrat", "us", "them")),
+        "institutional": _keyword_density(joined, ("official", "policy", "institution", "government", "public health", "authority")),
+        "prosocial": _keyword_density(joined, ("community", "support", "benefit", "care", "help", "trust", "neighbors")),
+        "complexity": _clamp(message_complexity * 0.65 + min(len(analysis_text), 1200) / 2400.0),
+    }
+
+
+def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | None) -> dict[str, float | str]:
+    lowered = analysis_text.lower()
+    credibility = 0.56
+    harm = 0.22
+
+    for pattern, penalty in LOW_CREDIBILITY_PATTERNS:
+        if pattern in lowered:
+            credibility -= penalty
+            harm += penalty * 0.55
+
+    if domain == "public_health":
+        if "alcohol" in lowered and any(token in lowered for token in ("good for you", "healthy", "beneficial", "great for")):
+            credibility -= 0.38
+            harm += 0.28
+        if any(token in lowered for token in ("doctor hate this", "they don't want you to know", "secret cure")):
+            credibility -= 0.24
+            harm += 0.16
+
+    if any(token in lowered for token in ("always", "never", "everyone", "nobody", "proves that")):
+        credibility -= 0.08
+    if source_excerpt:
+        credibility += 0.05
+    if any(token in lowered for token in ("study", "according to", "data", "evidence")):
+        credibility += 0.04
+
+    credibility = _clamp(credibility, 0.05, 0.95)
+    harm = _clamp(harm, 0.05, 0.95)
+    risk_label = "High" if credibility < 0.3 or harm > 0.62 else "Moderate" if credibility < 0.48 else "Low"
+    return {
+        "credibility": credibility,
+        "harm": harm,
+        "risk_label": risk_label,
+    }
+
+
+def _model_fidelity_factor(source_excerpt: str | None) -> tuple[float, list[str]]:
+    notes: list[str] = []
+    fidelity = 0.48
+    if settings.tribe_modal_url.strip():
+        fidelity += 0.18
+    else:
+        notes.append("TRIBE is running in fallback/demo mode, so neural-state fidelity is limited.")
+    if settings.ifm_api_key.strip():
+        fidelity += 0.16
+    else:
+        notes.append("K2 reasoning is running in fallback mode, so behavioral explanations are heuristic.")
+    if source_excerpt:
+        fidelity += 0.08
+    else:
+        notes.append("No external source excerpt was retrieved, so credibility estimates rely mostly on the submitted claim text.")
+    return _clamp(fidelity, 0.25, 0.9), notes
+
+
+def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
+    role = agent.role.lower()
+    city = get_city(city_id)
+    northness = _clamp((agent.lat - min(zone.lat_min for zone in city.land_zones)) / max(0.001, max(zone.lat_max for zone in city.land_zones) - min(zone.lat_min for zone in city.land_zones)))
+    eastness = _clamp((agent.lng - min(zone.lng_min for zone in city.land_zones)) / max(0.001, max(zone.lng_max for zone in city.land_zones) - min(zone.lng_min for zone in city.land_zones)))
+
+    analytical = 1.0 if any(token in role for token in ("analyst", "engineer", "research")) else 0.0
+    service = 1.0 if any(token in role for token in ("health", "educator", "responder")) else 0.0
+    civic = 1.0 if any(token in role for token in ("policy", "journalist", "organizer")) else 0.0
 
     return {
-        "cognitive_load": value("cognitive_load", 11),
-        "emotional_agitation": value("emotional_agitation", 23),
-        "defensive_posture": value("defensive_posture", 37),
-        "working_memory_strain": value("working_memory_strain", 51),
+        "analytical": analytical,
+        "service": service,
+        "civic": civic,
+        "peripheral_pressure": abs(0.5 - northness) * 0.35 + abs(0.5 - eastness) * 0.35,
+        "institutional_trust": _clamp(0.42 + service * 0.16 + civic * 0.08 - analytical * 0.04),
+        "identity_salience": _clamp(0.34 + civic * 0.18 + analytical * 0.07),
+    }
+
+
+def _apply_lfcm_calibration(
+    base: BSV,
+    *,
+    agent: _Virt,
+    city_id: str,
+    case_features: dict[str, float],
+    message_complexity: float,
+) -> BSV:
+    """
+    Lightweight calibration layer on top of TRIBE.
+    This replaces arbitrary jitter with a bounded math model that:
+    - preserves the original TRIBE signal
+    - adds role / case conditioning
+    - regularizes toward the base state to avoid exaggerated subgroup drift
+    """
+    cond = _agent_conditioning(agent, city_id)
+    complexity = _clamp(message_complexity)
+
+    def calibrate(raw: float, delta: float, regularizer: float = 0.18) -> float:
+        centered = raw - 0.5
+        adjusted = 0.5 + centered * 0.72 + delta * (1.0 - regularizer)
+        return _clamp(adjusted)
+
+    cognitive_delta = (
+        case_features["complexity"] * 0.22
+        + cond["analytical"] * 0.06
+        + cond["peripheral_pressure"] * 0.04
+        - cond["institutional_trust"] * 0.03
+        + (_seeded(agent.id * 17 + 11) - 0.5) * 0.04
+    )
+    emotional_delta = (
+        case_features["threat"] * 0.16
+        + case_features["identity"] * 0.08
+        + cond["identity_salience"] * 0.06
+        - case_features["prosocial"] * 0.05
+        + (_seeded(agent.id * 17 + 23) - 0.5) * 0.05
+    )
+    defensive_delta = (
+        case_features["threat"] * 0.18
+        + case_features["institutional"] * (0.09 - cond["institutional_trust"] * 0.06)
+        + case_features["identity"] * cond["identity_salience"] * 0.10
+        + complexity * 0.04
+        + (_seeded(agent.id * 17 + 37) - 0.5) * 0.05
+    )
+    memory_delta = (
+        case_features["complexity"] * 0.15
+        + cond["analytical"] * 0.03
+        - case_features["prosocial"] * 0.04
+        + (_seeded(agent.id * 17 + 51) - 0.5) * 0.04
+    )
+
+    return {
+        "cognitive_load": calibrate(float(base["cognitive_load"]), cognitive_delta),
+        "emotional_agitation": calibrate(float(base["emotional_agitation"]), emotional_delta),
+        "defensive_posture": calibrate(float(base["defensive_posture"]), defensive_delta, 0.22),
+        "working_memory_strain": calibrate(float(base["working_memory_strain"]), memory_delta),
     }
 
 
@@ -402,6 +560,7 @@ async def _run_agent_reasoning(
     total_neighbors: int,
     resonance: float,
     regions: dict[str, float],
+    claim_diagnostics: dict[str, float | str],
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Any]:
     signal = _dominant_signal(bsv, regions, supportive_neighbors)
@@ -421,6 +580,8 @@ async def _run_agent_reasoning(
                     f"Context: target domain={DOMAIN_CONTEXT.get(domain, domain)}; "
                     f"dominant mechanism={_signal_label(signal)}; local resonance={resonance:.2f}."
                 ),
+                claim_credibility=float(claim_diagnostics["credibility"]),
+                claim_risk=str(claim_diagnostics["risk_label"]),
             )
         except Exception:
             raw = (
@@ -431,7 +592,31 @@ async def _run_agent_reasoning(
             )
 
     reasoning, action, confidence, parsed_signal = _parse_k2_output(raw, signal)
-    state = "neutral" if confidence < 0.58 and parsed_signal in {"memory_alignment", "empathic_resonance", "social_proof"} else ("adopted" if action == "adopted" else "rejected")
+    support_ratio = 0.0 if total_neighbors == 0 else supportive_neighbors / max(1, total_neighbors)
+    claim_credibility = float(claim_diagnostics["credibility"])
+    claim_harm = float(claim_diagnostics["harm"])
+    adoption_score = _clamp(
+        claim_credibility * 0.36
+        + support_ratio * 0.18
+        + resonance * 0.10
+        + (1.0 - bsv["defensive_posture"]) * 0.13
+        + (1.0 - bsv["cognitive_load"]) * 0.10
+        + (0.05 if parsed_signal in {"memory_alignment", "empathic_resonance"} else 0.0)
+        + (0.04 if parsed_signal == "social_proof" else 0.0)
+        - claim_harm * 0.22
+        - bsv["emotional_agitation"] * 0.07
+    )
+
+    if claim_credibility < 0.24 and support_ratio < 0.45:
+        state = "rejected"
+    elif action == "adopted" and adoption_score >= 0.61:
+        state = "adopted"
+    elif adoption_score <= 0.42 or action == "rejected":
+        state = "rejected"
+    else:
+        state = "neutral"
+
+    confidence = _clamp((confidence * 0.58) + (abs(adoption_score - 0.5) * 2.0 * 0.22) + (claim_credibility * 0.08), 0.18, 0.82)
 
     return {
         "id": agent.id,
@@ -467,18 +652,18 @@ def _cluster_key(city_id: str, latitude: float, longitude: float) -> tuple[str, 
 
 
 def _build_hotspots(city_id: str, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rejected = [a for a in agents if a["belief_state"] == "rejected"]
-    if not rejected:
+    adopted = [a for a in agents if a["belief_state"] == "adopted"]
+    if not adopted:
         return []
 
     buckets: dict[str, dict[str, Any]] = {}
-    for agent in rejected:
+    for agent in adopted:
         key, label = _cluster_key(city_id, agent["latitude"], agent["longitude"])
         bucket = buckets.setdefault(key, {"id": key.lower(), "label": label, "area": label, "count": 0, "lat_sum": 0.0, "lng_sum": 0.0, "share_sum": 0.0})
         bucket["count"] += 1
         bucket["lat_sum"] += agent["latitude"]
         bucket["lng_sum"] += agent["longitude"]
-        bucket["share_sum"] += 1.0 / len(rejected)
+        bucket["share_sum"] += 1.0 / len(adopted)
 
     ranked = sorted(buckets.values(), key=lambda item: item["count"], reverse=True)[:3]
     return [
@@ -502,7 +687,7 @@ def _extract_claims(analysis_text: str) -> list[dict[str, Any]]:
         claims.append({
             "id": f"claim-{index}",
             "text": sentence[:220],
-            "risk": "High" if any(word in sentence.lower() for word in ("maga", "look down", "fair or not", "community")) else "Moderate",
+            "risk": "High" if any(word in sentence.lower() for word in ("maga", "look down", "fair or not", "community", "good for you", "miracle cure", "cures")) else "Moderate",
         })
     return claims
 
@@ -542,8 +727,8 @@ def _build_segment_buckets(agents: list[dict[str, Any]]) -> list[dict[str, Any]]
             "label": bucket["segment"],
             "dominant_driver": bucket["driver"],
             "share": round(count / total, 3),
-            "risk_level": "High" if bucket["rejected"] / max(1, count) > 0.55 else "Moderate",
-            "why_vulnerable": f"{bucket['segment']} over-index on {_signal_label(bucket['driver'])} with mean decision confidence {avg_confidence:.2f}.",
+            "risk_level": "High" if bucket["adopted"] / max(1, count) > 0.45 else "Moderate",
+            "why_vulnerable": f"{bucket['segment']} are more likely to internalize the claim through {_signal_label(bucket['driver'])}, with mean decision confidence {avg_confidence:.2f}.",
             "recommended_intervention_focus": _intervention_hint(bucket["driver"]),
         })
     return sorted(out, key=lambda item: (item["risk_level"] == "High", item["share"]), reverse=True)
@@ -584,7 +769,7 @@ def _build_mechanism_summary(agents: list[dict[str, Any]]) -> tuple[list[dict[st
         for pathway in pathways[:4]
     ]
     top = pathways[0]["label"] if pathways else "Mixed drivers"
-    summary = f"The dominant mechanism in this case is {top.lower()}, affecting about {round((pathways[0]['share'] if pathways else 0) * 100)}% of the modeled population."
+    summary = f"The dominant mechanism driving claim uptake in this case is {top.lower()}, affecting about {round((pathways[0]['share'] if pathways else 0) * 100)}% of the modeled population."
     return drivers, summary
 
 
@@ -651,12 +836,14 @@ def _build_intervention_playbook(
 
 def _build_confidence_notes(agents: list[dict[str, Any]], source_warning: str | None, source_excerpt: str | None) -> list[str]:
     avg_conf = sum(float(agent["k2_decision_confidence"]) for agent in agents) / max(1, len(agents))
-    notes = [f"Average modeled decision confidence is {avg_conf:.2f}."]
+    fidelity, fidelity_notes = _model_fidelity_factor(source_excerpt)
+    notes = [f"Average modeled decision confidence is {avg_conf:.2f}.", f"Pipeline fidelity estimate is {fidelity:.2f}."]
     if source_excerpt:
         notes.append("Source context was incorporated into the analysis text.")
     if source_warning:
         notes.append(source_warning)
-    if avg_conf < 0.62:
+    notes.extend(fidelity_notes)
+    if avg_conf < 0.62 or fidelity < 0.62:
         notes.append("Confidence is limited; recommend manual review before operationalizing interventions.")
     return notes
 
@@ -679,6 +866,7 @@ def _build_workspace_payload(
     source_excerpt: str | None,
     source_warning: str | None,
     agents: list[dict[str, Any]],
+    claim_diagnostics: dict[str, float | str],
 ) -> dict[str, Any]:
     total = len(agents)
     adopted = sum(1 for agent in agents if agent["belief_state"] == "adopted")
@@ -686,9 +874,20 @@ def _build_workspace_payload(
     neutral = total - adopted - rejected
     avg_load = sum(agent["tribe_neurological_metrics"]["cognitive_load"] for agent in agents) / max(1, total)
     avg_defense = sum(agent["tribe_neurological_metrics"]["defensive_activation"] for agent in agents) / max(1, total)
-    avg_confidence = sum(agent["k2_decision_confidence"] for agent in agents) / max(1, total)
-    spread_score = round(_clamp((0.58 * (adopted / max(1, total))) + (0.16 * avg_load) + (0.16 * avg_defense) + (0.10 * avg_confidence), 0.0, 1.0) * 100)
-    spread_risk = _risk_level(100 - spread_score)
+    raw_avg_confidence = sum(agent["k2_decision_confidence"] for agent in agents) / max(1, total)
+    fidelity_factor, _ = _model_fidelity_factor(source_excerpt)
+    avg_confidence = round(_clamp(raw_avg_confidence * (0.68 + fidelity_factor * 0.32), 0.18, 0.84), 3)
+    misinfo_risk_score = round(
+        _clamp(
+            (adopted / max(1, total)) * 0.55
+            + float(claim_diagnostics["harm"]) * 0.25
+            + (1.0 - float(claim_diagnostics["credibility"])) * 0.20,
+            0.0,
+            1.0,
+        )
+        * 100
+    )
+    spread_risk = "High" if misinfo_risk_score >= 70 else "Moderate" if misinfo_risk_score >= 40 else "Low"
     hotspots = _build_hotspots(city_id, agents)
     claims = _extract_claims(analysis_text)
     themes = _extract_themes(analysis_text)
@@ -724,16 +923,22 @@ def _build_workspace_payload(
     }
 
     spread_model = {
-        "risk_score": 100 - spread_score,
+        "risk_score": misinfo_risk_score,
         "spread_risk": spread_risk,
         "belief_adoption_rate": round(adopted / max(1, total) * 100),
+        "claim_rejection_rate": round(rejected / max(1, total) * 100),
+        "scientific_credibility": round(float(claim_diagnostics["credibility"]) * 100),
         "population_reached": round((adopted + rejected) / max(1, total) * 100),
         "avg_cognitive_load": round(avg_load, 3),
         "avg_defensive_activation": round(avg_defense, 3),
         "high_risk_segments": target_segments[:4],
         "belief_adoption_pathways": _build_belief_pathways(agents),
         "hotspots": hotspots,
-        "network_summary": f"{rejected} agents reject the corrective frame, {adopted} adopt it, and {neutral} remain neutral across the {city.label} simulation.",
+        "network_summary": f"{adopted} agents are likely to adopt the claim, {rejected} are likely to reject it, and {neutral} remain undecided across the {city.label} simulation.",
+        "core_story": (
+            f"Estimated scientific credibility is {round(float(claim_diagnostics['credibility']) * 100)}%, "
+            f"while modeled claim adoption is {round(adopted / max(1, total) * 100)}%."
+        ),
     }
 
     mechanisms = {
@@ -754,7 +959,7 @@ def _build_workspace_payload(
         "target_region": city.label,
         "spread_risk": spread_risk,
         "overall_confidence": round(avg_confidence, 3),
-        "key_finding": mechanism_summary,
+        "key_finding": f"{round(adopted / max(1, total) * 100)}% of the modeled population is likely to accept the claim despite a {round(float(claim_diagnostics['credibility']) * 100)}% credibility estimate. {mechanism_summary}",
         "recommended_next_step": intervention_playbook[0]["title"] if intervention_playbook else "Review the evidence trace and refine the input.",
     }
 
@@ -767,7 +972,7 @@ def _build_workspace_payload(
         "summary": {"total": total, "adopted": adopted, "rejected": rejected, "neutral": neutral},
         "agents": agents,
         "macro_result": {
-            "score": 100 - spread_score,
+            "score": misinfo_risk_score,
             "risk_level": spread_risk,
             "insights": [
                 {
@@ -824,6 +1029,8 @@ async def run_simulation_http(
     async with httpx.AsyncClient() as httpx_client:
         source_excerpt, source_warning = await _fetch_source_context(httpx_client, evidence.get("source_url"))
         analysis_text, _ = _build_analysis_text(evidence, source_excerpt)
+        case_features = _case_feature_vector(analysis_text, case_goal, domain, message_complexity)
+        claim_diagnostics = _claim_diagnostics(analysis_text, domain, source_excerpt)
         batch_agents = [{"id": agent.id, "role": agent.role, "latitude": agent.lat, "longitude": agent.lng} for agent in population]
         tribe_results = await call_tribe_modal_batch(httpx_client, analysis_text, batch_agents)
 
@@ -832,7 +1039,7 @@ async def run_simulation_http(
                 agent_id=agent.id,
                 latitude=agent.lat,
                 longitude=agent.lng,
-                bsv=_noise_bsv(
+                bsv=_apply_lfcm_calibration(
                     tribe_results.get(
                         str(agent.id),
                         {
@@ -842,8 +1049,10 @@ async def run_simulation_http(
                             "working_memory_strain": 0.5,
                         },
                     ),
-                    agent.id,
-                    message_complexity,
+                    agent=agent,
+                    city_id=city_id,
+                    case_features=case_features,
+                    message_complexity=message_complexity,
                 ),
             )
             for agent in population
@@ -874,6 +1083,7 @@ async def run_simulation_http(
                     total_neighbors=total_neighbors,
                     resonance=resonance,
                     regions=regions,
+                    claim_diagnostics=claim_diagnostics,
                     semaphore=semaphore,
                 )
             )
@@ -889,6 +1099,7 @@ async def run_simulation_http(
             source_excerpt=source_excerpt,
             source_warning=source_warning,
             agents=agents,
+            claim_diagnostics=claim_diagnostics,
         )
 
         payload.update(

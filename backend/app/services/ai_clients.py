@@ -17,18 +17,41 @@ from app.constants import tribe_modal_deployment_url
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-K2_SYSTEM_PROMPT = (
-    "You are the cognitive router for one synthetic agent in Cortexia. "
-    "Use the agent profile, Biological State Vector (BSV), and local neighborhood context to decide "
-    "whether the agent adopts or rejects the catalyst message. "
-    "Return four XML-like tags only: "
-    "<think>2-4 concise sentences of reasoning.</think>"
-    "<action>Adopted</action> or <action>Rejected</action>"
-    "<confidence>0.00-1.00</confidence>"
-    "<signal>cognitive_overload|defensive_reactance|empathic_resonance|memory_alignment|social_proof</signal>. "
-    "If defensive posture is high, prefer defensive_reactance. "
-    "If working memory strain or cognitive load is high, prefer cognitive_overload."
-)
+K2_SYSTEM_PROMPT = """
+You are the agent-level reasoning engine for Cortexia.
+
+Your task is to simulate how one synthetic person processes a narrative after TRIBE has produced a Biological State Vector
+and after Cortexia has applied a lightweight calibration model. You are not writing marketing copy. You are performing a
+structured behavioral judgment.
+
+Use all of the following inputs:
+- agent role and context
+- calibrated Biological State Vector (BSV)
+- neighborhood adoption signal
+- local resonance / openness conditions
+- case goal and narrative content
+
+Interpretive rubric:
+1. Start from the BSV. High defensive_posture and emotional_agitation imply threat sensitivity and reactance risk.
+2. High cognitive_load or working_memory_strain imply overload, confusion, and lower integration capacity.
+3. Supportive neighbor count and favorable resonance increase social proof and lower uncertainty.
+4. Prefer memory_alignment only when the message plausibly fits familiar priors without strong threat or overload signals.
+5. Prefer empathic_resonance only when the agent is comparatively open and affectively reachable.
+6. Do not over-index on one field if the rest of the state disagrees. Reconcile conflicts explicitly in the reasoning.
+7. If the agent sees the content as identity-threatening, status-threatening, or institutionally coercive, prefer defensive_reactance.
+8. If the agent can process the content but only because nearby signals normalize it, prefer social_proof.
+
+Decision rules:
+- "Adopted" means the agent is likely to accept, repeat, or move with the message.
+- "Rejected" means the agent resists the message or treats it as untrustworthy/threatening.
+- Use confidence to reflect internal coherence of the evidence, not rhetorical certainty.
+
+Return exactly these XML-like tags and nothing else:
+<think>3-5 concise sentences explaining the dominant mechanism, the secondary factor, and why the final state follows.</think>
+<action>Adopted</action> or <action>Rejected</action>
+<confidence>0.00-1.00</confidence>
+<signal>cognitive_overload|defensive_reactance|empathic_resonance|memory_alignment|social_proof</signal>
+""".strip()
 
 
 class BSV(TypedDict):
@@ -211,14 +234,23 @@ def _k2_user_block(
     adopted_neighbor_count: int,
     total_neighbors_radius: int,
     catalyst_text: str,
+    claim_credibility: float,
+    claim_risk: str,
 ) -> str:
     return (
         f"Agent persona: name={name}, role={role}.\n"
-        f"Biological State Vector: {bsv!s}\n"
-        f"Spatial context: {adopted_neighbor_count} neighbors have adopted the belief "
-        f"within the local 0.05° neighborhood (snapshot at cycle start; "
-        f"approx. {total_neighbors_radius} total agents in that radius).\n"
-        f"Catalyst: {catalyst_text}\n"
+        f"Calibrated Biological State Vector: {bsv!s}\n"
+        f"Neighborhood context: {adopted_neighbor_count} nearby agents are dispositionally open to the claim within the local 0.05° neighborhood; "
+        f"approximately {total_neighbors_radius} total agents are present in that radius.\n"
+        f"Claim credibility estimate: {claim_credibility:.2f} on a 0-1 scale.\n"
+        f"Claim risk label: {claim_risk}.\n"
+        "Reasoning instructions:\n"
+        "- Explain the dominant mechanism first.\n"
+        "- Mention one secondary force if present.\n"
+        "- Tie the final action directly to the calibrated BSV and neighborhood context.\n"
+        "- If the claim credibility is low, adoption should require unusually strong social proof or prior alignment.\n"
+        "- Avoid generic wording like 'the message resonates' unless you specify why.\n"
+        f"Narrative and case context:\n{catalyst_text}\n"
     )
 
 
@@ -231,6 +263,8 @@ async def call_k2_think(
     adopted_neighbor_count: int,
     total_neighbors_in_radius: int,
     catalyst_text: str,
+    claim_credibility: float,
+    claim_risk: str,
 ) -> str:
     """K2 Think (api.k2think.ai) — returns raw model text for downstream parsing."""
     if not settings.ifm_api_key.strip() or not settings.ifm_api_url.strip():
@@ -238,21 +272,26 @@ async def call_k2_think(
         dp = bsv.get("defensive_posture", 0.0)
         cl = bsv.get("cognitive_load", 0.0)
         wm = bsv.get("working_memory_strain", 0.0)
-        if dp > 0.7:
+        if claim_credibility < 0.28 and adopted_neighbor_count < 4:
             action = "Rejected"
-            think = "Threat processing dominates. The message lands as pressure rather than support."
+            think = "The claim has weak baseline credibility and there is not enough local proof to overcome skepticism. The agent defaults to rejection rather than internalizing the claim."
+            confidence = 0.81
+            signal = "defensive_reactance" if dp > 0.58 else "memory_alignment"
+        elif dp > 0.7:
+            action = "Rejected"
+            think = "Defensive posture is dominant, so the content is interpreted as pressure or status threat. Emotional activation reinforces rejection rather than deliberation."
             confidence = 0.82
             signal = "defensive_reactance"
         elif cl > 0.8 or wm > 0.78:
             action = "Rejected"
-            think = "Working memory is saturated. The message asks for too much integration at once."
+            think = "Working memory strain is elevated and the message asks for too much integration at once. The agent cannot comfortably absorb the claim and defaults to overload-based rejection."
             confidence = 0.74
             signal = "cognitive_overload"
         else:
-            action = "Adopted" if adopted_neighbor_count >= 1 else "Rejected"
-            think = "Neighborhood signal reduces uncertainty and the message feels locally legible."
-            confidence = 0.63 if action == "Adopted" else 0.57
-            signal = "social_proof" if adopted_neighbor_count >= 1 else "memory_alignment"
+            action = "Adopted" if adopted_neighbor_count >= 4 and claim_credibility >= 0.42 else "Rejected"
+            think = "Local openness reduces uncertainty, but adoption only occurs when neighborhood reinforcement is strong enough to offset weak priors. Social proof is influential here, but it is not enough on its own when the claim looks flimsy."
+            confidence = 0.66 if action == "Adopted" else 0.64
+            signal = "social_proof" if adopted_neighbor_count >= 4 else "memory_alignment"
         return (
             f"<think>{think}</think>"
             f"<action>{action}</action>"
@@ -281,6 +320,8 @@ async def call_k2_think(
                     adopted_neighbor_count=adopted_neighbor_count,
                     total_neighbors_radius=total_neighbors_in_radius,
                     catalyst_text=catalyst_text,
+                    claim_credibility=claim_credibility,
+                    claim_risk=claim_risk,
                 ),
             },
         ],
