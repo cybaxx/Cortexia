@@ -2,7 +2,6 @@
 
 Predictive **information epidemiology** workspace: stress-test a catalyst (message + evidence) against a **synthetic, geo-mapped population**, combining **TRIBE-style neural readouts** (BSV), **K2 reasoning**, and a **multi-round propagation** model.
 
-**Product and architecture reference:** [`docs/CORTEXIA_BLUEPRINT.md`](docs/CORTEXIA_BLUEPRINT.md).
 
 ---
 
