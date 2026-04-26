@@ -315,20 +315,20 @@
   }
 
   .status-tag-structured-extract {
-    background: hsl(var(--pastel-3) / 0.14);
-    color: hsl(var(--pastel-3));
-    border: 1px solid hsl(var(--pastel-3) / 0.32);
+    background: hsl(var(--pastel-1) / 0.12);
+    color: hsl(var(--pastel-1));
+    border: 1px solid hsl(var(--pastel-1) / 0.26);
   }
 
   .status-tag-synthesis {
-    background: hsl(var(--pastel-4) / 0.14);
-    color: hsl(var(--pastel-4));
-    border: 1px solid hsl(var(--pastel-4) / 0.32);
+    background: hsl(var(--pastel-1) / 0.1);
+    color: hsl(var(--pastel-1));
+    border: 1px solid hsl(var(--pastel-1) / 0.24);
   }
 
   .status-tag-operator-assisted {
-    background: hsl(var(--pastel-5) / 0.14);
-    color: hsl(var(--pastel-5));
-    border: 1px solid hsl(var(--pastel-5) / 0.32);
+    background: hsl(var(--pastel-1) / 0.1);
+    color: hsl(var(--pastel-1));
+    border: 1px solid hsl(var(--pastel-1) / 0.24);
   }
 }

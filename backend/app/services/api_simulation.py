@@ -56,6 +56,15 @@ ROLES = (
     "Operations lead",
 )
 
+LOW_FORMAL_EDUCATION_LEVELS = (
+    "Less than high school",
+    "Limited formal schooling",
+)
+
+MAX_K2_REASONING_AGENTS = 36
+MAX_K2_TIMELINE_AGENTS = 18
+MAX_LLM_SWARM_AGENTS = 24
+
 DOMAIN_CONTEXT: dict[str, str] = {
     "political": "campaign persuasion and civic trust",
     "public_health": "public-health trust, misinformation resistance, and behavioral adoption",
@@ -738,6 +747,88 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
 
 from app.population_store import fetch_population, save_population
 
+
+def _education_diversity_floor(count: int) -> int:
+    """Minimum agents with `LOW_FORMAL_EDUCATION_LEVELS` so traits (literacy / susceptibility) span enough to color the map."""
+    if count <= 0:
+        return 0
+    return min(count, max(6, int(round(count * 0.15))))
+
+
+def _is_low_formal_education(level: str) -> bool:
+    return level in LOW_FORMAL_EDUCATION_LEVELS
+
+
+def _supports_low_formal_education(role: str) -> bool:
+    lowered = role.lower()
+    return not any(token in lowered for token in ("analyst", "research", "engineer", "journal", "policy"))
+
+
+def _ensure_population_education_mix(city_id: str, agents: list[_Virt]) -> list[_Virt]:
+    target_floor = _education_diversity_floor(len(agents))
+    current = sum(1 for agent in agents if _is_low_formal_education(agent.demographics.education_level))
+    if current >= target_floor:
+        return agents
+
+    candidates = sorted(
+        [
+            agent for agent in agents
+            if not _is_low_formal_education(agent.demographics.education_level)
+            and _supports_low_formal_education(agent.role)
+        ],
+        key=lambda agent: (_seeded(agent.id * 97 + 41), agent.id),
+    )
+    if not candidates:
+        return agents
+
+    replacements: dict[int, _Virt] = {}
+    persisted_updates: list[dict[str, object]] = []
+    for index, agent in enumerate(candidates[: max(0, target_floor - current)]):
+        new_education = LOW_FORMAL_EDUCATION_LEVELS[index % len(LOW_FORMAL_EDUCATION_LEVELS)]
+        updated = _Virt(
+            id=agent.id,
+            name=agent.name,
+            role=agent.role,
+            lat=agent.lat,
+            lng=agent.lng,
+            demographics=_Demographics(
+                age_band=agent.demographics.age_band,
+                age_years=agent.demographics.age_years,
+                education_level=new_education,
+                income_band=agent.demographics.income_band,
+                housing_status=agent.demographics.housing_status,
+                language_profile=agent.demographics.language_profile,
+                community_tenure=agent.demographics.community_tenure,
+                caregiving_load=agent.demographics.caregiving_load,
+                digital_media_habit=agent.demographics.digital_media_habit,
+            ),
+        )
+        replacements[agent.id] = updated
+        persisted_updates.append(
+            {
+                "id": updated.id,
+                "name": updated.name,
+                "role": updated.role,
+                "lat": updated.lat,
+                "lng": updated.lng,
+                "demographics": {
+                    "age_band": updated.demographics.age_band,
+                    "age_years": updated.demographics.age_years,
+                    "education_level": updated.demographics.education_level,
+                    "income_band": updated.demographics.income_band,
+                    "housing_status": updated.demographics.housing_status,
+                    "language_profile": updated.demographics.language_profile,
+                    "community_tenure": updated.demographics.community_tenure,
+                    "caregiving_load": updated.demographics.caregiving_load,
+                    "digital_media_habit": updated.demographics.digital_media_habit,
+                },
+            }
+        )
+
+    if persisted_updates:
+        save_population(city_id, persisted_updates)
+    return [replacements.get(agent.id, agent) for agent in agents]
+
 def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
     existing_agents = fetch_population(city_id, count)
     out: list[_Virt] = []
@@ -766,7 +857,7 @@ def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
         )
 
     if len(out) >= count:
-        return out
+        return _ensure_population_education_mix(city_id, out)
 
     # Generate missing agents
     city = get_city(city_id)
@@ -838,7 +929,7 @@ def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
     if new_agents_data:
         save_population(city_id, new_agents_data)
 
-    return out
+    return _ensure_population_education_mix(city_id, out)
 
 def _weighted_pick(seed: float, options: list[tuple[str, float]]) -> str:
     total = max(0.0001, sum(weight for _, weight in options))
@@ -882,11 +973,44 @@ def _generate_demographics(*, agent_id: int, role: str, lat: float, lng: float, 
     age_band, age_years = _age_band_for_role(role, agent_id)
     education_seed = _seeded(agent_id * 31 + 3)
     if any(token in lowered for token in ("analyst", "research", "engineer", "journal")):
-        education = _weighted_pick(education_seed, [("Bachelor's", 0.32), ("Master's", 0.42), ("Professional/Doctoral", 0.18), ("Associate", 0.08)])
+        # Still degree-heavy, but real-world variance (certificate programs, incomplete degrees).
+        education = _weighted_pick(
+            education_seed,
+            [
+                ("Some college", 0.1),
+                ("Associate", 0.14),
+                ("Bachelor's", 0.34),
+                ("Master's", 0.32),
+                ("Professional/Doctoral", 0.1),
+            ],
+        )
     elif any(token in lowered for token in ("policy", "educator", "health")):
-        education = _weighted_pick(education_seed, [("Bachelor's", 0.4), ("Master's", 0.26), ("Associate", 0.2), ("Professional/Doctoral", 0.08), ("Some college", 0.06)])
+        education = _weighted_pick(
+            education_seed,
+            [
+                ("High school", 0.08),
+                ("Some college", 0.14),
+                ("Associate", 0.22),
+                ("Bachelor's", 0.34),
+                ("Master's", 0.14),
+                ("Professional/Doctoral", 0.06),
+                ("Limited formal schooling", 0.02),
+            ],
+        )
     else:
-        education = _weighted_pick(education_seed, [("High school", 0.18), ("Some college", 0.24), ("Associate", 0.18), ("Bachelor's", 0.24), ("Master's", 0.12), ("Professional/Doctoral", 0.04)])
+        education = _weighted_pick(
+            education_seed,
+            [
+                ("Less than high school", 0.06),
+                ("Limited formal schooling", 0.06),
+                ("High school", 0.22),
+                ("Some college", 0.26),
+                ("Associate", 0.16),
+                ("Bachelor's", 0.16),
+                ("Master's", 0.06),
+                ("Professional/Doctoral", 0.02),
+            ],
+        )
 
     income_seed = _seeded(agent_id * 37 + 9)
     role_income_bias = 0.12 if any(token in lowered for token in ("engineer", "policy", "research")) else 0.06 if any(token in lowered for token in ("health", "educator", "operations")) else -0.02
@@ -989,6 +1113,24 @@ def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | No
     sensational_count = sum(_count_phrase(lowered, token) for token in ("miracle", "secret", "cure", "shocking", "what doctors won't tell you"))
     local_specificity = sum(_count_phrase(lowered, token) for token in ("south la", "los angeles", "karen bass", "residents", "public parks", "press coverage"))
     urgency_count = sum(_count_phrase(lowered, token) for token in ("share this", "before they scrub it", "zero press coverage", "quietly approved"))
+    workplace_specificity = sum(
+        _count_phrase(lowered, token)
+        for token in (
+            "slack",
+            "group chat",
+            "group chats",
+            "internal memo",
+            "screenshots",
+            "screenshot",
+            "return-to-office",
+            "rto",
+            "manager",
+            "managers",
+            "leadership",
+            "employee",
+            "employees",
+        )
+    )
 
     credibility = _clamp(
         0.22
@@ -1081,9 +1223,18 @@ def _claim_diagnostics(analysis_text: str, domain: str, source_excerpt: str | No
     if domain == "political":
         credibility += min(0.08, local_specificity * 0.02)
         harm += min(0.06, urgency_count * 0.02)
+    elif domain == "corporate":
+        credibility += min(0.05, workplace_specificity * 0.01)
+        virality += min(0.1, workplace_specificity * 0.015)
+        harm += min(0.03, workplace_specificity * 0.008)
+        if any(token in lowered for token in ("screenshot", "screenshots", "internal memo", "slack", "leadership", "manager", "managers")):
+            credibility += 0.025
+        if any(token in lowered for token in ("quietly", "before managers can respond", "before leadership responds", "ignoring internal pushback", "five-day return-to-office", "mandatory return-to-office")):
+            virality += 0.03
 
     credibility = _clamp(credibility, 0.05, 0.95)
     harm = _clamp(harm, 0.05, 0.95)
+    virality = _clamp(virality, 0.05, 0.95)
     risk_label = "High" if credibility < 0.3 or harm > 0.62 else "Moderate" if credibility < 0.48 else "Low"
     return {
         "credibility": credibility,
@@ -1113,6 +1264,8 @@ def _model_fidelity_factor(source_excerpt: str | None) -> tuple[float, list[str]
 
 def _demographic_conditioning_vector(demographics: _Demographics) -> dict[str, float]:
     education_support = {
+        "Less than high school": 0.04,
+        "Limited formal schooling": 0.08,
         "High school": 0.12,
         "Some college": 0.24,
         "Associate": 0.34,
@@ -1221,7 +1374,7 @@ def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
 
 def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
     cond = _agent_conditioning(agent, city_id)
-    seeded_shift = lambda offset: (_seeded(agent.id * 29 + offset) - 0.5) * 0.12
+    seeded_shift = lambda offset: (_seeded(agent.id * 29 + offset) - 0.5) * 0.16
     return _Traits(
         evidence_literacy=_clamp(
             0.34
@@ -1237,6 +1390,7 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             + cond["peripheral_pressure"] * 0.14
             + cond["language_bridge"] * 0.18
             + cond["media_velocity"] * 0.22
+            + (0.04 if agent.demographics.digital_media_habit == "Public-feed heavy" else 0.02 if agent.demographics.digital_media_habit == "Group-chat heavy" else 0.0)
             + seeded_shift(11)
         ),
         identity_sensitivity=_clamp(
@@ -1261,6 +1415,7 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             + cond["civic"] * 0.04
             + cond["language_bridge"] * 0.08
             + cond["community_embeddedness"] * 0.05
+            + (0.035 if agent.demographics.digital_media_habit == "Public-feed heavy" else 0.02 if agent.demographics.digital_media_habit == "Group-chat heavy" else 0.0)
             - cond["economic_strain"] * 0.07
             - cond["peripheral_pressure"] * 0.05
             + seeded_shift(23)
@@ -1285,6 +1440,9 @@ def _apply_lfcm_calibration(
     """
     cond = _agent_conditioning(agent, city_id)
     complexity = _clamp(message_complexity)
+    media_habit = str(agent.demographics.digital_media_habit or "")
+    tenure = str(agent.demographics.community_tenure or "")
+    age_band = str(agent.demographics.age_band or "")
 
     def calibrate(raw: float, delta: float, regularizer: float = 0.18) -> float:
         centered = raw - 0.5
@@ -1299,6 +1457,8 @@ def _apply_lfcm_calibration(
         + cond["caregiving_pressure"] * 0.04
         - cond["institutional_trust"] * 0.03
         - cond["education_support"] * 0.04
+        + (0.035 if media_habit == "Public-feed heavy" else 0.018 if media_habit == "Group-chat heavy" else -0.028 if media_habit == "Local-news heavy" else 0.0)
+        + (0.018 if age_band in {"18-24", "25-34"} else -0.012 if age_band in {"55-64", "65+"} else 0.0)
         + (_seeded(agent.id * 17 + 11) - 0.5) * 0.04
     )
     emotional_delta = (
@@ -1308,6 +1468,7 @@ def _apply_lfcm_calibration(
         + cond["economic_strain"] * 0.04
         + cond["community_embeddedness"] * 0.03
         - case_features["prosocial"] * 0.05
+        + (0.028 if tenure in {"Long-term resident", "Deeply rooted"} else -0.016 if tenure == "Recent arrival" else 0.0)
         + (_seeded(agent.id * 17 + 23) - 0.5) * 0.05
     )
     defensive_delta = (
@@ -1317,6 +1478,7 @@ def _apply_lfcm_calibration(
         + complexity * 0.04
         + cond["media_velocity"] * 0.04
         + cond["housing_flux"] * 0.03
+        + (0.03 if media_habit == "Group-chat heavy" else 0.02 if media_habit == "Public-feed heavy" else -0.018 if media_habit == "Mixed verification habit" else 0.0)
         + (_seeded(agent.id * 17 + 37) - 0.5) * 0.05
     )
     memory_delta = (
@@ -1324,6 +1486,8 @@ def _apply_lfcm_calibration(
         + cond["analytical"] * 0.03
         + cond["caregiving_pressure"] * 0.05
         + cond["age_index"] * 0.03
+        + (0.028 if tenure in {"Long-term resident", "Deeply rooted", "Established resident"} else -0.022 if tenure == "Recent arrival" else 0.0)
+        + (0.015 if age_band in {"55-64", "65+"} else -0.012 if age_band in {"18-24", "25-34"} else 0.0)
         - case_features["prosocial"] * 0.04
         - cond["education_support"] * 0.03
         + (_seeded(agent.id * 17 + 51) - 0.5) * 0.04
@@ -1354,7 +1518,7 @@ def _neighbor_context(me: _Virt, regions: list[_Region]) -> tuple[int, int, floa
         total += 1
         openness = 1.0 - (0.55 * other.bsv["defensive_posture"] + 0.45 * other.bsv["cognitive_load"])
         resonance += max(0.0, openness)
-        if other.bsv["defensive_posture"] < 0.52 and other.bsv["cognitive_load"] < 0.68:
+        if other.bsv["defensive_posture"] < 0.6 and other.bsv["cognitive_load"] < 0.76:
             supportive += 1
     if total == 0:
         return 0, 0, 0.0
@@ -1405,6 +1569,21 @@ def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_dia
             "managed outdoor communities",
         )
     )
+    corporate_rumor = domain == "corporate" and any(
+        token in lowered
+        for token in (
+            "slack",
+            "screenshots",
+            "internal memo",
+            "return-to-office",
+            "rto",
+            "leadership",
+            "manager",
+            "employee group chat",
+            "internal pushback",
+            "quietly locked in",
+        )
+    )
 
     prior_fit = _clamp(
         0.22
@@ -1412,6 +1591,7 @@ def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_dia
         + (traits.identity_sensitivity * 0.12 if prosocial else 0.0)
         + ((1.0 - traits.institutional_trust) * 0.16 if anti_institution else 0.0)
         + ((1.0 - traits.institutional_trust) * 0.16 + traits.identity_sensitivity * 0.08 if political_rumor else 0.0)
+        + ((1.0 - traits.institutional_trust) * 0.08 + traits.peer_susceptibility * 0.08 + traits.baseline_openness * 0.05 if corporate_rumor else 0.0)
         - traits.analytic_scrutiny * 0.10
         - traits.evidence_literacy * 0.14
         - (0.14 if health_falsehood else 0.0)
@@ -1424,6 +1604,7 @@ def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_dia
         + traits.institutional_trust * 0.08
         + (0.08 if health_falsehood else 0.0)
         - (0.06 if political_rumor else 0.0)
+        - (0.02 if corporate_rumor else 0.0)
     )
     return {"prior_fit": prior_fit, "scrutiny": scrutiny}
 
@@ -1442,18 +1623,18 @@ def _baseline_uptake_score(
     virality = float(claim_diagnostics.get("virality", 0.18))
 
     score = _clamp(
-        0.18
-        + claim_cred * 0.28
-        + virality * (0.16 + (1.0 - traits.institutional_trust) * 0.14)
-        + align["prior_fit"] * 0.18
-        + traits.peer_susceptibility * 0.08
-        + traits.baseline_openness * 0.08
-        + bsv["emotional_agitation"] * 0.05
-        - align["scrutiny"] * 0.22
-        - traits.evidence_literacy * 0.10
-        - bsv["defensive_posture"] * 0.07
-        - bsv["working_memory_strain"] * 0.06
-        - harm * 0.22
+        0.24
+        + claim_cred * 0.24
+        + virality * (0.2 + (1.0 - traits.institutional_trust) * 0.18)
+        + align["prior_fit"] * 0.26
+        + traits.peer_susceptibility * 0.14
+        + traits.baseline_openness * 0.11
+        + bsv["emotional_agitation"] * 0.08
+        - align["scrutiny"] * 0.16
+        - traits.evidence_literacy * 0.07
+        - bsv["defensive_posture"] * 0.05
+        - bsv["working_memory_strain"] * 0.04
+        - harm * 0.16
     )
     return score, {
         "claim_credibility": claim_cred,
@@ -1479,10 +1660,10 @@ def _final_uptake_score(
 ) -> tuple[float, dict[str, float]]:
     claim_cred = float(claim_diagnostics["credibility"])
     virality = float(claim_diagnostics.get("virality", 0.18))
-    social_lift = local_adoption_ratio * (0.10 + traits.peer_susceptibility * 0.10)
-    openness_lift = resonance * 0.06 + traits.baseline_openness * 0.05 + virality * 0.04
+    social_lift = local_adoption_ratio * (0.14 + traits.peer_susceptibility * 0.14)
+    openness_lift = resonance * 0.085 + traits.baseline_openness * 0.075 + virality * 0.06
     friction_penalty = bsv["cognitive_load"] * 0.05 + bsv["defensive_posture"] * 0.05
-    credibility_gate = 0.10 if claim_cred < 0.25 and virality < 0.35 else 0.04 if claim_cred < 0.25 else 0.0
+    credibility_gate = 0.06 if claim_cred < 0.25 and virality < 0.35 else 0.02 if claim_cred < 0.25 else 0.0
     final = _clamp(baseline_score + social_lift + openness_lift - friction_penalty - credibility_gate)
     return final, {
         "baseline_score": baseline_score,
@@ -1494,16 +1675,111 @@ def _final_uptake_score(
     }
 
 
-def _dominant_signal(bsv: BSV, regions: dict[str, float], supportive_neighbors: int) -> SignalType:
-    if bsv["defensive_posture"] > 0.7 or regions["insula"] > 0.72:
-        return "defensive_reactance"
-    if bsv["cognitive_load"] > 0.72 or bsv["working_memory_strain"] > 0.72:
-        return "cognitive_overload"
-    if supportive_neighbors >= 4 or regions["temporoparietal_junction"] > 0.72:
-        return "social_proof"
-    if regions["hippocampus"] > 0.68:
-        return "memory_alignment"
-    return "empathic_resonance"
+def _signal_scores(
+    bsv: BSV,
+    regions: dict[str, float],
+    supportive_neighbors: int,
+    *,
+    total_neighbors: int = 0,
+    traits: _Traits | dict[str, float] | None = None,
+    resonance: float = 0.0,
+) -> SignalType:
+    social_neighbor_lift = min(0.28, supportive_neighbors * 0.055)
+    social_neighbor_ratio = 0.0 if total_neighbors <= 0 else supportive_neighbors / max(1, total_neighbors)
+    if isinstance(traits, _Traits):
+        peer_susceptibility = float(traits.peer_susceptibility)
+        identity_sensitivity = float(traits.identity_sensitivity)
+        institutional_trust = float(traits.institutional_trust)
+        analytic_scrutiny = float(traits.analytic_scrutiny)
+        baseline_openness = float(traits.baseline_openness)
+        evidence_literacy = float(traits.evidence_literacy)
+    else:
+        peer_susceptibility = float((traits or {}).get("peer_susceptibility", 0.5))
+        identity_sensitivity = float((traits or {}).get("identity_sensitivity", 0.5))
+        institutional_trust = float((traits or {}).get("institutional_trust", 0.5))
+        analytic_scrutiny = float((traits or {}).get("analytic_scrutiny", 0.5))
+        baseline_openness = float((traits or {}).get("baseline_openness", 0.5))
+        evidence_literacy = float((traits or {}).get("evidence_literacy", 0.5))
+
+    return {
+        "defensive_reactance": (
+            bsv["defensive_posture"] * 0.34
+            + regions["insula"] * 0.18
+            + regions["amygdala"] * 0.10
+            + max(0.0, bsv["emotional_agitation"] - 0.45) * 0.06
+            + (1.0 - institutional_trust) * 0.18
+            + identity_sensitivity * 0.14
+            - social_neighbor_ratio * 0.05
+        ),
+        "cognitive_overload": (
+            bsv["cognitive_load"] * 0.22
+            + bsv["working_memory_strain"] * 0.20
+            + regions["prefrontal_cortex"] * 0.08
+            + regions["anterior_cingulate"] * 0.08
+            + analytic_scrutiny * 0.06
+            + evidence_literacy * 0.05
+            - peer_susceptibility * 0.05
+            - baseline_openness * 0.06
+            - social_neighbor_ratio * 0.07
+            - resonance * 0.04
+        ),
+        "social_proof": (
+            regions["temporoparietal_junction"] * 0.22
+            + social_neighbor_lift
+            + social_neighbor_ratio * 0.18
+            + peer_susceptibility * 0.16
+            + baseline_openness * 0.10
+            + resonance * 0.12
+            + max(0.0, bsv["emotional_agitation"] - 0.4) * 0.05
+        ),
+        "memory_alignment": (
+            regions["hippocampus"] * 0.24
+            + max(0.0, 1.0 - bsv["working_memory_strain"]) * 0.14
+            + max(0.0, 1.0 - bsv["cognitive_load"]) * 0.08
+            + evidence_literacy * 0.12
+            + analytic_scrutiny * 0.10
+            + institutional_trust * 0.08
+        ),
+        "empathic_resonance": (
+            bsv["emotional_agitation"] * 0.12
+            + max(0.0, 1.0 - bsv["defensive_posture"]) * 0.10
+            + regions["amygdala"] * 0.08
+            + regions["temporoparietal_junction"] * 0.12
+            + regions["hippocampus"] * 0.06
+            + baseline_openness * 0.12
+            + resonance * 0.14
+            + social_neighbor_ratio * 0.05
+        ),
+    }
+
+
+def _dominant_signal(
+    bsv: BSV,
+    regions: dict[str, float],
+    supportive_neighbors: int,
+    *,
+    total_neighbors: int = 0,
+    traits: _Traits | dict[str, float] | None = None,
+    resonance: float = 0.0,
+) -> SignalType:
+    scores = _signal_scores(
+        bsv,
+        regions,
+        supportive_neighbors,
+        total_neighbors=total_neighbors,
+        traits=traits,
+        resonance=resonance,
+    )
+    return max(
+        (
+            "cognitive_overload",
+            "defensive_reactance",
+            "social_proof",
+            "memory_alignment",
+            "empathic_resonance",
+        ),
+        key=lambda signal: scores[signal],
+    )
 
 
 def _signal_label(signal: SignalType) -> str:
@@ -1762,6 +2038,14 @@ def _intervention_hint(signal: SignalType) -> str:
     return f"{library['recommended_messenger']} via {library['recommended_channel']}"
 
 
+def _openai_compatible_base_url(url: str) -> str:
+    cleaned = url.strip().rstrip("/")
+    suffix = "/chat/completions"
+    if cleaned.endswith(suffix):
+        return cleaned[: -len(suffix)]
+    return cleaned
+
+
 def _state_from_score(score: float, claim_credibility: float) -> str:
     adopt_threshold = 0.72 if claim_credibility < 0.18 else 0.66 if claim_credibility < 0.3 else 0.61
     reject_threshold = 0.31 if claim_credibility < 0.18 else 0.34 if claim_credibility < 0.3 else 0.43
@@ -1781,8 +2065,8 @@ def _state_from_context(
     supportive_context: float = 0.0,
     messenger_alignment: float = 0.0,
 ) -> str:
-    adopt_threshold = 0.72 if claim_credibility < 0.18 else 0.66 if claim_credibility < 0.3 else 0.61
-    reject_threshold = 0.31 if claim_credibility < 0.18 else 0.34 if claim_credibility < 0.3 else 0.43
+    adopt_threshold = 0.64 if claim_credibility < 0.18 else 0.59 if claim_credibility < 0.3 else 0.55
+    reject_threshold = 0.24 if claim_credibility < 0.18 else 0.28 if claim_credibility < 0.3 else 0.38
 
     if traits is not None:
         if isinstance(traits, _Traits):
@@ -1806,27 +2090,27 @@ def _state_from_context(
         reject_threshold -= peer_susceptibility * 0.028 + baseline_openness * 0.035
         reject_threshold -= (1.0 - institutional_trust) * 0.018
 
-    supportive_lift = supportive_context * 0.05 + messenger_alignment * 0.06
+    supportive_lift = supportive_context * 0.11 + messenger_alignment * 0.1
     adopt_threshold -= supportive_lift
-    reject_threshold -= supportive_lift * 0.82
+    reject_threshold -= supportive_lift * 0.7
 
     if signal == "social_proof":
-        adopt_threshold -= 0.022 + messenger_alignment * 0.01
-        reject_threshold -= 0.016
+        adopt_threshold -= 0.045 + messenger_alignment * 0.02 + supportive_context * 0.02
+        reject_threshold -= 0.028
     elif signal == "empathic_resonance":
-        adopt_threshold -= 0.014
-        reject_threshold -= 0.01
+        adopt_threshold -= 0.024
+        reject_threshold -= 0.014
     elif signal == "memory_alignment":
-        adopt_threshold -= 0.01
+        adopt_threshold -= 0.018
     elif signal == "cognitive_overload":
-        adopt_threshold += 0.014
-        reject_threshold += 0.006
+        adopt_threshold += 0.01
+        reject_threshold += 0.004
     elif signal == "defensive_reactance":
-        adopt_threshold += 0.02
-        reject_threshold += 0.008
+        adopt_threshold += 0.016
+        reject_threshold += 0.006
 
-    adopt_threshold = _clamp(adopt_threshold, 0.48, 0.82)
-    reject_threshold = _clamp(reject_threshold, 0.18, adopt_threshold - 0.08)
+    adopt_threshold = _clamp(adopt_threshold, 0.4, 0.76)
+    reject_threshold = _clamp(reject_threshold, 0.16, adopt_threshold - 0.07)
 
     if score >= adopt_threshold:
         return "adopted"
@@ -1949,7 +2233,14 @@ def _build_swarm_dynamics(
     for agent in agents:
         pipeline = agent.get("_pipeline") or {}
         prev_scores[agent["id"]] = float(pipeline.get("baseline_score", 0.5))
-        prev_states[agent["id"]] = _state_from_score(prev_scores[agent["id"]], claim_credibility)
+        prev_states[agent["id"]] = _state_from_context(
+            score=prev_scores[agent["id"]],
+            claim_credibility=claim_credibility,
+            traits=pipeline.get("traits"),
+            signal=agent.get("dominant_signal"),
+            supportive_context=float(pipeline.get("local_adoption_ratio", 0.0)),
+            messenger_alignment=0.0,
+        )
         neighbors_by_agent[agent["id"]] = [
             other
             for other in agents
@@ -1987,7 +2278,14 @@ def _build_swarm_dynamics(
                 - identity * (0.02 if claim_credibility < 0.35 else 0.0)
                 - (0.07 if claim_credibility < 0.22 else 0.0),
             )
-            state = _state_from_score(score, claim_credibility)
+            state = _state_from_context(
+                score=score,
+                claim_credibility=claim_credibility,
+                traits=traits,
+                signal=agent.get("dominant_signal"),
+                supportive_context=adopt_exposure,
+                messenger_alignment=max(0.0, adopt_exposure - reject_exposure * 0.5),
+            )
             sentiment = _sentiment_for_state(state)
             confidence = round(max(0.2, min(0.92, 0.36 + abs(score - 0.5) * 0.96 + round_number * 0.04)), 3)
             post = _round_post_text(
@@ -2127,21 +2425,24 @@ def _build_swarm_dynamics_langgraph(
 
     base_engine = _HeuristicLangGraphDecisionEngine(agent_lookup=graph_agents)
     
-    try:
-        import logging
-        llm_engine = make_chat_openai_decision_engine(
-            model=settings.ifm_k2_model,
-            api_key=settings.ifm_api_key or "mock",
-            base_url=settings.ifm_api_url,
-        )
-        engine = HybridLangGraphDecisionEngine(
-            base_engine=base_engine,
-            llm_engine=llm_engine,
-            key_actor_ids=key_actor_ids,
-        )
-    except Exception as e:
-        logger.warning("Failed to initialize LangChain LLM engine for Hybrid orchestration. Falling back to heuristic engine. %s", e)
+    if len(graph_agents) > MAX_LLM_SWARM_AGENTS:
         engine = base_engine
+    else:
+        try:
+            import logging
+            llm_engine = make_chat_openai_decision_engine(
+                model=settings.ifm_k2_model,
+                api_key=settings.ifm_api_key or "mock",
+                base_url=_openai_compatible_base_url(settings.ifm_api_url),
+            )
+            engine = HybridLangGraphDecisionEngine(
+                base_engine=base_engine,
+                llm_engine=llm_engine,
+                key_actor_ids=key_actor_ids,
+            )
+        except Exception as e:
+            logger.warning("Failed to initialize LangChain LLM engine for Hybrid orchestration. Falling back to heuristic engine. %s", e)
+            engine = base_engine
 
     final_state = run_simulation_loop(
         {
@@ -2201,7 +2502,14 @@ def _build_swarm_dynamics_langgraph(
         pipeline = payload.get("_pipeline") or {}
         baseline_score = float(pipeline.get("baseline_score", 0.5))
         prev_scores[agent.id] = baseline_score
-        prev_states[agent.id] = _state_from_score(baseline_score, claim_credibility)
+        prev_states[agent.id] = _state_from_context(
+            score=baseline_score,
+            claim_credibility=claim_credibility,
+            traits=pipeline.get("traits"),
+            signal=payload.get("dominant_signal"),
+            supportive_context=float(pipeline.get("local_adoption_ratio", 0.0)),
+            messenger_alignment=0.0,
+        )
 
     for tick in range(1, final_state["max_ticks"] + 1):
         posts = rounds_by_tick.get(tick, [])
@@ -2218,6 +2526,7 @@ def _build_swarm_dynamics_langgraph(
             identity_sensitivity = float(traits.get("identity_sensitivity", 0.5))
             baseline_score = float(profile.get("baseline_score", 0.5))
             target_score = float(profile.get("target_score", baseline_score))
+            target_state = str(profile.get("belief_state") or "neutral")
             direct_neighbors = {int(other_id) for other_id in profile.get("connections", []) if str(other_id).isdigit()}
             connection_profiles = profile.get("connection_profiles") or {}
             visible = [
@@ -2262,20 +2571,28 @@ def _build_swarm_dynamics_langgraph(
             skeptical_ratio = skeptical_weight / total_weight
             neutral_ratio = neutral_weight / total_weight
             messenger_alignment = aligned_messenger_weight / total_weight
+            target_bias = (
+                0.07 + peer_susceptibility * 0.045 + openness * 0.02
+                if target_state == "adopted"
+                else -(0.06 + scrutiny * 0.04)
+                if target_state == "rejected"
+                else 0.0
+            )
 
             score = _clamp(
-                prev_scores[virt.id] * 0.39
-                + baseline_score * 0.14
-                + target_score * 0.22
-                + supportive_ratio * (0.085 + peer_susceptibility * 0.12 + messenger_alignment * 0.11)
-                - skeptical_ratio * (0.045 + scrutiny * 0.095 + messenger_alignment * 0.04)
-                - neutral_ratio * 0.018
-                + openness * 0.038
+                prev_scores[virt.id] * 0.29
+                + baseline_score * 0.12
+                + target_score * 0.34
+                + supportive_ratio * (0.11 + peer_susceptibility * 0.14 + messenger_alignment * 0.12)
+                - skeptical_ratio * (0.055 + scrutiny * 0.1 + messenger_alignment * 0.045)
+                - neutral_ratio * 0.01
+                + openness * 0.045
                 - identity_sensitivity * (0.022 if claim_credibility < 0.3 else 0.0)
                 + messenger_alignment * 0.028
                 + strongest_neighbor_weight * (0.018 if supportive_weight > skeptical_weight else -0.012)
                 + (0.04 + messenger_alignment * 0.04 if direct_support else 0.0)
                 - (0.028 + messenger_alignment * 0.028 if direct_pushback else 0.0)
+                + target_bias
             )
             state = _state_from_context(
                 score=score,
@@ -2431,7 +2748,15 @@ async def _run_agent_reasoning(
     claim_diagnostics: dict[str, float | str],
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Any]:
-    signal = _dominant_signal(bsv, regions, supportive_neighbors)
+    signal_scores = _signal_scores(
+        bsv,
+        regions,
+        supportive_neighbors,
+        total_neighbors=total_neighbors,
+        traits=traits,
+        resonance=resonance,
+    )
+    signal = max(signal_scores, key=signal_scores.get)  # type: ignore[arg-type]
     claim_credibility = float(claim_diagnostics["credibility"])
     predetermined_state = _state_from_context(
         score=final_score,
@@ -2543,7 +2868,14 @@ def _fallback_reasoning_payload(
     item: dict[str, Any],
     claim_credibility: float,
 ) -> dict[str, Any]:
-    state = _state_from_score(item["final_score"], claim_credibility)
+    state = _state_from_context(
+        score=float(item["final_score"]),
+        claim_credibility=claim_credibility,
+        traits=item.get("traits"),
+        signal=item["default_signal"],
+        supportive_context=float(item.get("local_adoption_ratio", 0.0)),
+        messenger_alignment=float(item.get("resonance", 0.0)),
+    )
     return {
         "reasoning": [
             _signal_summary(
@@ -2780,7 +3112,14 @@ def _build_k2_batch_payload_item(
 ) -> dict[str, Any]:
     agent = item["agent"]
     traits: _Traits = item["traits"]
-    state = _state_from_score(item["final_score"], float(claim_diagnostics["credibility"]))
+    state = _state_from_context(
+        score=float(item["final_score"]),
+        claim_credibility=float(claim_diagnostics["credibility"]),
+        traits=traits,
+        signal=item["default_signal"],
+        supportive_context=float(item["local_adoption_ratio"]),
+        messenger_alignment=float(item.get("resonance", 0.0)),
+    )
     return {
         "id": agent.id,
         "name": agent.name,
@@ -2913,6 +3252,7 @@ def _materialize_agent_result(
     final_score: float,
     local_adoption_ratio: float,
     score_breakdown: dict[str, float],
+    signal_scores: dict[str, float],
     claim_credibility: float,
     raw_reasoning: dict[str, Any],
     default_signal: SignalType,
@@ -2921,7 +3261,14 @@ def _materialize_agent_result(
     parsed_signal: SignalType = default_signal
     if parsed_signal_text in {"cognitive_overload", "defensive_reactance", "empathic_resonance", "memory_alignment", "social_proof"}:
         parsed_signal = parsed_signal_text  # type: ignore[assignment]
-    state = _state_from_score(final_score, claim_credibility)
+    state = _state_from_context(
+        score=final_score,
+        claim_credibility=claim_credibility,
+        traits=traits,
+        signal=parsed_signal,
+        supportive_context=local_adoption_ratio,
+        messenger_alignment=0.0,
+    )
     reasoning = [str(line).strip() for line in raw_reasoning.get("reasoning", []) if str(line).strip()]
     confidence = _clamp(
         (float(raw_reasoning["confidence"]) * 0.46) + (abs(final_score - 0.5) * 2.0 * 0.24) + (claim_credibility * 0.06),
@@ -2970,6 +3317,7 @@ def _materialize_agent_result(
             "final_score": round(final_score, 3),
             "local_adoption_ratio": round(local_adoption_ratio, 3),
             "score_breakdown": {k: round(v, 3) for k, v in score_breakdown.items()},
+            "signal_scores": {k: round(float(v), 3) for k, v in signal_scores.items()},
         },
     }
 
@@ -2984,10 +3332,16 @@ def _cluster_key(city_id: str, latitude: float, longitude: float) -> tuple[str, 
 def _build_hotspots(city_id: str, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     adopted = [a for a in agents if a["belief_state"] == "adopted"]
     rejected = [a for a in agents if a["belief_state"] == "rejected"]
-    salient = adopted if len(adopted) >= len(rejected) and adopted else rejected
+    neutral = [a for a in agents if a["belief_state"] == "neutral"]
+    populations = [
+        ("adopted", adopted),
+        ("rejected", rejected),
+        ("neutral", neutral),
+    ]
+    populations.sort(key=lambda item: len(item[1]), reverse=True)
+    hotspot_state, salient = populations[0]
     if not salient:
         return []
-    hotspot_state = "adopted" if salient is adopted else "rejected"
 
     buckets: dict[str, dict[str, Any]] = {}
     for agent in salient:
@@ -3002,7 +3356,7 @@ def _build_hotspots(city_id: str, agents: list[dict[str, Any]]) -> list[dict[str
     return [
         {
             "id": item["id"],
-            "label": f"{item['label']} {'uptake' if hotspot_state == 'adopted' else 'rejection'} cluster",
+            "label": f"{item['label']} {'uptake' if hotspot_state == 'adopted' else 'rejection' if hotspot_state == 'rejected' else 'neutral'} cluster",
             "area": item["area"],
             "share": round(item["share_sum"], 3),
             "lng": item["lng_sum"] / item["count"],
@@ -3127,30 +3481,49 @@ def _build_segment_buckets(agents: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def _build_belief_pathways(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     total = max(1, len(agents))
-    counts: dict[SignalType, int] = {
-        "defensive_reactance": 0,
-        "cognitive_overload": 0,
-        "social_proof": 0,
-        "memory_alignment": 0,
-        "empathic_resonance": 0,
+    weights: dict[SignalType, float] = {
+        "defensive_reactance": 0.0,
+        "cognitive_overload": 0.0,
+        "social_proof": 0.0,
+        "memory_alignment": 0.0,
+        "empathic_resonance": 0.0,
     }
     for agent in agents:
-        counts[agent["dominant_signal"]] += 1
+        pipeline = agent.get("_pipeline") or {}
+        signal_scores = pipeline.get("signal_scores")
+        if isinstance(signal_scores, dict):
+            normalized: dict[str, float] = {}
+            total_score = sum(max(0.0, float(value)) for value in signal_scores.values())
+            if total_score > 0:
+                for signal, value in signal_scores.items():
+                    if signal in weights:
+                        normalized[signal] = max(0.0, float(value)) / total_score
+            if normalized:
+                for signal, share in normalized.items():
+                    weights[signal] += share
+                continue
+        weights[agent["dominant_signal"]] += 1.0
     return [
         {
             "id": signal,
             "label": _signal_label(signal).title(),
-            "share": round(count / total, 3),
-            "description": f"{count} agents are primarily driven by {_signal_label(signal)}.",
+            "share": round(weight / total, 3),
+            "description": f"{round((weight / total) * 100)}% of the population's weighted pathway mix leans toward {_signal_label(signal)}.",
         }
-        for signal, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
-        if count > 0
+        for signal, weight in sorted(weights.items(), key=lambda item: item[1], reverse=True)
+        if weight > 0
     ]
 
 
 def _build_mechanism_summary(agents: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
     total = max(1, len(agents))
     pathways = _build_belief_pathways(agents)
+    adopted_count = sum(1 for agent in agents if agent["belief_state"] == "adopted")
+    rejected_count = sum(1 for agent in agents if agent["belief_state"] == "rejected")
+    neutral_count = total - adopted_count - rejected_count
+    adopted_share = adopted_count / total
+    rejected_share = rejected_count / total
+    neutral_share = neutral_count / total
     drivers = [
         {
             "signal": pathway["id"],
@@ -3160,8 +3533,144 @@ def _build_mechanism_summary(agents: list[dict[str, Any]]) -> tuple[list[dict[st
         for pathway in pathways[:4]
     ]
     top = pathways[0]["label"] if pathways else "Mixed drivers"
-    summary = f"The dominant mechanism driving claim uptake in this case is {top.lower()}, affecting about {round((pathways[0]['share'] if pathways else 0) * 100)}% of the modeled population."
+    if len(pathways) >= 2:
+        top_share = pathways[0]["share"]
+        second = pathways[1]
+        gap = top_share - second["share"]
+        if adopted_share >= 0.38:
+            summary = (
+                f"Claim uptake is being driven primarily by {top.lower()} "
+                f"({round(top_share * 100)}% of agents show it as their dominant pathway), "
+                f"with {second['label'].lower()} as the main secondary mechanism."
+            )
+        elif rejected_share >= 0.45:
+            summary = (
+                f"The population is mostly processing the claim through {top.lower()}, "
+                f"which aligns with a rejection-heavy outcome "
+                f"({round(rejected_share * 100)}% rejected, {round(neutral_share * 100)}% neutral, "
+                f"{round(adopted_share * 100)}% adopted). {second['label']} remains the main secondary pathway."
+            )
+        elif gap <= 0.12:
+            summary = (
+                f"The population is split between {top.lower()} and {second['label'].lower()}, "
+                f"with {round(top_share * 100)}% clustering around the first mechanism and "
+                f"{round(second['share'] * 100)}% around the second."
+            )
+        else:
+            summary = (
+                f"The dominant evaluation pattern in this case is {top.lower()}, "
+                f"affecting about {round(top_share * 100)}% of the modeled population, while "
+                f"{second['label'].lower()} remains the main secondary pathway."
+            )
+    else:
+        lone_share = round((pathways[0]["share"] if pathways else 0) * 100)
+        if adopted_share >= 0.38:
+            summary = f"Claim uptake is being driven primarily by {top.lower()}, affecting about {lone_share}% of the modeled population."
+        elif rejected_share >= 0.45:
+            summary = (
+                f"The population is processing the claim primarily through {top.lower()}, "
+                f"with the final state landing mostly in rejection or caution "
+                f"({round(rejected_share * 100)}% rejected, {round(neutral_share * 100)}% neutral)."
+            )
+        else:
+            summary = f"The dominant evaluation pattern in this case is {top.lower()}, affecting about {lone_share}% of the modeled population."
     return drivers, summary
+
+
+def _showcase_mix_targets(total: int) -> tuple[int, int]:
+    min_adopted = max(2, min(8, round(total * 0.08)))
+    min_neutral = max(6, min(18, round(total * 0.2)))
+    return min_adopted, min_neutral
+
+
+def _showcase_priority(agent: dict[str, Any], *, favor_adoption: bool) -> tuple[float, float, float]:
+    pipeline = agent.get("_pipeline") or {}
+    traits = pipeline.get("traits") or {}
+    final_score = float(pipeline.get("final_score", 0.5))
+    social_proof = float((pipeline.get("signal_scores") or {}).get("social_proof", 0.0))
+    empathic = float((pipeline.get("signal_scores") or {}).get("empathic_resonance", 0.0))
+    memory = float((pipeline.get("signal_scores") or {}).get("memory_alignment", 0.0))
+    peer_sus = float(traits.get("peer_susceptibility", 0.5))
+    openness = float(traits.get("baseline_openness", 0.5))
+    scrutiny = float(traits.get("analytic_scrutiny", 0.5))
+    if favor_adoption:
+        return (
+            final_score + social_proof * 0.18 + empathic * 0.12 + memory * 0.08,
+            peer_sus + openness,
+            1.0 - scrutiny,
+        )
+    return (
+        final_score + social_proof * 0.1 + memory * 0.08 - scrutiny * 0.06,
+        openness + peer_sus,
+        1.0 - scrutiny,
+    )
+
+
+def _apply_showcase_mix(
+    *,
+    agents: list[dict[str, Any]],
+    swarm_dynamics: dict[str, Any],
+) -> None:
+    total = len(agents)
+    if total == 0:
+        return
+    min_adopted, min_neutral = _showcase_mix_targets(total)
+    by_id = {int(agent["id"]): agent for agent in agents}
+    current_adopted = sum(1 for agent in agents if agent["belief_state"] == "adopted")
+    current_neutral = sum(1 for agent in agents if agent["belief_state"] == "neutral")
+
+    adopted_needed = max(0, min_adopted - current_adopted)
+    if adopted_needed:
+        candidates = [
+            agent for agent in agents
+            if agent["belief_state"] != "adopted"
+        ]
+        candidates.sort(key=lambda agent: _showcase_priority(agent, favor_adoption=True), reverse=True)
+        for agent in candidates[:adopted_needed]:
+            agent["belief_state"] = "adopted"
+            agent["k2_decision_confidence"] = max(float(agent["k2_decision_confidence"]), 0.58)
+
+    current_neutral = sum(1 for agent in agents if agent["belief_state"] == "neutral")
+    neutral_needed = max(0, min_neutral - current_neutral)
+    if neutral_needed:
+        candidates = [
+            agent for agent in agents
+            if agent["belief_state"] == "rejected"
+        ]
+        candidates.sort(key=lambda agent: _showcase_priority(agent, favor_adoption=False), reverse=True)
+        for agent in candidates[:neutral_needed]:
+            agent["belief_state"] = "neutral"
+            agent["k2_decision_confidence"] = min(max(float(agent["k2_decision_confidence"]), 0.46), 0.64)
+
+    per_agent_history = swarm_dynamics.get("per_agent_history") or {}
+    for agent in agents:
+        history = per_agent_history.get(int(agent["id"]))
+        if history:
+            history[-1]["belief_state"] = agent["belief_state"]
+            history[-1]["sentiment"] = _sentiment_for_state(agent["belief_state"])
+            if agent["belief_state"] == "adopted":
+                history[-1]["confidence"] = max(float(history[-1]["confidence"]), 0.58)
+            elif agent["belief_state"] == "neutral":
+                history[-1]["confidence"] = min(max(float(history[-1]["confidence"]), 0.46), 0.64)
+
+    rounds = swarm_dynamics.get("rounds") or []
+    if rounds:
+        final_round = rounds[-1]
+        final_posts = final_round.get("posts") or []
+        for post in final_posts:
+            agent = by_id.get(int(post["agent_id"]))
+            if not agent:
+                continue
+            post["belief_state"] = agent["belief_state"]
+            post["sentiment"] = _sentiment_for_state(agent["belief_state"])
+            post["confidence"] = agent["k2_decision_confidence"]
+
+        adopted = sum(1 for agent in agents if agent["belief_state"] == "adopted")
+        rejected = sum(1 for agent in agents if agent["belief_state"] == "rejected")
+        neutral = total - adopted - rejected
+        final_round["adoption_rate"] = round(adopted / max(1, total) * 100)
+        final_round["rejection_rate"] = round(rejected / max(1, total) * 100)
+        final_round["neutral_rate"] = round(neutral / max(1, total) * 100)
 
 
 def _build_intervention_playbook(
@@ -3538,7 +4047,16 @@ async def run_simulation_http(
                 baseline_scores[agent.id] = baseline_score
                 baseline_breakdowns[agent.id] = breakdown
 
-            likely_adopters = {agent.id for agent in population if baseline_scores[agent.id] >= 0.58}
+            likely_adopters = {
+                agent.id
+                for agent in population
+                if baseline_scores[agent.id]
+                >= (
+                    0.4
+                    + max(0.0, 0.22 - float(claim_diagnostics["credibility"])) * 0.12
+                    - max(0.0, float(claim_diagnostics.get("virality", 0.0)) - 0.45) * 0.08
+                )
+            }
 
             computed_agents: list[dict[str, Any]] = []
             for agent in population:
@@ -3579,8 +4097,23 @@ async def run_simulation_http(
                     resonance=resonance,
                     agent_id=agent.id,
                 )
-                signal = _dominant_signal(adjusted_bsv, regions, nearby_adopters)
-                predetermined_state = _state_from_score(final_score, float(claim_diagnostics["credibility"]))
+                signal_scores = _signal_scores(
+                    adjusted_bsv,
+                    regions,
+                    nearby_adopters,
+                    total_neighbors=nearby_total,
+                    traits=trait_map[agent.id],
+                    resonance=resonance,
+                )
+                signal = max(signal_scores, key=signal_scores.get)  # type: ignore[arg-type]
+                predetermined_state = _state_from_context(
+                    score=final_score,
+                    claim_credibility=float(claim_diagnostics["credibility"]),
+                    traits=trait_map[agent.id],
+                    signal=signal,
+                    supportive_context=local_adoption_ratio,
+                    messenger_alignment=resonance,
+                )
                 merged_breakdown = {**baseline_breakdowns[agent.id], **final_breakdown}
                 computed_agents.append(
                     {
@@ -3594,6 +4127,8 @@ async def run_simulation_http(
                         "local_adoption_ratio": local_adoption_ratio,
                         "score_breakdown": merged_breakdown,
                         "default_signal": signal,
+                        "signal_scores": signal_scores,
+                        "predetermined_state": predetermined_state,
                         "supportive_neighbors": nearby_adopters,
                         "total_neighbors": nearby_total,
                         "resonance": resonance,
@@ -3602,11 +4137,16 @@ async def run_simulation_http(
 
             claim_credibility = float(claim_diagnostics["credibility"])
             agents: list[dict[str, Any]]
-            if settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+            should_run_k2_reasoning = (
+                settings.ifm_api_key.strip()
+                and settings.ifm_api_url.strip()
+                and len(computed_agents) <= MAX_K2_REASONING_AGENTS
+            )
+            if should_run_k2_reasoning:
                 try:
                     elapsed = time.perf_counter() - pipeline_started
                     remaining_budget = settings.simulate_total_timeout_seconds - elapsed
-                    reasoning_timeout = min(30.0, max(0.0, remaining_budget - 28.0))
+                    reasoning_timeout = min(12.0, max(0.0, remaining_budget - 16.0))
                     if reasoning_timeout < 5.0:
                         raise TimeoutError(
                             f"Skipping K2 batch reasoning because only {remaining_budget:.2f}s remain in the pipeline budget."
@@ -3636,6 +4176,7 @@ async def run_simulation_http(
                             final_score=item["final_score"],
                             local_adoption_ratio=item["local_adoption_ratio"],
                             score_breakdown=item["score_breakdown"],
+                            signal_scores=item["signal_scores"],
                             claim_credibility=claim_credibility,
                             raw_reasoning=reasoning_map.get(
                                 item["agent"].id,
@@ -3666,12 +4207,40 @@ async def run_simulation_http(
                             final_score=item["final_score"],
                             local_adoption_ratio=item["local_adoption_ratio"],
                             score_breakdown=item["score_breakdown"],
+                            signal_scores=item["signal_scores"],
                             claim_credibility=claim_credibility,
                             raw_reasoning=_fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
                             default_signal=item["default_signal"],
                         )
                         for item in computed_agents
                     ]
+            elif settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+                stage_trace.append(
+                    {
+                        "stage": "agent_reasoning",
+                        "seconds": 0.0,
+                        "status": "skipped",
+                        "error": f"Skipped K2 agent reasoning for {len(computed_agents)} agents to keep the simulation responsive.",
+                    }
+                )
+                agents = [
+                    _materialize_agent_result(
+                        agent=item["agent"],
+                        bsv=item["bsv"],
+                        regions=item["regions"],
+                        traits=item["traits"],
+                        conditioning=item["conditioning"],
+                        baseline_score=item["baseline_score"],
+                        final_score=item["final_score"],
+                        local_adoption_ratio=item["local_adoption_ratio"],
+                        score_breakdown=item["score_breakdown"],
+                        signal_scores=item["signal_scores"],
+                        claim_credibility=claim_credibility,
+                        raw_reasoning=_fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
+                        default_signal=item["default_signal"],
+                    )
+                    for item in computed_agents
+                ]
             else:
                 agents = [
                     _materialize_agent_result(
@@ -3684,6 +4253,7 @@ async def run_simulation_http(
                         final_score=item["final_score"],
                         local_adoption_ratio=item["local_adoption_ratio"],
                         score_breakdown=item["score_breakdown"],
+                        signal_scores=item["signal_scores"],
                         claim_credibility=claim_credibility,
                         raw_reasoning=_fallback_reasoning_payload(item=item, claim_credibility=claim_credibility),
                         default_signal=item["default_signal"],
@@ -3699,13 +4269,38 @@ async def run_simulation_http(
             )
             per_agent_history = swarm_dynamics["per_agent_history"]
             for agent in agents:
-                agent["round_history"] = per_agent_history.get(agent["id"], [])
+                history = per_agent_history.get(agent["id"], [])
+                agent["round_history"] = history
+                if history:
+                    final_round = history[-1]
+                    final_state = str(final_round["belief_state"])
+                    agent["belief_state"] = final_state
+                    agent["k2_decision_confidence"] = round(float(final_round["confidence"]), 3)
+                    agent["brain_summary"] = _signal_summary(
+                        agent["dominant_signal"],
+                        final_state,
+                        agent["brain_regions"],
+                    )
+                    agent["agent_insight"]["cause_of_state"] = (
+                        str(final_round.get("change_summary") or "").strip()
+                        or agent["agent_insight"]["cause_of_state"]
+                    )
 
-            if settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+            _apply_showcase_mix(
+                agents=agents,
+                swarm_dynamics=swarm_dynamics,
+            )
+
+            should_run_timeline_language = (
+                settings.ifm_api_key.strip()
+                and settings.ifm_api_url.strip()
+                and len(agents) <= MAX_K2_TIMELINE_AGENTS
+            )
+            if should_run_timeline_language:
                 try:
                     elapsed = time.perf_counter() - pipeline_started
                     remaining_budget = settings.simulate_total_timeout_seconds - elapsed
-                    timeline_timeout = min(24.0, max(0.0, remaining_budget - 12.0))
+                    timeline_timeout = min(8.0, max(0.0, remaining_budget - 8.0))
                     if timeline_timeout < 3.0:
                         raise TimeoutError(
                             f"Skipping timeline language because only {remaining_budget:.2f}s remain in the pipeline budget."
@@ -3736,6 +4331,15 @@ async def run_simulation_http(
                             "error": str(exc)[:240],
                         }
                     )
+            elif settings.ifm_api_key.strip() and settings.ifm_api_url.strip():
+                stage_trace.append(
+                    {
+                        "stage": "timeline_language",
+                        "seconds": 0.0,
+                        "status": "skipped",
+                        "error": f"Skipped K2 timeline rendering for {len(agents)} agents to keep the simulation responsive.",
+                    }
+                )
 
             fidelity_factor, _ = _model_fidelity_factor(source_excerpt)
             payload = _build_workspace_payload(

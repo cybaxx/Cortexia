@@ -306,10 +306,15 @@ async def _synthesize_action_center(httpx_client: httpx.AsyncClient, payload: di
     spread_risk = str(payload.get("spread_risk") or "Moderate")
     key_finding = str(payload.get("key_finding") or "The simulation shows a narrative that deserves monitoring.")
     dominant_pathway = str(payload.get("dominant_pathway") or "social proof")
+    case_goal = str(payload.get("case_goal") or "").strip()
     live_sources = payload.get("live_sources") or []
     return {
         "headline": f"{spread_risk} risk scenario in {payload.get('city')}",
-        "executive_summary": key_finding,
+        "executive_summary": (
+            f"Goal: {case_goal}. {key_finding}"
+            if case_goal
+            else key_finding
+        ),
         "decision_window": "Next 24-72 hours",
         "urgency": "high" if spread_risk.lower() == "high" else "medium",
         "confidence_note": (
@@ -323,8 +328,13 @@ async def _synthesize_action_center(httpx_client: httpx.AsyncClient, payload: di
                 "owner": "Comms lead",
                 "audience": "High-risk segments",
                 "timeline": "Today",
-                "action": f"Draft one plain-language response aligned to the dominant pathway: {dominant_pathway}.",
-                "why_now": "The simulation shows this is the clearest first intervention lever.",
+                "action": (
+                    f"Draft one plain-language response aligned to the dominant pathway: {dominant_pathway}. "
+                    f"Shape it to the stated goal: {case_goal}."
+                    if case_goal
+                    else f"Draft one plain-language response aligned to the dominant pathway: {dominant_pathway}."
+                ),
+                "why_now": "The simulation shows this is the clearest first intervention lever for the stated objective." if case_goal else "The simulation shows this is the clearest first intervention lever.",
             },
             {
                 "title": "Monitor local amplification",
@@ -332,7 +342,7 @@ async def _synthesize_action_center(httpx_client: httpx.AsyncClient, payload: di
                 "audience": payload.get("city") or "target city",
                 "timeline": "Next 24 hours",
                 "action": "Track whether the scenario is appearing in local news, forums, or advocacy channels.",
-                "why_now": "Early detection matters more than late-stage rebuttal.",
+                "why_now": "Early detection matters more than late-stage rebuttal, especially if the team needs to act on the intake goal quickly." if case_goal else "Early detection matters more than late-stage rebuttal.",
             },
         ],
         "monitoring_queries": _build_queries(

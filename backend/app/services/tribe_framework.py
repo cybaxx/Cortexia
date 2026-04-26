@@ -75,6 +75,8 @@ def _demographic_modulators(demographics: Any) -> dict[str, float]:
     """Map Cortexia demographic fields to 0–1 scalars (aligned with swarm conditioning)."""
     demo = demographics if isinstance(demographics, dict) else {}
     education_support = {
+        "Less than high school": 0.04,
+        "Limited formal schooling": 0.08,
         "High school": 0.12,
         "Some college": 0.24,
         "Associate": 0.34,

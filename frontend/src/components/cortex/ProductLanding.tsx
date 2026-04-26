@@ -11,14 +11,15 @@ export function ProductLanding({ onEnter }: { onEnter: () => void }) {
       </div>
 
       <div className="relative z-10 mx-auto flex min-h-screen w-full max-w-[1450px] flex-col px-6 pb-10 pt-6 md:px-10">
-        <header className="flex items-center justify-between gap-4">
-          <div className="inline-flex items-center gap-3 rounded-[10px] border border-white/[0.18] bg-bg-surface px-4 py-2">
-            <div className="grid h-14 w-14 place-items-center rounded-[10px] border border-white/[0.18] bg-[linear-gradient(180deg,hsl(var(--pastel-1)/0.14),hsl(var(--pastel-3)/0.06))] p-1.5">
-              <img src="/cortexia-mark.svg" alt="Cortexia logo" className="h-full w-full object-contain" />
+        <header className="flex items-start justify-between gap-6">
+          <div className="inline-flex items-center gap-4 rounded-[14px] border border-white/[0.14] bg-[linear-gradient(180deg,hsl(var(--bg-surface)/0.96),hsl(var(--bg-elevated)/0.92))] px-5 py-4 shadow-[0_12px_42px_rgba(0,0,0,0.18)]">
+            <div className="grid h-20 w-20 place-items-center rounded-[14px] border border-white/[0.18] bg-[linear-gradient(180deg,hsl(var(--pastel-1)/0.18),hsl(var(--pastel-3)/0.08))] p-2">
+              <img src="/cortexia-logo.png" alt="Cortexia logo" className="h-full w-full object-contain" />
             </div>
-            <div>
-              <div className="lab-kicker">Cortexia</div>
-              <div className="text-sm text-text-secondary">TRIBE + K2 social simulation studio</div>
+            <div className="pt-1">
+              <div className="lab-kicker text-text-secondary">Cortexia</div>
+              <div className="mt-1 text-2xl font-semibold tracking-[-0.03em] text-text-primary">CORTEXIA</div>
+              <div className="mt-1 text-sm text-text-secondary">Narrative Intelligence Studio</div>
             </div>
           </div>
 
@@ -35,13 +36,13 @@ export function ProductLanding({ onEnter }: { onEnter: () => void }) {
         <section className="grid flex-1 items-center gap-8 py-10 xl:grid-cols-[1.08fr_0.92fr]">
           <div>
             <h1 className="max-w-4xl text-5xl font-semibold leading-[0.94] tracking-[-0.04em] md:text-7xl">
-              City-scale narrative simulation.
+              A consumer-centered lab for the narratives that matter.
             </h1>
 
             <p className="mt-6 max-w-2xl text-lg leading-relaxed text-text-secondary md:text-xl">
-              Cortexia Compass turns one scenario into a city-scale simulation. TRIBE models each person&apos;s cognitive
-              state, K2 Think interprets how the narrative lands, and the map shows how it spreads across interviewable
-              synthetic people you can inspect, question, and report on.
+              Cortexia turns one scenario into an inspectable simulation of how people receive it, react to it, spread
+              it, and respond under pressure. Move from early narrative testing to interviews, mechanism analysis, and
+              reporting in one workflow.
             </p>
 
             <div className="mt-8 flex flex-wrap gap-3">
@@ -49,9 +50,6 @@ export function ProductLanding({ onEnter }: { onEnter: () => void }) {
                 Start simulation
                 <ArrowRight className="h-4 w-4" />
               </button>
-              <div className="rounded-[10px] border border-white/[0.18] bg-bg-surface px-5 py-3.5 text-sm text-text-secondary">
-                TRIBE generates state outputs. K2 Think explains and operationalizes them.
-              </div>
             </div>
           </div>
 

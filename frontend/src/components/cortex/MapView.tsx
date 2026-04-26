@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import ReactMap, { Layer, type MapRef } from 'react-map-gl';
 import DeckGL from '@deck.gl/react';
-import { IconLayer, PathLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers';
+import { PathLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers';
 import { PathStyleExtension } from '@deck.gl/extensions';
 import { getCityById } from '@/data/cities';
 import { COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
@@ -68,45 +68,6 @@ function clamp(value: number, min: number, max: number) {
 function markerSize(zoom: number, cityZoom: number) {
   return clamp(34 + (zoom - cityZoom) * 3.4, 30, 52);
 }
-
-function svgToDataUrl(svg: string) {
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
-function personIconSvg(fill: string) {
-  return `
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 96">
-      <ellipse cx="32" cy="87" rx="18" ry="6" fill="rgba(0,0,0,0.28)" />
-      <circle cx="32" cy="16" r="10" fill="${fill}" />
-      <rect x="24" y="28" width="16" height="26" rx="8" fill="${fill}" />
-      <rect x="18" y="32" width="8" height="24" rx="4" fill="${fill}" />
-      <rect x="38" y="32" width="8" height="24" rx="4" fill="${fill}" />
-      <rect x="24" y="52" width="7" height="28" rx="3.5" fill="${fill}" />
-      <rect x="33" y="52" width="7" height="28" rx="3.5" fill="${fill}" />
-    </svg>
-  `;
-}
-
-const PERSON_ICONS = {
-  adopt: {
-    url: svgToDataUrl(personIconSvg('#4A9EFF')),
-    width: 64,
-    height: 96,
-    anchorY: 88,
-  },
-  strain: {
-    url: svgToDataUrl(personIconSvg('#E8856A')),
-    width: 64,
-    height: 96,
-    anchorY: 88,
-  },
-  neutral: {
-    url: svgToDataUrl(personIconSvg('#C0B8B0')),
-    width: 64,
-    height: 96,
-    anchorY: 88,
-  },
-} as const;
 
 function clusterFill(state?: 'adopted' | 'rejected' | 'neutral') {
   if (state === 'adopted') return [74, 158, 255, 38] as [number, number, number, number];
@@ -304,28 +265,32 @@ export const MapView = () => {
     return () => cancelAnimationFrame(frame);
   }, []);
 
+  const focusAgent = useCallback((agent: Agent, x?: number, y?: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    const centerX = rect ? rect.width / 2 : x ?? 0;
+    const centerY = rect ? rect.height / 2 : y ?? 0;
+
+    setViewState((vs) => ({
+      ...vs,
+      longitude: agent.position[0],
+      latitude: agent.position[1],
+      zoom: Math.max(vs.zoom, c.zoom + 0.25),
+      transitionDuration: 900,
+    }));
+
+    setPinned({ agent, x: centerX, y: centerY });
+    setSelectedAgentId(agent.id);
+  }, [c.zoom, setSelectedAgentId]);
+
   const handleDeckClick = useCallback((info: { object?: unknown; x?: number; y?: number }) => {
     const object = info.object as Agent | undefined;
     if (object) {
-      const rect = containerRef.current?.getBoundingClientRect();
-      const centerX = rect ? rect.width / 2 : info.x ?? 0;
-      const centerY = rect ? rect.height / 2 : info.y ?? 0;
-
-      setViewState((vs) => ({
-        ...vs,
-        longitude: object.position[0],
-        latitude: object.position[1],
-        zoom: Math.max(vs.zoom, c.zoom + 0.25),
-        transitionDuration: 900,
-      }));
-
-      setPinned({ agent: object, x: centerX, y: centerY });
-      setSelectedAgentId(object.id);
+      focusAgent(object, info.x, info.y);
     } else {
       setPinned(null);
       setSelectedAgentId(null);
     }
-  }, [c.zoom, setSelectedAgentId]);
+  }, [focusAgent, setSelectedAgentId]);
 
   const mergedPopupAgent = useMemo(() => {
     if (!pinned) return null;
@@ -333,6 +298,17 @@ export const MapView = () => {
     if (!payload) return mergeAgent(pinned.agent, overrides[pinned.agent.id]);
     return buildAgentFromPayload(payload, overrides[payload.id]);
   }, [agentSimulationById, overrides, pinned]);
+
+  const projectedAgents = useMemo(() => {
+    const map = mapRef.current;
+    if (!map) return [];
+    return agents
+      .map((agent) => {
+        const point = map.project([agent.position[0], agent.position[1]]);
+        return { agent, x: point.x, y: point.y };
+      })
+      .filter(({ x, y }) => Number.isFinite(x) && Number.isFinite(y));
+  }, [agents, viewState]);
 
   useEffect(() => {
     if (selectedAgentId == null) {
@@ -468,41 +444,13 @@ export const MapView = () => {
       opacity: 0.65,
       radiusUnits: 'pixels',
       getPosition: (a) => a.position,
-      getRadius: (a) => 12 + (a.confidence ?? 0.5) * 7,
-      radiusMinPixels: 12,
-      radiusMaxPixels: 22,
+      getRadius: (a) => 8 + (a.confidence ?? 0.5) * 5,
+      radiusMinPixels: 8,
+      radiusMaxPixels: 16,
       getFillColor: (a) => {
         const [r, g, b] = COLORS[a.state];
-        return [r, g, b, 34 + Math.round((a.confidence ?? 0.5) * 24)] as [number, number, number, number];
+        return [r, g, b, 22 + Math.round((a.confidence ?? 0.5) * 18)] as [number, number, number, number];
       },
-      parameters: { depthTest: false },
-    }),
-    new ScatterplotLayer<Agent>({
-      id: 'agent-hit-area',
-      data: agents,
-      pickable: true,
-      stroked: false,
-      filled: true,
-      opacity: 0.01,
-      radiusUnits: 'pixels',
-      getPosition: (a) => a.position,
-      getRadius: () => markerSize(viewState.zoom, c.zoom) * 0.72,
-      radiusMinPixels: 18,
-      radiusMaxPixels: 30,
-      getFillColor: () => [255, 255, 255, 2] as [number, number, number, number],
-      parameters: { depthTest: false },
-    }),
-    new IconLayer<Agent>({
-      id: 'people',
-      data: agents,
-      pickable: true,
-      billboard: true,
-      sizeUnits: 'pixels',
-      sizeScale: 1,
-      alphaCutoff: 0.01,
-      getPosition: (a) => a.position,
-      getIcon: (a) => PERSON_ICONS[a.state],
-      getSize: () => markerSize(viewState.zoom, c.zoom),
       parameters: { depthTest: false },
     }),
     ...(pinned
@@ -557,6 +505,48 @@ export const MapView = () => {
         )}
       </DeckGL>
 
+      <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
+        {projectedAgents.map(({ agent, x, y }) => {
+          const [r, g, b] = COLORS[agent.state];
+          const selected = selectedAgentId === agent.id;
+          const size = Math.round(markerSize(viewState.zoom, c.zoom));
+          return (
+            <button
+              key={agent.id}
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                focusAgent(agent, x, y);
+              }}
+              className="pointer-events-auto absolute group"
+              style={{
+                left: x,
+                top: y,
+                width: size,
+                height: Math.round(size * 1.45),
+                transform: 'translate(-50%, -100%)',
+              }}
+              aria-label={`Inspect ${agent.name}`}
+            >
+              <svg
+                width={size}
+                height={Math.round(size * 1.45)}
+                viewBox="0 0 64 96"
+                className={`overflow-visible drop-shadow-[0_10px_18px_rgba(0,0,0,0.55)] transition-transform duration-200 ${selected ? 'scale-[1.08]' : 'group-hover:scale-[1.04]'}`}
+              >
+                <ellipse cx="32" cy="87" rx="18" ry="6" fill="rgba(0,0,0,0.28)" />
+                <circle cx="32" cy="16" r="10" fill={`rgb(${r} ${g} ${b})`} />
+                <rect x="24" y="28" width="16" height="26" rx="8" fill={`rgb(${r} ${g} ${b})`} />
+                <rect x="18" y="32" width="8" height="24" rx="4" fill={`rgb(${r} ${g} ${b})`} />
+                <rect x="38" y="32" width="8" height="24" rx="4" fill={`rgb(${r} ${g} ${b})`} />
+                <rect x="24" y="52" width="7" height="28" rx="3.5" fill={`rgb(${r} ${g} ${b})`} />
+                <rect x="33" y="52" width="7" height="28" rx="3.5" fill={`rgb(${r} ${g} ${b})`} />
+              </svg>
+            </button>
+          );
+        })}
+      </div>
+
       <div className="pointer-events-none absolute bottom-4 left-4 z-10 w-[220px] rounded-[12px] border border-white/[0.12] bg-[rgba(12,12,15,0.86)] p-3 shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm">
         <div className="space-y-2">
           <LegendRow icon={createLegendPerson('#4A9EFF')} label="Adoption" />
@@ -569,6 +559,9 @@ export const MapView = () => {
             </div>
             <span className="text-xs text-text-secondary">Connection strength</span>
           </div>
+          <p className="mt-2 text-[10px] leading-snug text-text-muted">
+            Outcomes reflect education, media habits, and ties—open a node to see full demographics.
+          </p>
         </div>
       </div>
 

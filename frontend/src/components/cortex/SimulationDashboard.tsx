@@ -75,11 +75,30 @@ const WORKFLOW_STEPS = [
 ] as const;
 
 const REPORT_TABS = [
-  { id: 'brief', label: 'Brief' },
-  { id: 'research', label: 'Live Research' },
-  { id: 'interventions', label: 'Interventions' },
+  { id: 'brief', label: 'Decision Brief' },
+  { id: 'research', label: 'Evidence' },
+  { id: 'interventions', label: 'Actions' },
   { id: 'export', label: 'Export' },
 ] as const;
+
+const REPORT_TAB_COPY: Record<(typeof REPORT_TABS)[number]['id'], { title: string; description: string }> = {
+  brief: {
+    title: 'What this tab is for',
+    description: 'A short operator summary of what the simulation and research mean, how urgent it is, and what decision window you are working inside.',
+  },
+  research: {
+    title: 'What this tab is for',
+    description: 'The raw evidence layer: source pages the system found, what pattern it extracted from each one, and which URLs still need human verification.',
+  },
+  interventions: {
+    title: 'What this tab is for',
+    description: 'Recommended next moves. Each card tells you what to do, who should own it, who it is meant for, and why it matters now.',
+  },
+  export: {
+    title: 'What this tab is for',
+    description: 'Package the current run into files you can hand off. Use this when the scenario is ready to leave the dashboard and become a brief, report, or archive.',
+  },
+};
 
 export function SimulationDashboard({ onBack }: { onBack: () => void }) {
   const cityId = useCortexStore((s) => s.cityId);
@@ -530,6 +549,15 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                       ))}
                     </div>
 
+                    <div className="rounded-[6px] border border-white/[0.06] bg-bg-input px-4 py-4">
+                      <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
+                        {REPORT_TAB_COPY[reportTab].title}
+                      </div>
+                      <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+                        {REPORT_TAB_COPY[reportTab].description}
+                      </p>
+                    </div>
+
                     {reportTab === 'brief' && (
                       <div className="space-y-4">
                         {!hasActionCenter ? (
@@ -539,7 +567,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                         ) : (
                           <>
                             <div className="rounded-[6px] border border-white/[0.06] bg-bg-input px-5 py-5">
-                              <div className="lab-kicker">Executive brief</div>
+                              <div className="lab-kicker">Decision summary</div>
                               <div className="mt-3 text-[26px] font-bold tracking-[-0.02em] text-text-primary">
                                 {actionCenter.brief.headline}
                               </div>
@@ -548,10 +576,19 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                               </p>
                             </div>
 
+                            {caseGoal.trim() && (
+                              <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface px-4 py-4">
+                                <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
+                                  Decision goal
+                                </div>
+                                <p className="mt-2 text-sm leading-relaxed text-text-secondary">{caseGoal}</p>
+                              </div>
+                            )}
+
                             <div className="grid gap-3 sm:grid-cols-3">
                               <ReadoutCard label="Urgency" value={actionCenter.brief.urgency} />
                               <ReadoutCard label="Decision window" value={actionCenter.brief.decision_window} />
-                              <ReadoutCard label="Dominant pathway" value={dominantPathway?.label ?? 'Unavailable'} />
+                              <ReadoutCard label="Main spread mechanism" value={dominantPathway?.label ?? 'Unavailable'} />
                             </div>
 
                             <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface px-4 py-4 text-sm leading-relaxed text-text-secondary">
@@ -585,8 +622,11 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                         <div className="grid gap-4 lg:grid-cols-[1.05fr_0.95fr]">
                           <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface p-4">
                             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
-                              Live sources
+                              Source dossier
                             </div>
+                            <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                              Pages surfaced from the live web that appear relevant to this scenario.
+                            </p>
                             <div className="mt-3 space-y-3">
                               {!hasActionCenter && (
                                 <div className="text-sm leading-relaxed text-text-secondary">
@@ -623,8 +663,11 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
 
                           <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface p-4">
                             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
-                              Pattern extraction
+                              Source interpretation
                             </div>
+                            <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                              What the system thinks each source is signaling, and why it matters to the spread pattern.
+                            </p>
                             <div className="mt-3 space-y-3">
                               {!hasActionCenter && (
                                 <div className="text-sm leading-relaxed text-text-secondary">
@@ -639,11 +682,15 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                               {(actionCenter?.extracted_patterns ?? []).map((pattern, index) => (
                                 <div key={`${pattern.url}-${index}`} className="rounded-[6px] border border-white/[0.06] bg-bg-input px-4 py-3">
                                   <div className="flex items-center justify-between gap-3">
-                                    <div className="text-sm font-medium text-text-primary">{pattern.risk_level}</div>
-                                    <div className="text-[11px] text-text-muted">{pattern.geography || 'General relevance'}</div>
+                                    <div className="text-sm font-medium text-text-primary">{pattern.risk_level} relevance</div>
+                                    <div className="text-[11px] text-text-muted">{pattern.geography || 'No geography called out'}</div>
                                   </div>
-                                  <p className="mt-2 text-xs leading-relaxed text-text-secondary">{pattern.claim}</p>
-                                  <p className="mt-2 text-xs leading-relaxed text-text-muted">{pattern.why_it_matters}</p>
+                                  <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                                    <span className="text-text-primary">Detected pattern:</span> {pattern.claim}
+                                  </p>
+                                  <p className="mt-2 text-xs leading-relaxed text-text-muted">
+                                    <span className="text-text-primary">Why this matters:</span> {pattern.why_it_matters}
+                                  </p>
                                 </div>
                               ))}
                             </div>
@@ -654,9 +701,12 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                           <div className="mb-3 flex items-center gap-2">
                             <ShieldCheck className="h-4 w-4 text-pastel-2" />
                             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
-                              Browser verification queue
+                              Manual verification queue
                             </div>
                           </div>
+                          <p className="mb-3 text-xs leading-relaxed text-text-secondary">
+                            These are the URLs a human should open when the system thinks the source needs a closer read before you act on it.
+                          </p>
                           <div className="space-y-2">
                             {!hasActionCenter && (
                               <div className="text-sm leading-relaxed text-text-secondary">
@@ -670,9 +720,11 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                             )}
                             {(actionCenter?.browser_verification_queue ?? []).map((item) => (
                               <div key={`${item.url}-${item.reason}`} className="rounded-[6px] border border-white/[0.06] bg-bg-surface px-4 py-3">
-                                <div className="text-sm font-medium text-text-primary">{item.reason}</div>
+                                <div className="text-sm font-medium text-text-primary">Why to check this manually: {item.reason}</div>
                                 <div className="mt-1 break-all text-xs text-pastel-2">{item.url}</div>
-                                <div className="mt-2 text-xs leading-relaxed text-text-secondary">{item.check_for}</div>
+                                <div className="mt-2 text-xs leading-relaxed text-text-secondary">
+                                  <span className="text-text-primary">What to verify:</span> {item.check_for}
+                                </div>
                               </div>
                             ))}
                           </div>
@@ -689,11 +741,15 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                               <div className="text-[11px] uppercase tracking-[0.12em] text-text-muted">{item.timeline}</div>
                             </div>
                             <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                              <ReadoutCard label="Owner" value={item.owner} />
-                              <ReadoutCard label="Audience" value={item.audience} />
+                              <ReadoutCard label="Who owns this" value={item.owner} />
+                              <ReadoutCard label="Who this is for" value={item.audience} />
                             </div>
-                            <p className="mt-3 text-sm leading-relaxed text-text-secondary">{item.action}</p>
-                            <p className="mt-2 text-xs leading-relaxed text-text-muted">{item.why_now}</p>
+                            <p className="mt-3 text-sm leading-relaxed text-text-secondary">
+                              <span className="text-text-primary">Recommended move:</span> {item.action}
+                            </p>
+                            <p className="mt-2 text-xs leading-relaxed text-text-muted">
+                              <span className="text-text-primary">Why now:</span> {item.why_now}
+                            </p>
                           </div>
                         ))}
 
@@ -747,8 +803,11 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                         {exportItems.length > 0 && (
                           <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface p-4">
                             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted">
-                              Included in export
+                              Files include
                             </div>
+                            <p className="mt-2 text-xs leading-relaxed text-text-secondary">
+                              These sections will be bundled into the exported package based on what exists in the current run.
+                            </p>
                             <div className="mt-3 grid gap-2">
                               {exportItems.map((item) => (
                                 <div key={item} className="rounded-[6px] border border-white/[0.06] bg-bg-input px-3 py-2 text-sm text-text-secondary">
@@ -769,7 +828,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                   title="Control Tower"
                   kicker="Status"
                   icon={RadioTower}
-                  body="Provider status, action-center run controls, and what this final step can do right now."
+                  body="Run the research pass, see which providers are contributing, and understand which parts of the Action Center are populated from live evidence."
                 >
                   <div className="space-y-4">
                     <button
