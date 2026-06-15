@@ -91,7 +91,7 @@ class HealthResponse(BaseModel):
 async def health():
     try:
         import torch
-        gpu = torch.cuda.is_available()
+        gpu = torch.cuda.is_available() or torch.backends.mps.is_available()
     except ImportError:
         gpu = False
     return HealthResponse(status="ok", gpu_available=gpu)

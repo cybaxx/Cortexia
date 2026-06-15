@@ -14,14 +14,15 @@ const INTERVIEW_PROMPTS = [
 ];
 
 function K2ThinkTrace({ lines }: { lines: string[] }) {
+  const safeLines = Array.isArray(lines) ? lines : [];
   return (
     <div className="rounded-[24px] border border-white/[0.08] bg-bg-deep/55 p-3">
       <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.12em] text-pastel-2/90">Interpretation of neural response model</div>
       <ol className="list-decimal list-inside space-y-1.5 font-mono text-[10px] text-text-secondary leading-relaxed">
-        {lines.length === 0 ? (
+        {safeLines.length === 0 ? (
           <li className="text-text-muted">No reasoning lines returned for this agent.</li>
         ) : (
-          lines.map((line, i) => (
+          safeLines.map((line, i) => (
             <li key={i} className="pl-0.5">
               {line}
             </li>

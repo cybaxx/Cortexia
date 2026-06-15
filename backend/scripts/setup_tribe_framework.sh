@@ -66,6 +66,9 @@ cat <<EOF
 
 TRIBE framework dependencies installed.
 
+Device auto-detected at runtime (cuda > mps > cpu).
+On Apple Silicon Macs, MPS GPU acceleration is used automatically.
+
 Next steps:
 1. Export your Hugging Face token:
    export HF_TOKEN=hf_your_token_here

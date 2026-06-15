@@ -1,4 +1,10 @@
-"""Live research and final-step action-center synthesis."""
+"""Live research and final-step action-center synthesis.
+
+Supports three provider tiers:
+1. Tavily + Firecrawl (paid APIs) — when keys are configured
+2. Local web (DuckDuckGo + trafilatura) — free, no API keys needed
+3. Simulation-only fallback — when no web access is available
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,11 @@ import httpx
 from app.city_presets import get_city
 from app.config import get_settings
 from app.services.ai_clients import call_k2_action_center
+from app.services.local_research import (
+    build_fallback_patterns,
+    extract_page_content,
+    search_web,
+)
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -25,20 +36,31 @@ class ProviderStatus:
 
 
 def action_center_provider_status() -> dict[str, dict[str, str | bool]]:
+    has_paid_search = bool(settings.tavily_api_key.strip())
+    has_paid_extract = bool(settings.firecrawl_api_key.strip())
+    local_web_enabled = not has_paid_search  # auto-enable when no paid API
+
     return {
         "tavily": _provider(
-            enabled=bool(settings.tavily_api_key.strip()),
-            mode="live-search" if settings.tavily_api_key.strip() else "disabled",
-            detail="Broad web search for current evidence."
-            if settings.tavily_api_key.strip()
-            else "Set TAVILY_API_KEY to enable live web search.",
+            enabled=has_paid_search,
+            mode="live-search" if has_paid_search else "disabled",
+            detail="Broad web search for current evidence (paid API)."
+            if has_paid_search
+            else "Set TAVILY_API_KEY to enable premium search.",
         ),
         "firecrawl": _provider(
-            enabled=bool(settings.firecrawl_api_key.strip()),
-            mode="structured-extract" if settings.firecrawl_api_key.strip() else "disabled",
-            detail="Structured extraction from selected URLs."
-            if settings.firecrawl_api_key.strip()
-            else "Set FIRECRAWL_API_KEY to enable structured extraction.",
+            enabled=has_paid_extract,
+            mode="structured-extract" if has_paid_extract else "disabled",
+            detail="Structured extraction from selected URLs (paid API)."
+            if has_paid_extract
+            else "Set FIRECRAWL_API_KEY to enable premium extraction.",
+        ),
+        "local_web": _provider(
+            enabled=local_web_enabled,
+            mode="active" if local_web_enabled else "disabled",
+            detail="Free DuckDuckGo search + trafilatura content extraction — no API key needed."
+            if local_web_enabled
+            else "Disabled because paid search is active.",
         ),
         "k2": _provider(
             enabled=bool(settings.ifm_api_key.strip() and settings.ifm_api_url.strip()),
@@ -80,11 +102,20 @@ async def build_action_center_research(
         case_goal=case_goal,
     )
 
-    tavily_results = await _run_tavily(httpx_client, queries) if settings.tavily_api_key.strip() else []
-    extracted_patterns = await _run_firecrawl(httpx_client, tavily_results, city_label=city.label) if settings.firecrawl_api_key.strip() and tavily_results else []
+    search_results: list[dict[str, Any]] = []
+    if settings.tavily_api_key.strip():
+        search_results = await _run_tavily(httpx_client, queries)
+    else:
+        search_results = await search_web(httpx_client, queries)
+
+    extracted_patterns: list[dict[str, Any]] = []
+    if settings.firecrawl_api_key.strip() and search_results:
+        extracted_patterns = await _run_firecrawl(httpx_client, search_results, city_label=city.label)
+    elif search_results:
+        extracted_patterns = await _extract_local(httpx_client, search_results)
 
     if not extracted_patterns:
-        extracted_patterns = _fallback_patterns_from_results(tavily_results)
+        extracted_patterns = build_fallback_patterns(search_results)
 
     synthesis_input = {
         "domain": domain,
@@ -99,13 +130,13 @@ async def build_action_center_research(
         "provider_status": provider_status,
         "live_sources": [
             {
-                "title": item["title"],
-                "url": item["url"],
-                "domain": item["domain"],
-                "snippet": item["snippet"],
-                "raw_excerpt": item["raw_excerpt"],
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "domain": item.get("domain", urlparse(item.get("url", "")).netloc),
+                "snippet": item.get("snippet", ""),
+                "raw_excerpt": item.get("raw_excerpt", item.get("snippet", "")),
             }
-            for item in tavily_results[: settings.action_center_max_sources]
+            for item in search_results[: settings.action_center_max_sources]
         ],
         "extracted_patterns": extracted_patterns[: settings.action_center_max_sources],
     }
@@ -115,7 +146,7 @@ async def build_action_center_research(
     return {
         "provider_status": provider_status,
         "queries": queries,
-        "sources": tavily_results[: settings.action_center_max_sources],
+        "sources": search_results[: settings.action_center_max_sources],
         "extracted_patterns": extracted_patterns[: settings.action_center_max_sources],
         "brief": {
             "headline": synthesis["headline"],
@@ -264,6 +295,42 @@ async def _run_firecrawl(
             }
         )
     return out
+
+
+async def _extract_local(
+    httpx_client: httpx.AsyncClient,
+    search_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Extract page content from search results using trafilatura (free, no API)."""
+    out: list[dict[str, Any]] = []
+    for item in search_results[: min(4, len(search_results))]:
+        url = item.get("url", "")
+        if not url:
+            continue
+        content = await extract_page_content(httpx_client, url)
+        snippet = item.get("snippet", "")
+        out.append({
+            "url": url,
+            "claim": _first_sentence(content) if content else snippet[:220],
+            "risk_level": "Moderate",
+            "geography": item.get("domain", urlparse(url).netloc),
+            "why_it_matters": (
+                content[:300] if content
+                else f"Could not extract full content from {urlparse(url).netloc}. Using search snippet as fallback."
+            ),
+            "evidence": content[:600] if content else snippet[:300],
+        })
+    return out
+
+
+def _first_sentence(text: str) -> str:
+    """Extract the first meaningful sentence from extracted text."""
+    cleaned = text.strip()
+    for delim in (". ", ".\n", "! ", "?\n", "\n\n"):
+        idx = cleaned.find(delim)
+        if idx > 20:
+            return cleaned[: idx + 1].strip()
+    return cleaned[:300]
 
 
 def _fallback_patterns_from_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:

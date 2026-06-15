@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         default=str(_BACKEND_DIR / "tribe_data"),
         description="Local cache/data directory for the vendored tribe_neural framework.",
     )
+    tribe_device: str = Field(
+        default="",
+        description="Device override for TRIBE inference: 'cuda', 'mps', or 'cpu'. Auto-detected if empty.",
+    )
 
     # K2 Think (OpenAI-compatible): https://api.k2think.ai/v1/chat/completions
     ifm_api_url: str = Field(
@@ -77,7 +81,7 @@ class Settings(BaseSettings):
         description="Timeout for Action Center provider calls such as Tavily and Firecrawl.",
     )
 
-    # TRIBE v2 on Modal (same as `tribe_modal_deployment_url()` in app.constants)
+    # TRIBE v2 on Modal
     tribe_modal_url: str = Field(
         default="",
         description="Deployed Modal extract_bsv endpoint base URL (TRIBE_MODAL_URL)",
@@ -126,7 +130,7 @@ class Settings(BaseSettings):
     simulate_total_timeout_seconds: float = Field(
         default=180.0,
         gt=10.0,
-        le=900.0,
+        le=3600.0,
         description="Hard timeout for the full /api/simulate pipeline.",
     )
     pipeline_db_path: str = Field(

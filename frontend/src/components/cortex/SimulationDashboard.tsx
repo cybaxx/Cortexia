@@ -1,21 +1,20 @@
-import { Component, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Component, useEffect, useState, type ReactNode } from 'react';
 import {
   ArrowLeft,
   BrainCircuit,
   ChevronLeft,
   ChevronRight,
-  Download,
   ExternalLink,
+  FolderOpen,
   Globe2,
   Loader2,
   MapPinned,
   MessageSquare,
-  Network,
-  NotebookPen,
   RadioTower,
   Search,
   ShieldCheck,
   Sparkles,
+  X,
 } from 'lucide-react';
 import { CITY_PRESETS, getCityById } from '@/data/cities';
 import { USE_CASES } from '@/data/useCases';
@@ -23,6 +22,7 @@ import { getActionCenterStatus, postActionCenterResearch } from '@/lib/api/simul
 import { useCortexStore } from '@/store/cortex';
 import type { ActionCenterProviderStatus, ActionCenterResponse } from '@/types/simulation';
 import { AgentVoiceWorkspace } from './AgentVoiceWorkspace';
+import { CaseManager } from './CaseManager';
 import { MapView } from './MapView';
 
 class MapErrorBoundary extends Component<
@@ -128,7 +128,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
   const [actionCenter, setActionCenter] = useState<ActionCenterResponse | null>(null);
   const [actionCenterLoading, setActionCenterLoading] = useState(false);
   const [actionCenterError, setActionCenterError] = useState<string | null>(null);
-  const city = getCityById(cityId);
+  const [showCaseManager, setShowCaseManager] = useState(false);
   const selectedUseCase = USE_CASES.find((item) => item.id === useCase) ?? USE_CASES[1] ?? USE_CASES[0];
   const scenarioText = evidence.text_input.trim();
   const canonicalText =
@@ -170,8 +170,8 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
     latestResponse?.tribe_meta ? 'TRIBE neural state output' : null,
     interventionPlaybook.length > 0 ? 'Intervention playbook' : null,
     hasActionCenter ? 'Action Center brief' : null,
-    hasActionCenter && actionCenter.sources.length > 0 ? 'Live research sources' : null,
-    hasActionCenter && actionCenter.browser_verification_queue.length > 0 ? 'Browser verification queue' : null,
+    hasActionCenter && actionCenter!.sources.length > 0 ? 'Live research sources' : null,
+    hasActionCenter && actionCenter!.browser_verification_queue.length > 0 ? 'Browser verification queue' : null,
   ].filter((item): item is string => Boolean(item));
 
   function goToStep(step: (typeof WORKFLOW_STEPS)[number]['id']) {
@@ -249,6 +249,16 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                 <ArrowLeft className="h-4 w-4" />
                 Back to landing
               </button>
+              <button
+                type="button"
+                onClick={() => setShowCaseManager(!showCaseManager)}
+                className={`ui-button-secondary mb-5 ml-2 inline-flex items-center gap-2 px-4 py-2 text-sm ${
+                  showCaseManager ? 'border-pastel-2/40 bg-pastel-2/10 text-pastel-2' : ''
+                }`}
+              >
+                <FolderOpen className="h-4 w-4" />
+                Cases
+              </button>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-3">
@@ -277,6 +287,25 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
             </div>
           </div>
         </header>
+
+        {showCaseManager && (
+          <div className="mt-4 rounded-[16px] border border-white/[0.10] bg-bg-surface/80 p-5">
+            <div className="mb-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <FolderOpen className="h-5 w-5 text-pastel-2" />
+                <h2 className="text-[16px] font-semibold text-text-primary">Case Manager</h2>
+                <span className="text-[12px] text-text-muted">Browse, open, and manage past simulations</span>
+              </div>
+              <button
+                onClick={() => setShowCaseManager(false)}
+                className="rounded-[6px] p-1.5 text-text-muted hover:text-text-secondary"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <CaseManager onClose={() => setShowCaseManager(false)} />
+          </div>
+        )}
 
         <section className="mt-5">
           {stepId === 'evidence' && (
@@ -569,10 +598,10 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                             <div className="rounded-[6px] border border-white/[0.06] bg-bg-input px-5 py-5">
                               <div className="lab-kicker">Decision summary</div>
                               <div className="mt-3 text-[26px] font-bold tracking-[-0.02em] text-text-primary">
-                                {actionCenter.brief.headline}
+                                {actionCenter!.brief.headline}
                               </div>
                               <p className="mt-3 text-sm leading-relaxed text-text-secondary">
-                                {actionCenter.brief.executive_summary}
+                                {actionCenter!.brief.executive_summary}
                               </p>
                             </div>
 
@@ -586,16 +615,16 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                             )}
 
                             <div className="grid gap-3 sm:grid-cols-3">
-                              <ReadoutCard label="Urgency" value={actionCenter.brief.urgency} />
-                              <ReadoutCard label="Decision window" value={actionCenter.brief.decision_window} />
+                              <ReadoutCard label="Urgency" value={actionCenter!.brief.urgency} />
+                              <ReadoutCard label="Decision window" value={actionCenter!.brief.decision_window} />
                               <ReadoutCard label="Main spread mechanism" value={dominantPathway?.label ?? 'Unavailable'} />
                             </div>
 
                             <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface px-4 py-4 text-sm leading-relaxed text-text-secondary">
-                              {actionCenter.brief.confidence_note}
+                              {actionCenter!.brief.confidence_note}
                             </div>
 
-                            {actionCenter.monitoring_queries.length > 0 && (
+                            {actionCenter!.monitoring_queries.length > 0 && (
                               <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface p-4">
                                 <div className="mb-3 flex items-center gap-2">
                                   <Search className="h-4 w-4 text-pastel-2" />
@@ -604,7 +633,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                                   </div>
                                 </div>
                                 <div className="grid gap-2">
-                                  {actionCenter.monitoring_queries.map((query) => (
+                                  {actionCenter!.monitoring_queries.map((query) => (
                                     <div key={query} className="rounded-[6px] border border-white/[0.06] bg-bg-input px-3 py-2 text-sm text-text-secondary">
                                       {query}
                                     </div>
@@ -633,7 +662,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                                   Run live research to populate the source dossier.
                                 </div>
                               )}
-                              {hasActionCenter && actionCenter.sources.length === 0 && (
+                              {hasActionCenter && actionCenter!.sources.length === 0 && (
                                 <div className="text-sm leading-relaxed text-text-secondary">
                                   The research pass returned no live sources.
                                 </div>
@@ -674,7 +703,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                                   Run live research to populate the structured extraction panel.
                                 </div>
                               )}
-                              {hasActionCenter && actionCenter.extracted_patterns.length === 0 && (
+                              {hasActionCenter && actionCenter!.extracted_patterns.length === 0 && (
                                 <div className="text-sm leading-relaxed text-text-secondary">
                                   No structured extraction items were returned for this research pass.
                                 </div>
@@ -713,7 +742,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                                 Run live research to populate the browser verification queue.
                               </div>
                             )}
-                            {hasActionCenter && actionCenter.browser_verification_queue.length === 0 && (
+                            {hasActionCenter && actionCenter!.browser_verification_queue.length === 0 && (
                               <div className="text-sm leading-relaxed text-text-secondary">
                                 This research pass did not surface any browser-priority URLs.
                               </div>
@@ -759,7 +788,7 @@ export function SimulationDashboard({ onBack }: { onBack: () => void }) {
                           </div>
                         )}
 
-                        {hasActionCenter && actionCenter.recommended_actions.length === 0 && (
+                        {hasActionCenter && actionCenter!.recommended_actions.length === 0 && (
                           <div className="rounded-[6px] border border-white/[0.06] bg-bg-surface px-4 py-3 text-sm text-text-secondary">
                             The research pass completed without any recommended actions.
                           </div>
@@ -921,26 +950,6 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <div className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.12em] text-text-muted">{label}</div>
       {children}
     </label>
-  );
-}
-
-function StageChip({
-  icon: Icon,
-  title,
-  body,
-}: {
-  icon: typeof BrainCircuit;
-  title: string;
-  body: string;
-}) {
-  return (
-    <div className="rounded-[10px] border border-white/[0.12] bg-bg-surface px-4 py-4">
-      <div className="flex items-center gap-3">
-        <Icon className="h-4 w-4 text-pastel-2" />
-        <div className="text-sm font-medium text-text-primary">{title}</div>
-      </div>
-      <div className="mt-2 text-sm leading-relaxed text-text-secondary">{body}</div>
-    </div>
   );
 }
 

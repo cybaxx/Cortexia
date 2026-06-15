@@ -25,6 +25,9 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Semaphore to prevent concurrent TRIBE GPU inference (avoids OOM on MPS/CUDA)
+_tribe_semaphore = asyncio.Semaphore(1)
+
 _FLOAT_STAT_KEYS = frozenset({"peak", "mean", "auc", "rise_slope", "cv", "decay_slope"})
 
 
@@ -40,12 +43,7 @@ class FrameworkBatchResult(TypedDict):
     tribe_meta: dict[str, Any]
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, value))
-
-
-def _sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + math.exp(-value))
+from app.services.shared_math import clamp as _clamp, sigmoid as _sigmoid
 
 
 def _ensure_runtime_env() -> None:
@@ -309,7 +307,8 @@ async def run_framework_batch(catalyst_text: str, agents: list[dict[str, Any]]) 
 
     from tribe_neural.steps.step5_composites import compute_composites
 
-    result = await asyncio.to_thread(_pipeline_once, text)
+    async with _tribe_semaphore:
+        result = await asyncio.to_thread(_pipeline_once, text)
     stats_baseline = result["roi_stats"]
     connectivity = result["connectivity"]
     default_dominant = result["dominant_roi"]

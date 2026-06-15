@@ -1,0 +1,92 @@
+[
+  {
+    "title": "Social media post claims mandatory vaccination without public hearings",
+    "text": "A viral Facebook post claims the city council quietly approved a mandatory vaccine policy without public consultation. The post includes a screenshot of an alleged internal memo and urges residents to share before officials scrub it from public records.",
+    "source_url": "https://example.com/vaccine-rumor",
+    "speaker_context": "Neighborhood Facebook group post with 2,400 shares",
+    "domain": "public_health",
+    "city_id": "la",
+    "message_complexity": 0.65
+  },
+  {
+    "title": "AI-generated video of mayor accepting bribes circulates on Telegram",
+    "text": "A deepfake video showing the mayor apparently accepting a cash bribe from a developer has been shared 15,000 times on Telegram channels. The video shows the mayor in what appears to be a private meeting, though lighting inconsistencies and audio artifacts suggest AI generation.",
+    "source_url": "https://example.com/deepfake-mayor",
+    "speaker_context": "Telegram channel with 50k subscribers, video timestamp shows last week",
+    "domain": "political",
+    "city_id": "sf",
+    "message_complexity": 0.75
+  },
+  {
+    "title": "Corporate Slack leak claims mandatory RTO with no exceptions",
+    "text": "Screenshots circulating on Blind and Reddit show an alleged internal Slack message from leadership stating that return-to-office will be mandatory five days a week starting next month, with zero exceptions for medical or family reasons. The screenshots lack any verifiable message ID or timestamp metadata.",
+    "source_url": "https://example.com/rto-leak",
+    "speaker_context": "Anonymous post on Blind with 800 comments",
+    "domain": "corporate",
+    "city_id": "sj",
+    "message_complexity": 0.5
+  },
+  {
+    "title": "TikTok influencer claims tap water contains undisclosed pharmaceuticals",
+    "text": "A TikTok video with 2.1 million views shows a person holding a water testing strip claiming the local tap water contains trace amounts of three prescription pharmaceuticals that the city is not disclosing. The video provides no lab report, no methodology, and no identifiable testing credentials.",
+    "source_url": "https://example.com/tap-water-claim",
+    "speaker_context": "TikTok creator with 400k followers, no scientific background disclosed",
+    "domain": "public_health",
+    "city_id": "sd",
+    "message_complexity": 0.55
+  },
+  {
+    "title": "Anonymous letter claims zoning changes will demolish historic neighborhood",
+    "text": "An unsigned letter distributed to 3,000 mailboxes claims the city planning department has approved a rezoning that will allow a developer to buy and demolish an entire historic neighborhood block to build luxury condos. No public hearing has been announced and no rezoning application appears in the city's online permit portal.",
+    "source_url": "https://example.com/zoning-letter",
+    "speaker_context": "Physical mailer with no return address, distributed in the Oakwood historic district",
+    "domain": "urban",
+    "city_id": "sac",
+    "message_complexity": 0.6
+  },
+  {
+    "title": "WhatsApp chain message says election results were manipulated",
+    "text": "A chain message spreading through WhatsApp groups claims that ballot counting machines in the county were reprogrammed before the last election and that official results undercounted votes by 15 percent. The message cites a single unnamed former election worker and provides no documentation or audit trail.",
+    "source_url": "https://example.com/election-chain",
+    "speaker_context": "WhatsApp forward with 'forwarded many times' label, predominantly in Spanish-language groups",
+    "domain": "political",
+    "city_id": "la",
+    "message_complexity": 0.7
+  },
+  {
+    "title": "Reddit post claims fast food chain uses lab-grown meat without labeling",
+    "text": "A Reddit post on r/conspiracy with 12,000 upvotes claims a major fast food chain has been secretly replacing beef with lab-grown meat in three test cities without any labeling disclosure. The post includes photos of allegedly unusual meat texture but no lab analysis or supply chain documentation.",
+    "source_url": "https://example.com/lab-meat-claim",
+    "speaker_context": "Reddit post by throwaway account, cross-posted to 4 subreddits",
+    "domain": "public_health",
+    "city_id": "sf",
+    "message_complexity": 0.45
+  },
+  {
+    "title": "Union group chat alleges company is planning mass layoffs next week",
+    "text": "An internal union Slack workspace has messages claiming the company will announce 30 percent layoffs next Tuesday, citing an unnamed source in HR. Two employee group chats have since amplified the message with warnings to prepare financially. No WARN Act notice has been filed, and the company has not commented.",
+    "source_url": "https://example.com/layoff-rumor",
+    "speaker_context": "Union Slack with 1,200 members, message originally from a shop steward",
+    "domain": "corporate",
+    "city_id": "sj",
+    "message_complexity": 0.5
+  },
+  {
+    "title": "Instagram post claims new light rail project will increase crime by 40%",
+    "text": "An Instagram carousel post claims a proposed light rail extension will increase neighborhood crime by 40 percent based on a study it attributes to a university that says it never conducted such research. The post has been shared by three neighborhood association accounts with a combined 25,000 followers.",
+    "source_url": "https://example.com/light-rail-crime",
+    "speaker_context": "Instagram post by local community account, cites fabricated study",
+    "domain": "urban",
+    "city_id": "sd",
+    "message_complexity": 0.55
+  },
+  {
+    "title": "YouTube video claims apple cider vinegar cures hypertension without medication",
+    "text": "A YouTube video with 850,000 views features a wellness influencer claiming that drinking apple cider vinegar daily can cure hypertension and replace prescription blood pressure medication entirely. The video cites no clinical trials, displays a disclaimer in small text, and includes affiliate links to purchase the specific brand of vinegar.",
+    "source_url": "https://example.com/vinegar-cure",
+    "speaker_context": "YouTube wellness channel, host describes themselves as 'holistic health practitioner'",
+    "domain": "public_health",
+    "city_id": "la",
+    "message_complexity": 0.4
+  }
+]

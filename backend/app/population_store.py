@@ -18,6 +18,8 @@ def init_population_store() -> None:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS agents (
@@ -69,7 +71,6 @@ def save_population(city_id: str, agents: list[dict[str, object]]) -> None:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
-        _ensure_agent_columns(conn)
         conn.executemany(
             """
             INSERT INTO agents (
@@ -127,7 +128,6 @@ def fetch_population(city_id: str, limit: int) -> list[dict[str, object]]:
         return []
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        _ensure_agent_columns(conn)
         rows = conn.execute(
             "SELECT * FROM agents WHERE city_id = ? ORDER BY id ASC LIMIT ?",
             (city_id, limit),
@@ -141,7 +141,6 @@ def fetch_population_agent(city_id: str, agent_id: int) -> dict[str, object] | N
         return None
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        _ensure_agent_columns(conn)
         row = conn.execute(
             "SELECT * FROM agents WHERE city_id = ? AND id = ?",
             (city_id, agent_id),

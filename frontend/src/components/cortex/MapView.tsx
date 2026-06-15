@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import ReactMap, { Layer, type MapRef } from 'react-map-gl';
+import maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
 import DeckGL from '@deck.gl/react';
 import { PathLayer, ScatterplotLayer, TextLayer } from '@deck.gl/layers';
 import { PathStyleExtension } from '@deck.gl/extensions';
@@ -7,10 +9,12 @@ import { getCityById } from '@/data/cities';
 import { COLORS, beliefToAgentState, type Agent } from '@/lib/agents';
 import { useCortexStore } from '@/store/cortex';
 import type { AgentSimulationPayload } from '@/types/simulation';
+import { loadCityPlaces, type CityPlace } from '@/data/places';
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string | undefined;
 const INITIAL_ZOOM = 2.5;
-const MAP_STYLE = 'mapbox://styles/mapbox/dark-v11';
+const FREE_DARK_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
+const MAP_STYLE = MAPBOX_TOKEN ? 'mapbox://styles/mapbox/dark-v11' : FREE_DARK_STYLE;
 
 const BUILDINGS_LAYER = {
   id: '3d-buildings',
@@ -119,6 +123,8 @@ export const MapView = () => {
   const [flowTick, setFlowTick] = useState(0);
   const mapRef = useRef<MapRef>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const cityPlaces = useMemo(() => loadCityPlaces(cityId), [cityId]);
 
   const agents = useMemo(
     () =>
@@ -336,9 +342,9 @@ export const MapView = () => {
             id: 'network-lines',
             data: networkPaths,
             pickable: false,
-            getPath: (d) => d.path,
-            getColor: (d) => [255, 255, 255, Math.round(d.alpha * 0.82)] as [number, number, number, number],
-            getWidth: (d) => d.width,
+            getPath: (d: any) => d.path,
+            getColor: (d: any) => [255, 255, 255, Math.round(d.alpha * 0.82)] as [number, number, number, number],
+            getWidth: (d: any) => d.width,
             widthMinPixels: 1,
             widthMaxPixels: 1.8,
             jointRounded: true,
@@ -353,9 +359,9 @@ export const MapView = () => {
             id: 'active-influence-lines',
             data: activeInteractionPaths,
             pickable: false,
-            getPath: (d) => d.path,
+            getPath: (d: any) => d.path,
             getColor: () => [255, 255, 255, 88] as [number, number, number, number],
-            getWidth: (d) => 1 + d.strength * 0.75,
+            getWidth: (d: any) => 1 + d.strength * 0.75,
             widthMinPixels: 1,
             widthMaxPixels: 2,
             jointRounded: true,
@@ -376,11 +382,11 @@ export const MapView = () => {
             stroked: false,
             filled: true,
             radiusUnits: 'pixels',
-            getPosition: (d) => d.position,
-            getRadius: (d) => 2.5 + d.strength * 2.2,
+            getPosition: (d: any) => d.position,
+            getRadius: (d: any) => 2.5 + d.strength * 2.2,
             radiusMinPixels: 2.5,
             radiusMaxPixels: 6,
-            getFillColor: (d) =>
+            getFillColor: (d: any) =>
               d.beliefState === 'adopted'
                 ? [74, 158, 255, 220]
                 : d.beliefState === 'rejected'
@@ -395,10 +401,10 @@ export const MapView = () => {
           new ScatterplotLayer({
             id: 'cluster-zones-glow',
             data: hotspots,
-            getPosition: (d) => [d.lng, d.lat],
-            getRadius: (d) => d.radiusMeters * 1.12,
+            getPosition: (d: any) => [d.lng, d.lat],
+            getRadius: (d: any) => d.radiusMeters * 1.12,
             radiusUnits: 'meters',
-            getFillColor: (d) => {
+            getFillColor: (d: any) => {
               const [r, g, b] = clusterFill(d.state);
               return [r, g, b, 18] as [number, number, number, number];
             },
@@ -408,10 +414,10 @@ export const MapView = () => {
           new ScatterplotLayer({
             id: 'cluster-zones',
             data: hotspots,
-            getPosition: (d) => [d.lng, d.lat],
-            getRadius: (d) => d.radiusMeters,
+            getPosition: (d: any) => [d.lng, d.lat],
+            getRadius: (d: any) => d.radiusMeters,
             radiusUnits: 'meters',
-            getFillColor: (d) => clusterFill(d.state),
+            getFillColor: (d: any) => clusterFill(d.state),
             stroked: false,
             pickable: false,
           }),
@@ -423,8 +429,8 @@ export const MapView = () => {
             getBackgroundColor: [12, 12, 15, 214],
             getBorderColor: [255, 255, 255, 38],
             backgroundPadding: [10, 5],
-            getPosition: (d) => d.position,
-            getText: (d) => d.label,
+            getPosition: (d: any) => d.position,
+            getText: (d: any) => d.label,
             getSize: 11,
             sizeUnits: 'pixels',
             getColor: [240, 237, 232, 235],
@@ -435,7 +441,54 @@ export const MapView = () => {
           }),
         ]
       : []),
-    new ScatterplotLayer<Agent>({
+    ...(cityPlaces.length
+      ? [
+          new ScatterplotLayer({
+            id: 'real-places',
+            data: cityPlaces,
+            pickable: true,
+            stroked: true,
+            filled: true,
+            radiusUnits: 'pixels',
+            getPosition: (d: any) => d.geometry.coordinates as [number, number],
+            getRadius: () => 5,
+            radiusMinPixels: 4,
+            radiusMaxPixels: 7,
+            getFillColor: (d: any) => {
+              switch (d.properties.kind) {
+                case 'park': return [76, 175, 80, 180] as [number, number, number, number];
+                case 'school': return [255, 183, 77, 180] as [number, number, number, number];
+                case 'hospital': return [239, 83, 80, 180] as [number, number, number, number];
+                case 'government': return [149, 117, 205, 180] as [number, number, number, number];
+                case 'landmark': return [79, 195, 247, 180] as [number, number, number, number];
+                default: return [144, 164, 174, 180] as [number, number, number, number];
+              }
+            },
+            getLineColor: () => [255, 255, 255, 80] as [number, number, number, number],
+            getLineWidth: () => 1,
+            lineWidthMinPixels: 0.5,
+            parameters: { depthTest: false },
+          }),
+          new TextLayer({
+            id: 'real-places-labels',
+            data: cityPlaces,
+            pickable: false,
+            getPosition: (d: any) => d.geometry.coordinates as [number, number],
+            getText: (d: any) => d.properties.name,
+            getSize: 9,
+            sizeUnits: 'pixels',
+            getColor: [240, 237, 232, 200],
+            getTextAnchor: 'start',
+            getAlignmentBaseline: 'center',
+            getPixelOffset: [8, 0],
+            fontFamily: 'IBM Plex Sans, system-ui, sans-serif',
+            background: true,
+            getBackgroundColor: [12, 12, 15, 140],
+            backgroundPadding: [4, 2],
+          }),
+        ]
+      : []),
+    new ScatterplotLayer({
       id: 'agent-ground-glow',
       data: agents,
       pickable: false,
@@ -443,26 +496,26 @@ export const MapView = () => {
       filled: true,
       opacity: 0.65,
       radiusUnits: 'pixels',
-      getPosition: (a) => a.position,
-      getRadius: (a) => 8 + (a.confidence ?? 0.5) * 5,
+      getPosition: (a: any) => a.position,
+      getRadius: (a: any) => 8 + (a.confidence ?? 0.5) * 5,
       radiusMinPixels: 8,
       radiusMaxPixels: 16,
-      getFillColor: (a) => {
-        const [r, g, b] = COLORS[a.state];
+      getFillColor: (a: any) => {
+        const [r, g, b] = COLORS[a.state as keyof typeof COLORS];
         return [r, g, b, 22 + Math.round((a.confidence ?? 0.5) * 18)] as [number, number, number, number];
       },
       parameters: { depthTest: false },
     }),
     ...(pinned
       ? [
-          new ScatterplotLayer<Agent>({
+          new ScatterplotLayer({
             id: 'person-selected-ring',
             data: [mergedPopupAgent ?? pinned.agent],
             pickable: false,
             stroked: true,
             filled: false,
             radiusUnits: 'pixels',
-            getPosition: (a) => a.position,
+            getPosition: (a: any) => a.position,
             getRadius: () => markerSize(viewState.zoom, c.zoom) * 0.92,
             radiusMinPixels: 22,
             radiusMaxPixels: 38,
@@ -477,10 +530,8 @@ export const MapView = () => {
   return (
     <div ref={containerRef} className="relative h-full min-h-[420px] bg-bg-deep">
       {!MAPBOX_TOKEN && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center px-4 text-center">
-          <div className="rounded-[20px] border border-white/[0.08] bg-bg-surface/90 px-4 py-3 font-mono text-[10px] text-text-secondary">
-            Set <span className="text-pastel-2/90">VITE_MAPBOX_TOKEN</span> in <code className="text-text-primary">frontend/.env</code> to load the basemap.
-          </div>
+        <div className="absolute bottom-3 left-3 z-0 rounded-[8px] border border-white/[0.06] bg-bg-surface/70 px-3 py-1.5 font-mono text-[9px] text-text-muted">
+          Free OSM basemap · set <span className="text-pastel-2/90">VITE_MAPBOX_TOKEN</span> for premium tiles
         </div>
       )}
 
@@ -492,17 +543,16 @@ export const MapView = () => {
         onClick={handleDeckClick}
         style={{ position: 'absolute', inset: 0 }}
       >
-        {MAPBOX_TOKEN && (
-          <ReactMap
-            ref={mapRef}
-            mapboxAccessToken={MAPBOX_TOKEN}
-            mapStyle={MAP_STYLE}
-            reuseMaps
-            maxPitch={85}
-          >
-            <Layer {...BUILDINGS_LAYER} />
-          </ReactMap>
-        )}
+        <ReactMap
+          ref={mapRef}
+          mapLib={maplibregl as any}
+          mapStyle={MAP_STYLE}
+          reuseMaps
+          maxPitch={85}
+          {...(MAPBOX_TOKEN ? { mapboxAccessToken: MAPBOX_TOKEN } : {})}
+        >
+          <Layer {...(BUILDINGS_LAYER as any)} />
+        </ReactMap>
       </DeckGL>
 
       <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">

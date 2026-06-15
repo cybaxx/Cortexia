@@ -2,7 +2,7 @@ import sqlite3
 import json
 from app.config import get_settings
 from app.population_store import fetch_population, fetch_population_agent, init_population_store
-from app.services.api_simulation import _build_virtual_population
+from app.services.population import _build_virtual_population
 
 def run_test():
     init_population_store()

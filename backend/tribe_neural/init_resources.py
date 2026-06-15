@@ -16,6 +16,43 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.environ.get("TRIBE_DATA_DIR", "./data"))
 
 
+def _get_device() -> str:
+    """Return the best available torch device: cuda > mps > cpu.
+
+    Checks pydantic settings first, then TRIBE_DEVICE env var, then auto-detects.
+    """
+    override = ""
+    try:
+        from app.config import get_settings
+        override = get_settings().tribe_device.strip().lower()
+    except Exception:
+        pass
+    if not override:
+        override = os.environ.get("TRIBE_DEVICE", "").strip().lower()
+    if override in {"cuda", "mps", "cpu"}:
+        return override
+
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _get_autocast_device() -> str:
+    """Return the device name for torch.amp.autocast.
+
+    CPU does not support autocast, so we return "cpu" as a sentinel
+    that callers can check to skip the autocast wrapper entirely.
+    """
+    device = _get_device()
+    if device == "cpu":
+        return "cpu"
+    return device
+
+
 @dataclass
 class Resources:
     """Container for all pre-loaded pipeline resources."""
@@ -104,11 +141,10 @@ def _load_whisperx() -> tuple:
     if os.environ.get("TRIBE_DISABLE_WHISPERX", "").strip().lower() in {"1", "true", "yes"}:
         raise RuntimeError("WhisperX disabled by TRIBE_DISABLE_WHISPERX")
 
-    import torch
     import whisperx
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "default"
+    device = _get_device()
+    compute_type = "float16" if device in ("cuda", "mps") else "default"
 
     asr_model = whisperx.load_model(
         "large-v3", device=device, compute_type=compute_type, language="en",
@@ -122,11 +158,10 @@ def _load_whisperx() -> tuple:
 
 def _patch_whisperx(asr_model: object, align_model: object, align_metadata: dict) -> None:
     """Monkey-patch ExtractWordsFromAudio to use warm whisperx models."""
-    import torch
     import whisperx
     from tribev2.eventstransforms import ExtractWordsFromAudio
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _get_device()
 
     @staticmethod
     def _fast_transcribe(wav_filename, language):
@@ -159,45 +194,56 @@ def _patch_whisperx(asr_model: object, align_model: object, align_metadata: dict
     logger.info("ExtractWordsFromAudio patched to use in-process whisperx")
 
 
-def _enable_cuda_optimizations() -> None:
-    """Enable CUDA performance flags for inference."""
+def _enable_device_optimizations() -> None:
+    """Enable platform-specific performance flags for inference."""
     import torch
 
-    if not torch.cuda.is_available():
-        return
+    device = _get_device()
 
-    # TF32: ~2-3x faster matmuls with negligible precision loss
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    # cuDNN benchmark: auto-tune convolution algorithms for this GPU
-    torch.backends.cudnn.benchmark = True
-
-    logger.info(
-        "CUDA optimizations enabled: TF32 matmul=%s, cuDNN benchmark=%s",
-        torch.backends.cuda.matmul.allow_tf32,
-        torch.backends.cudnn.benchmark,
-    )
+    if device == "cuda":
+        # TF32: ~2-3x faster matmuls with negligible precision loss
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # cuDNN benchmark: auto-tune convolution algorithms for this GPU
+        torch.backends.cudnn.benchmark = True
+        logger.info(
+            "CUDA optimizations enabled: TF32 matmul=%s, cuDNN benchmark=%s",
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.benchmark,
+        )
+    elif device == "mps":
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+        logger.info("MPS device selected for TRIBE inference")
+    else:
+        logger.info("CPU device selected for TRIBE inference")
 
 
 def _optimize_tribe_model(model_wrapper: object) -> None:
-    """Enable bf16 autocast for TRIBE inference."""
+    """Enable fp16 autocast for TRIBE inference on the active device."""
     import torch
 
     model = model_wrapper._model
     if model is None:
         return
 
-    # Wrap the forward method with bf16 autocast so inputs are automatically
-    # cast — avoids dtype mismatch between fp32 data loader and bf16 model.
+    autocast_device = _get_autocast_device()
+    if autocast_device == "cpu":
+        logger.info("TRIBE model running on CPU — autocast skipped")
+        return
+
+    # Wrap the forward method with fp16 autocast so inputs are automatically
+    # cast — avoids dtype mismatch between fp32 data loader and fp16 model.
     original_forward = model.forward
 
-    @torch.amp.autocast("cuda", dtype=torch.float16)
+    @torch.amp.autocast(autocast_device, dtype=torch.float16)
     def autocast_forward(*args, **kwargs):
         return original_forward(*args, **kwargs)
 
     model.forward = autocast_forward
-    logger.info("TRIBE model forward wrapped with fp16 autocast")
+    logger.info("TRIBE model forward wrapped with fp16 autocast on %s", autocast_device)
 
 
 def _patch_tts() -> None:
@@ -293,7 +339,10 @@ def _patch_tts() -> None:
             communicate = edge_tts.Communicate(self.text, "en-US-AriaNeural")
             await communicate.save(str(audio_path))
 
-        # Run async edge-tts in a sync context
+        # Run async edge-tts in a sync context.
+        # This runs during model loading at startup (never during request handling),
+        # so the asyncio.run-in-threadpool pattern is safe here.
+        # If called from an async context, uses a separate thread to avoid deadlock.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -337,15 +386,31 @@ def load_resources() -> Resources:
     # Avoid tokenizer/fork deadlocks once TRIBE builds dataloaders.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    # Enable CUDA optimizations before loading any models
-    _enable_cuda_optimizations()
+    # Enable device-specific optimizations before loading any models
+    _enable_device_optimizations()
 
     logger.info("Loading TRIBE v2 model...")
     from tribev2.demo_utils import TribeModel
 
+    device = _get_device()
+    logger.info("TRIBE device: %s", device)
+
+    # On Apple Silicon, the text/audio/image/video feature extractors
+    # default to "cuda" in the checkpoint config.yaml.  Override them
+    # to "cpu" so the Llama embedding model loads without CUDA hooks.
+    # The main brain model still runs on the detected device (usually MPS).
+    extractor_device = "cpu"
+    if device == "cuda":
+        extractor_device = "cuda"
+
     model = TribeModel.from_pretrained(
         "facebook/tribev2",
         cache_folder=str(DATA_DIR / "cache"),
+        device=device,
+        config_update={
+            "data.text_feature.device": extractor_device,
+            "data.audio_feature.device": extractor_device,
+        },
     )
     logger.info("TRIBE v2 model loaded")
 

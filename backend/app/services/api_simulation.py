@@ -1,7 +1,15 @@
 """
 Case-oriented misinformation analysis for `POST /api/simulate`.
 
-The backend now returns a research workspace payload:
+Module sections (4585 lines across 6 functional areas):
+  ── Population Generation (lines ~690–970)
+  ── Scoring & Calibration (lines ~1090–1700)
+  ── Propagation & Swarm (lines ~1830–2880)
+  ── Agent Reasoning (lines ~3030–3360)
+  ── Payload Assembly (lines ~3760–4120)
+  ── Pipeline Orchestration (lines ~3940–4590)
+
+The backend returns a research workspace payload:
 - evidence trace
 - spread model
 - mechanisms
@@ -26,10 +34,21 @@ from urllib.parse import urlparse
 import httpx
 
 from app.city_presets import get_city
+from app.political_geography import lookup_political_lean
 from app.config import get_settings
 from app.pipeline_store import persist_case_run
 from app.services.ai_clients import BSV, call_k2_batch_think, call_k2_explanation_only, call_k2_timeline_batch, call_tribe_modal_batch
 from app.services.langgraph_multi_agent_sim import AgentAction, run_simulation_loop, HybridLangGraphDecisionEngine, make_chat_openai_decision_engine
+from app.services.population import (
+    _build_virtual_population,
+    _compress_ws,
+    _Demographics,
+    _seeded,
+    _sentences,
+    _upper_first,
+    _Virt,
+)
+from app.services.shared_math import clamp as _clamp
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -41,25 +60,6 @@ SignalType = Literal[
     "memory_alignment",
     "social_proof",
 ]
-
-ROLES = (
-    "Civic analyst",
-    "Field organizer",
-    "Educator",
-    "Healthcare worker",
-    "Policy aide",
-    "Journalist",
-    "Engineer",
-    "Small business owner",
-    "Researcher",
-    "First responder",
-    "Operations lead",
-)
-
-LOW_FORMAL_EDUCATION_LEVELS = (
-    "Less than high school",
-    "Limited formal schooling",
-)
 
 MAX_K2_REASONING_AGENTS = 36
 MAX_K2_TIMELINE_AGENTS = 18
@@ -128,39 +128,6 @@ INTERVENTION_LIBRARY: dict[SignalType, dict[str, str]] = {
     },
 }
 
-FIRST = [
-    "Ava",
-    "Noah",
-    "Mia",
-    "Liam",
-    "Zoe",
-    "Eli",
-    "Maya",
-    "Owen",
-    "Iris",
-    "Kai",
-    "Lena",
-    "Theo",
-    "Nora",
-    "Ezra",
-]
-LAST = [
-    "Ramos",
-    "Chen",
-    "Patel",
-    "Nguyen",
-    "Okafor",
-    "Silva",
-    "Khan",
-    "Walsh",
-    "Brooks",
-    "Tanaka",
-    "Mendez",
-    "Park",
-    "Aoki",
-    "Diallo",
-]
-
 _THINK_RE = re.compile(r"<think>([\s\S]*?)</think>", re.IGNORECASE)
 _ACTION_RE = re.compile(r"<action>\s*(Adopted|Rejected)\s*</action>", re.IGNORECASE)
 _CONFIDENCE_RE = re.compile(r"<confidence>\s*([01](?:\.\d+)?)\s*</confidence>", re.IGNORECASE)
@@ -212,29 +179,6 @@ class _ReadableHTMLParser(HTMLParser):
 
 
 @dataclass(frozen=True)
-class _Demographics:
-    age_band: str
-    age_years: int
-    education_level: str
-    income_band: str
-    housing_status: str
-    language_profile: str
-    community_tenure: str
-    caregiving_load: str
-    digital_media_habit: str
-
-
-@dataclass(frozen=True)
-class _Virt:
-    id: int
-    name: str
-    role: str
-    lat: float
-    lng: float
-    demographics: _Demographics
-
-
-@dataclass(frozen=True)
 class _Region:
     agent_id: int
     latitude: float
@@ -250,6 +194,8 @@ class _Traits:
     institutional_trust: float
     analytic_scrutiny: float
     baseline_openness: float
+    political_lean: float = 0.0
+    political_homogeneity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -677,27 +623,8 @@ class _HeuristicLangGraphDecisionEngine:
         )
 
 
-def _compress_ws(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _count_phrase(text: str, phrase: str) -> int:
     return len(re.findall(rf"\b{re.escape(phrase)}\b", text))
-
-
-def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, v))
-
-
-def _seeded(i: int) -> float:
-    x = math.sin(i * 9301 + 49297) * 233280
-    return x - math.floor(x)
-
-
-def _upper_first(text: str) -> str:
-    if not text:
-        return text
-    return text[0].upper() + text[1:]
 
 
 def _extract_page_text(html_text: str) -> str:
@@ -707,13 +634,6 @@ def _extract_page_text(html_text: str) -> str:
     lines = [_compress_ws(line) for line in raw.splitlines()]
     text = "\n".join(line for line in lines if line)
     return text[:3200]
-
-
-def _sentences(text: str) -> list[str]:
-    cleaned = re.sub(r"\s+", " ", text.strip())
-    if not cleaned:
-        return []
-    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()][:6]
 
 
 async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str | None) -> tuple[str | None, str | None]:
@@ -743,341 +663,6 @@ async def _fetch_source_context(httpx_client: httpx.AsyncClient, source_url: str
         return extracted[:2000], None
     except Exception as exc:
         raise RuntimeError(f"Source URL fetch failed: {exc}") from exc
-
-
-from app.population_store import fetch_population, save_population
-
-
-def _education_diversity_floor(count: int) -> int:
-    """Minimum agents with `LOW_FORMAL_EDUCATION_LEVELS` so traits (literacy / susceptibility) span enough to color the map."""
-    if count <= 0:
-        return 0
-    return min(count, max(6, int(round(count * 0.15))))
-
-
-def _is_low_formal_education(level: str) -> bool:
-    return level in LOW_FORMAL_EDUCATION_LEVELS
-
-
-def _supports_low_formal_education(role: str) -> bool:
-    lowered = role.lower()
-    return not any(token in lowered for token in ("analyst", "research", "engineer", "journal", "policy"))
-
-
-def _ensure_population_education_mix(city_id: str, agents: list[_Virt]) -> list[_Virt]:
-    target_floor = _education_diversity_floor(len(agents))
-    current = sum(1 for agent in agents if _is_low_formal_education(agent.demographics.education_level))
-    if current >= target_floor:
-        return agents
-
-    candidates = sorted(
-        [
-            agent for agent in agents
-            if not _is_low_formal_education(agent.demographics.education_level)
-            and _supports_low_formal_education(agent.role)
-        ],
-        key=lambda agent: (_seeded(agent.id * 97 + 41), agent.id),
-    )
-    if not candidates:
-        return agents
-
-    replacements: dict[int, _Virt] = {}
-    persisted_updates: list[dict[str, object]] = []
-    for index, agent in enumerate(candidates[: max(0, target_floor - current)]):
-        new_education = LOW_FORMAL_EDUCATION_LEVELS[index % len(LOW_FORMAL_EDUCATION_LEVELS)]
-        updated = _Virt(
-            id=agent.id,
-            name=agent.name,
-            role=agent.role,
-            lat=agent.lat,
-            lng=agent.lng,
-            demographics=_Demographics(
-                age_band=agent.demographics.age_band,
-                age_years=agent.demographics.age_years,
-                education_level=new_education,
-                income_band=agent.demographics.income_band,
-                housing_status=agent.demographics.housing_status,
-                language_profile=agent.demographics.language_profile,
-                community_tenure=agent.demographics.community_tenure,
-                caregiving_load=agent.demographics.caregiving_load,
-                digital_media_habit=agent.demographics.digital_media_habit,
-            ),
-        )
-        replacements[agent.id] = updated
-        persisted_updates.append(
-            {
-                "id": updated.id,
-                "name": updated.name,
-                "role": updated.role,
-                "lat": updated.lat,
-                "lng": updated.lng,
-                "demographics": {
-                    "age_band": updated.demographics.age_band,
-                    "age_years": updated.demographics.age_years,
-                    "education_level": updated.demographics.education_level,
-                    "income_band": updated.demographics.income_band,
-                    "housing_status": updated.demographics.housing_status,
-                    "language_profile": updated.demographics.language_profile,
-                    "community_tenure": updated.demographics.community_tenure,
-                    "caregiving_load": updated.demographics.caregiving_load,
-                    "digital_media_habit": updated.demographics.digital_media_habit,
-                },
-            }
-        )
-
-    if persisted_updates:
-        save_population(city_id, persisted_updates)
-    return [replacements.get(agent.id, agent) for agent in agents]
-
-def _build_virtual_population(city_id: str, count: int) -> list[_Virt]:
-    existing_agents = fetch_population(city_id, count)
-    out: list[_Virt] = []
-
-    for item in existing_agents:
-        demo_dict = item["demographics"]
-        out.append(
-            _Virt(
-                id=item["id"],
-                name=item["name"],
-                role=item["role"],
-                lat=item["lat"],
-                lng=item["lng"],
-                demographics=_Demographics(
-                    age_band=demo_dict["age_band"],
-                    age_years=demo_dict["age_years"],
-                    education_level=demo_dict["education_level"],
-                    income_band=demo_dict["income_band"],
-                    housing_status=demo_dict["housing_status"],
-                    language_profile=demo_dict["language_profile"],
-                    community_tenure=demo_dict["community_tenure"],
-                    caregiving_load=demo_dict["caregiving_load"],
-                    digital_media_habit=demo_dict["digital_media_habit"],
-                ),
-            )
-        )
-
-    if len(out) >= count:
-        return _ensure_population_education_mix(city_id, out)
-
-    # Generate missing agents
-    city = get_city(city_id)
-    zones = list(city.land_zones)
-    zone_areas = [
-        max(0.000001, (zone.lng_max - zone.lng_min) * (zone.lat_max - zone.lat_min))
-        for zone in zones
-    ]
-    total_area = sum(zone_areas)
-    cumulative: list[float] = []
-    running = 0.0
-    for area in zone_areas:
-        running += area / total_area
-        cumulative.append(running)
-
-    new_agents_data = []
-    start_id = len(out)
-
-    for i in range(start_id, count):
-        zone_pick = _seeded(i + 8500)
-        zone_idx = next((idx for idx, bound in enumerate(cumulative) if zone_pick <= bound), 0)
-        zone = zones[max(0, zone_idx)]
-        r1 = _seeded(i + 1)
-        r2 = _seeded(i + 1001)
-        lng_inset = (zone.lng_max - zone.lng_min) * 0.08
-        lat_inset = (zone.lat_max - zone.lat_min) * 0.08
-        role = ROLES[i % len(ROLES)]
-        lat = zone.lat_min + lat_inset + r2 * max(0.0001, zone.lat_max - zone.lat_min - lat_inset * 2)
-        lng = zone.lng_min + lng_inset + r1 * max(0.0001, zone.lng_max - zone.lng_min - lng_inset * 2)
-        name = f"{FIRST[i % len(FIRST)]} {LAST[(i * 3) % len(LAST)]}"
-        
-        demographics = _generate_demographics(
-            agent_id=i,
-            role=role,
-            lat=lat,
-            lng=lng,
-            city_id=city_id,
-        )
-
-        virt = _Virt(
-            id=i,
-            name=name,
-            role=role,
-            lat=lat,
-            lng=lng,
-            demographics=demographics,
-        )
-        out.append(virt)
-
-        new_agents_data.append({
-            "id": virt.id,
-            "name": virt.name,
-            "role": virt.role,
-            "lat": virt.lat,
-            "lng": virt.lng,
-            "demographics": {
-                "age_band": demographics.age_band,
-                "age_years": demographics.age_years,
-                "education_level": demographics.education_level,
-                "income_band": demographics.income_band,
-                "housing_status": demographics.housing_status,
-                "language_profile": demographics.language_profile,
-                "community_tenure": demographics.community_tenure,
-                "caregiving_load": demographics.caregiving_load,
-                "digital_media_habit": demographics.digital_media_habit,
-            }
-        })
-
-    if new_agents_data:
-        save_population(city_id, new_agents_data)
-
-    return _ensure_population_education_mix(city_id, out)
-
-def _weighted_pick(seed: float, options: list[tuple[str, float]]) -> str:
-    total = max(0.0001, sum(weight for _, weight in options))
-    cursor = 0.0
-    for label, weight in options:
-        cursor += weight / total
-        if seed <= cursor:
-            return label
-    return options[-1][0]
-
-
-def _age_band_for_role(role: str, agent_id: int) -> tuple[str, int]:
-    lowered = role.lower()
-    seed = _seeded(agent_id * 19 + 7)
-    if any(token in lowered for token in ("policy", "analyst", "research", "operations")):
-        band = _weighted_pick(seed, [("25-34", 0.28), ("35-44", 0.34), ("45-54", 0.24), ("55-64", 0.14)])
-    elif any(token in lowered for token in ("educator", "health", "journal", "responder")):
-        band = _weighted_pick(seed, [("25-34", 0.22), ("35-44", 0.31), ("45-54", 0.29), ("55-64", 0.18)])
-    else:
-        band = _weighted_pick(seed, [("18-24", 0.14), ("25-34", 0.3), ("35-44", 0.24), ("45-54", 0.18), ("55-64", 0.1), ("65+", 0.04)])
-    ranges = {
-        "18-24": (18, 24),
-        "25-34": (25, 34),
-        "35-44": (35, 44),
-        "45-54": (45, 54),
-        "55-64": (55, 64),
-        "65+": (65, 74),
-    }
-    lo, hi = ranges[band]
-    age_years = lo + int(_seeded(agent_id * 23 + 13) * (hi - lo + 1))
-    return band, age_years
-
-
-def _generate_demographics(*, agent_id: int, role: str, lat: float, lng: float, city_id: str) -> _Demographics:
-    city = get_city(city_id)
-    lat_span = max(0.001, max(zone.lat_max for zone in city.land_zones) - min(zone.lat_min for zone in city.land_zones))
-    lng_span = max(0.001, max(zone.lng_max for zone in city.land_zones) - min(zone.lng_min for zone in city.land_zones))
-    northness = _clamp((lat - min(zone.lat_min for zone in city.land_zones)) / lat_span)
-    eastness = _clamp((lng - min(zone.lng_min for zone in city.land_zones)) / lng_span)
-    lowered = role.lower()
-    age_band, age_years = _age_band_for_role(role, agent_id)
-    education_seed = _seeded(agent_id * 31 + 3)
-    if any(token in lowered for token in ("analyst", "research", "engineer", "journal")):
-        # Still degree-heavy, but real-world variance (certificate programs, incomplete degrees).
-        education = _weighted_pick(
-            education_seed,
-            [
-                ("Some college", 0.1),
-                ("Associate", 0.14),
-                ("Bachelor's", 0.34),
-                ("Master's", 0.32),
-                ("Professional/Doctoral", 0.1),
-            ],
-        )
-    elif any(token in lowered for token in ("policy", "educator", "health")):
-        education = _weighted_pick(
-            education_seed,
-            [
-                ("High school", 0.08),
-                ("Some college", 0.14),
-                ("Associate", 0.22),
-                ("Bachelor's", 0.34),
-                ("Master's", 0.14),
-                ("Professional/Doctoral", 0.06),
-                ("Limited formal schooling", 0.02),
-            ],
-        )
-    else:
-        education = _weighted_pick(
-            education_seed,
-            [
-                ("Less than high school", 0.06),
-                ("Limited formal schooling", 0.06),
-                ("High school", 0.22),
-                ("Some college", 0.26),
-                ("Associate", 0.16),
-                ("Bachelor's", 0.16),
-                ("Master's", 0.06),
-                ("Professional/Doctoral", 0.02),
-            ],
-        )
-
-    income_seed = _seeded(agent_id * 37 + 9)
-    role_income_bias = 0.12 if any(token in lowered for token in ("engineer", "policy", "research")) else 0.06 if any(token in lowered for token in ("health", "educator", "operations")) else -0.02
-    income_position = _clamp(0.18 + eastness * 0.22 + northness * 0.12 + role_income_bias + (income_seed - 0.5) * 0.22)
-    if income_position >= 0.72:
-        income_band = "Upper middle income"
-    elif income_position >= 0.52:
-        income_band = "Middle income"
-    elif income_position >= 0.34:
-        income_band = "Lower middle income"
-    else:
-        income_band = "Economically strained"
-
-    housing_seed = _seeded(agent_id * 41 + 5)
-    if income_band == "Economically strained":
-        housing_status = _weighted_pick(housing_seed, [("Stable renter", 0.48), ("Multigenerational household", 0.28), ("Housing insecure", 0.24)])
-    elif income_band == "Upper middle income":
-        housing_status = _weighted_pick(housing_seed, [("Homeowner", 0.54), ("Stable renter", 0.3), ("Multigenerational household", 0.16)])
-    else:
-        housing_status = _weighted_pick(housing_seed, [("Stable renter", 0.42), ("Homeowner", 0.34), ("Multigenerational household", 0.18), ("Housing insecure", 0.06)])
-
-    language_profile = _weighted_pick(
-        _seeded(agent_id * 43 + 17),
-        [
-            ("English-dominant", 0.46),
-            ("Bilingual English-Spanish", 0.34),
-            ("English plus household language", 0.14),
-            ("Multilingual household", 0.06),
-        ],
-    )
-    community_tenure = _weighted_pick(
-        _seeded(agent_id * 47 + 21),
-        [
-            ("Recent arrival", 0.14),
-            ("Established resident", 0.36),
-            ("Long-term resident", 0.34),
-            ("Deeply rooted local", 0.16),
-        ],
-    )
-    caregiving_load = _weighted_pick(
-        _seeded(agent_id * 53 + 27),
-        [
-            ("Low caregiving load", 0.42),
-            ("Shared caregiving", 0.38),
-            ("Primary caregiver", 0.2),
-        ],
-    )
-    digital_media_habit = _weighted_pick(
-        _seeded(agent_id * 59 + 31),
-        [
-            ("Local-news heavy", 0.26),
-            ("Group-chat heavy", 0.24),
-            ("Public-feed heavy", 0.24),
-            ("Mixed verification habit", 0.26),
-        ],
-    )
-    return _Demographics(
-        age_band=age_band,
-        age_years=age_years,
-        education_level=education,
-        income_band=income_band,
-        housing_status=housing_status,
-        language_profile=language_profile,
-        community_tenure=community_tenure,
-        caregiving_load=caregiving_load,
-        digital_media_habit=digital_media_habit,
-    )
 
 
 def _keyword_density(text: str, words: tuple[str, ...]) -> float:
@@ -1263,69 +848,18 @@ def _model_fidelity_factor(source_excerpt: str | None) -> tuple[float, list[str]
 
 
 def _demographic_conditioning_vector(demographics: _Demographics) -> dict[str, float]:
-    education_support = {
-        "Less than high school": 0.04,
-        "Limited formal schooling": 0.08,
-        "High school": 0.12,
-        "Some college": 0.24,
-        "Associate": 0.34,
-        "Bachelor's": 0.48,
-        "Master's": 0.6,
-        "Professional/Doctoral": 0.7,
-    }.get(demographics.education_level, 0.3)
-    economic_strain = {
-        "Upper middle income": 0.12,
-        "Middle income": 0.26,
-        "Lower middle income": 0.48,
-        "Economically strained": 0.72,
-    }.get(demographics.income_band, 0.4)
-    housing_flux = {
-        "Homeowner": 0.12,
-        "Stable renter": 0.28,
-        "Multigenerational household": 0.34,
-        "Housing insecure": 0.7,
-    }.get(demographics.housing_status, 0.3)
-    language_bridge = {
-        "English-dominant": 0.1,
-        "Bilingual English-Spanish": 0.44,
-        "English plus household language": 0.3,
-        "Multilingual household": 0.56,
-    }.get(demographics.language_profile, 0.2)
-    community_embeddedness = {
-        "Recent arrival": 0.14,
-        "Established resident": 0.42,
-        "Long-term resident": 0.66,
-        "Deeply rooted local": 0.84,
-    }.get(demographics.community_tenure, 0.4)
-    caregiving_pressure = {
-        "Low caregiving load": 0.12,
-        "Shared caregiving": 0.36,
-        "Primary caregiver": 0.68,
-    }.get(demographics.caregiving_load, 0.2)
-    media_velocity = {
-        "Local-news heavy": 0.2,
-        "Group-chat heavy": 0.58,
-        "Public-feed heavy": 0.66,
-        "Mixed verification habit": 0.32,
-    }.get(demographics.digital_media_habit, 0.3)
-    age_index = {
-        "18-24": 0.32,
-        "25-34": 0.46,
-        "35-44": 0.56,
-        "45-54": 0.62,
-        "55-64": 0.66,
-        "65+": 0.6,
-    }.get(demographics.age_band, 0.5)
-    return {
-        "education_support": education_support,
-        "economic_strain": economic_strain,
-        "housing_flux": housing_flux,
-        "language_bridge": language_bridge,
-        "community_embeddedness": community_embeddedness,
-        "caregiving_pressure": caregiving_pressure,
-        "media_velocity": media_velocity,
-        "age_index": age_index,
-    }
+    from app.services.tribe_framework import _demographic_modulators
+    return _demographic_modulators({
+        "education_level": demographics.education_level,
+        "income_band": demographics.income_band,
+        "housing_status": demographics.housing_status,
+        "language_profile": demographics.language_profile,
+        "community_tenure": demographics.community_tenure,
+        "caregiving_load": demographics.caregiving_load,
+        "digital_media_habit": demographics.digital_media_habit,
+        "age_band": demographics.age_band,
+        "age_years": demographics.age_years,
+    })
 
 
 def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
@@ -1334,6 +868,7 @@ def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
     northness = _clamp((agent.lat - min(zone.lat_min for zone in city.land_zones)) / max(0.001, max(zone.lat_max for zone in city.land_zones) - min(zone.lat_min for zone in city.land_zones)))
     eastness = _clamp((agent.lng - min(zone.lng_min for zone in city.land_zones)) / max(0.001, max(zone.lng_max for zone in city.land_zones) - min(zone.lng_min for zone in city.land_zones)))
     demographics = _demographic_conditioning_vector(agent.demographics)
+    pol = lookup_political_lean(agent.lat, agent.lng, city_id)
 
     analytical = 1.0 if any(token in role for token in ("analyst", "engineer", "research")) else 0.0
     service = 1.0 if any(token in role for token in ("health", "educator", "responder")) else 0.0
@@ -1369,12 +904,16 @@ def _agent_conditioning(agent: _Virt, city_id: str) -> dict[str, float]:
         "caregiving_pressure": demographics["caregiving_pressure"],
         "media_velocity": demographics["media_velocity"],
         "age_index": demographics["age_index"],
+        "political_lean": pol.lean,
+        "political_homogeneity": pol.homogeneity,
     }
 
 
-def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
-    cond = _agent_conditioning(agent, city_id)
+def _agent_traits(agent: _Virt, city_id: str, *, conditioning: dict[str, float] | None = None) -> _Traits:
+    cond = conditioning if conditioning is not None else _agent_conditioning(agent, city_id)
     seeded_shift = lambda offset: (_seeded(agent.id * 29 + offset) - 0.5) * 0.16
+    pol_lean = cond.get("political_lean", 0.0)
+    pol_homog = cond.get("political_homogeneity", 0.0)
     return _Traits(
         evidence_literacy=_clamp(
             0.34
@@ -1382,6 +921,7 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             + cond["service"] * 0.07
             + cond["education_support"] * 0.34
             + (0.06 if agent.demographics.digital_media_habit == "Local-news heavy" else 0.03 if agent.demographics.digital_media_habit == "Mixed verification habit" else -0.02)
+            + abs(pol_lean) * 0.08  # politically engaged = more informed
             + seeded_shift(7)
         ),
         peer_susceptibility=_clamp(
@@ -1390,6 +930,7 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             + cond["peripheral_pressure"] * 0.14
             + cond["language_bridge"] * 0.18
             + cond["media_velocity"] * 0.22
+            + pol_homog * 0.18  # homogeneous areas → stronger in-group peer effects
             + (0.04 if agent.demographics.digital_media_habit == "Public-feed heavy" else 0.02 if agent.demographics.digital_media_habit == "Group-chat heavy" else 0.0)
             + seeded_shift(11)
         ),
@@ -1398,14 +939,20 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             + cond["identity_salience"] * 0.26
             + cond["community_embeddedness"] * 0.18
             + cond["caregiving_pressure"] * 0.08
+            + pol_homog * 0.14  # homogeneous areas → stronger identity alignment
             + seeded_shift(13)
         ),
-        institutional_trust=_clamp(cond["institutional_trust"] + seeded_shift(17)),
+        institutional_trust=_clamp(
+            cond["institutional_trust"]
+            + pol_lean * 0.15  # liberals trust institutions more; conservatives less
+            + seeded_shift(17)
+        ),
         analytic_scrutiny=_clamp(
             0.28
             + cond["analytical"] * 0.26
             + cond["education_support"] * 0.24
             + cond["age_index"] * 0.08
+            + abs(pol_lean) * 0.12  # politically engaged = more scrutiny regardless of side
             + (0.05 if agent.demographics.digital_media_habit == "Local-news heavy" else -0.03 if agent.demographics.digital_media_habit == "Public-feed heavy" else 0.0)
             + seeded_shift(19)
         ),
@@ -1420,6 +967,8 @@ def _agent_traits(agent: _Virt, city_id: str) -> _Traits:
             - cond["peripheral_pressure"] * 0.05
             + seeded_shift(23)
         ),
+        political_lean=pol_lean,
+        political_homogeneity=pol_homog,
     )
 
 
@@ -1430,6 +979,7 @@ def _apply_lfcm_calibration(
     city_id: str,
     case_features: dict[str, float],
     message_complexity: float,
+    conditioning: dict[str, float] | None = None,
 ) -> BSV:
     """
     Lightweight calibration layer on top of TRIBE.
@@ -1438,7 +988,7 @@ def _apply_lfcm_calibration(
     - adds role / case conditioning
     - regularizes toward the base state to avoid exaggerated subgroup drift
     """
-    cond = _agent_conditioning(agent, city_id)
+    cond = conditioning if conditioning is not None else _agent_conditioning(agent, city_id)
     complexity = _clamp(message_complexity)
     media_habit = str(agent.demographics.digital_media_habit or "")
     tenure = str(agent.demographics.community_tenure or "")
@@ -1503,7 +1053,7 @@ def _apply_lfcm_calibration(
 
 def _within_radius(a_lat: float, a_lng: float, b_lat: float, b_lng: float, radius_deg: float = 0.05) -> bool:
     dlat, dlng = abs(a_lat - b_lat), abs(a_lng - b_lng)
-    return (dlat**2 + dlng**2) ** 0.5 <= radius_deg
+    return dlat**2 + dlng**2 <= radius_deg**2
 
 
 def _neighbor_context(me: _Virt, regions: list[_Region]) -> tuple[int, int, float]:
@@ -1554,9 +1104,65 @@ def _derive_brain_regions(bsv: BSV, *, role: str, supportive_neighbors: int, res
 
 def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_diagnostics: dict[str, float | str]) -> dict[str, float]:
     lowered = analysis_text.lower()
-    anti_institution = any(token in lowered for token in ("they don't want you", "officials lie", "government", "cover up", "media"))
+    # ── Broad-consensus topics (70-89% real-world support per 2026 polls) ──
+    # These topics have overwhelming public support that our naive model misses
+    # because the keyword "government" falsely triggers anti-institution penalties.
+    # Sources: BPC/Advocus housing (89%), KFF drug pricing (85%), White House voter ID,
+    # Stanford HAI AI reg (41% want more/27% too much/32% unsure).
+    broad_consensus = any(token in lowered for token in (
+        # Housing (89% support — BPC/Advocus May 2026)
+        "housing affordability", "homeless", "zoning reform", "rent stabilization",
+        "housing crisis", "affordable housing", "homeless shelter",
+        # Healthcare/drug pricing (72-88% support — KFF Mar 2026)
+        "drug price", "prescription drug", "pharmaceutical", "insulin",
+        "generic drug", "medicare negotiate", "lower drug",
+        # Election integrity (70-80% support voter ID)
+        "election integrity", "voter id", "voter identification",
+        "secure election", "ballot security", "vote",
+        # AI regulation (41% want more reg — Stanford HAI Apr 2026)
+        "algorithmic transparency", "bias testing", "ai safety",
+        "consumer protection", "ai regulation", "ai accountability",
+    ))
+    # Beneficiary framing — when text clearly names who benefits from the policy
+    beneficiary_framing = any(token in lowered for token in (
+        "patients", "homeowners", "renters", "voters", "families",
+        "students", "teachers", "seniors", "children", "community",
+        "lifesaving", "lives", "affordable", "access",
+    ))
+    # Anti-institution penalty should be NARROWER — only trigger on explicit
+    # anti-government rhetoric, not generic mentions of "government" or "regulation"
+    anti_institution = any(token in lowered for token in (
+        "they don't want you", "officials lie", "cover up",
+        "deep state", "corrupt politicians", "rigged system",
+    ))
+    # "Government" alone is NOT anti-institution — only when paired with
+    # negative qualifiers that indicate actual institutional distrust
+    gov_distrust = anti_institution or any(token in lowered for token in (
+        "government overreach", "surveillance state", "police state",
+        "government tracking", "big brother",
+    ))
     prosocial = any(token in lowered for token in ("community", "family", "protect", "help", "support"))
     absolutist = any(token in lowered for token in ("always", "never", "everyone", "nobody", "proves"))
+    gov_expansion = any(token in lowered for token in (
+        "welfare", "safety net", "food bank", "rental aid", "cash assistance",
+        "job training", "police budget", "public program", "social program",
+        "expand", "funding", "redirect", "proposing",
+    ))
+    public_safety = any(token in lowered for token in (
+        "crime", "police", "safety", "security", "camera", "surveillance",
+        "license plate", "traffic", "stolen", "missing", "emergency",
+        "protect", "deter", "public safety", "law enforcement",
+    ))
+    privacy_concern = any(token in lowered for token in (
+        "privacy", "surveillance dragnet", "government overreach",
+        "civil liberties", "tracking", "monitoring", "database", "data",
+        "minority neighborhoods", "disproportionately", "abuse",
+    ))
+    # Public safety + privacy = conflicted framing. Real polls show 60-80%
+    # support for surveillance WITH guardrails, not the 8% our naive model gives.
+    # When both safety benefits AND privacy concerns are present,
+    # agents should lean toward conditional acceptance, not pure neutral.
+    conflicted_surveillance = public_safety and privacy_concern
     health_falsehood = domain == "public_health" and any(token in lowered for token in ("alcohol is good for you", "miracle cure", "doctor hate this"))
     political_rumor = domain == "political" and any(
         token in lowered
@@ -1589,9 +1195,23 @@ def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_dia
         0.22
         + traits.baseline_openness * 0.18
         + (traits.identity_sensitivity * 0.12 if prosocial else 0.0)
-        + ((1.0 - traits.institutional_trust) * 0.16 if anti_institution else 0.0)
+        # ── Anti-institution penalty (NOW NARROWER — only explicit distrust rhetoric) ──
+        + ((1.0 - traits.institutional_trust) * 0.08 if gov_distrust else 0.0)
         + ((1.0 - traits.institutional_trust) * 0.16 + traits.identity_sensitivity * 0.08 if political_rumor else 0.0)
         + ((1.0 - traits.institutional_trust) * 0.08 + traits.peer_susceptibility * 0.08 + traits.baseline_openness * 0.05 if corporate_rumor else 0.0)
+        + (traits.political_lean * 0.18 if gov_expansion else 0.0)
+        + traits.political_homogeneity * traits.identity_sensitivity * 0.10
+        # ── Public safety calibration (LVT/Harris 2026, NLC 2023) ──
+        + (traits.institutional_trust * 0.22 + traits.baseline_openness * 0.08 if conflicted_surveillance else 0.0)
+        + (traits.institutional_trust * 0.14 if public_safety and not privacy_concern else 0.0)
+        - (0.06 if privacy_concern and not public_safety else 0.0)
+        # ── Broad-consensus topics — overwhelming real-world support ──
+        # Housing 89%, drug pricing 85%, voter ID 75%, AI reg 41%+
+        + (traits.institutional_trust * 0.18 + traits.baseline_openness * 0.10 if broad_consensus else 0.0)
+        # Beneficiary framing: people support policies that help concrete groups
+        + (traits.institutional_trust * 0.10 if beneficiary_framing and not gov_distrust else 0.0)
+        # Domain-specific trust: public_health has uniquely high institutional trust
+        + (0.08 if domain == "public_health" else 0.0)
         - traits.analytic_scrutiny * 0.10
         - traits.evidence_literacy * 0.14
         - (0.14 if health_falsehood else 0.0)
@@ -1602,6 +1222,15 @@ def _claim_alignment(analysis_text: str, domain: str, traits: _Traits, claim_dia
         + traits.evidence_literacy * 0.24
         + traits.analytic_scrutiny * 0.22
         + traits.institutional_trust * 0.08
+        + (traits.political_lean * -0.10 if gov_expansion else 0.0)
+        + abs(traits.political_lean) * traits.political_homogeneity * 0.12
+        # Public safety reduces scrutiny
+        - (traits.institutional_trust * 0.10 if public_safety else 0.0)
+        + ((1.0 - traits.institutional_trust) * 0.08 if privacy_concern else 0.0)
+        # Broad-consensus topics reduce scrutiny (people trust these policies)
+        - (traits.institutional_trust * 0.08 if broad_consensus else 0.0)
+        # Domain-specific: health topics get less scrutiny
+        - (0.04 if domain == "public_health" else 0.0)
         + (0.08 if health_falsehood else 0.0)
         - (0.06 if political_rumor else 0.0)
         - (0.02 if corporate_rumor else 0.0)
@@ -2268,6 +1897,8 @@ def _build_swarm_dynamics(
             openness = float(traits.get("baseline_openness", 0.5))
             scrutiny = float(traits.get("analytic_scrutiny", 0.5))
             identity = float(traits.get("identity_sensitivity", 0.5))
+            hop_distance = round_number - 1  # round 1 = direct (hop 0), round 2 = 1 hop, etc.
+            effective_cred = claim_credibility * max(0.10, 1.0 - hop_distance * 0.08)
             score = _clamp(
                 baseline * (0.62 if round_number == 1 else 0.34)
                 + final * (0.18 if round_number == 1 else 0.32)
@@ -2275,12 +1906,12 @@ def _build_swarm_dynamics(
                 + adopt_exposure * (0.10 + peer_sus * 0.10 + role_bias)
                 - reject_exposure * (0.08 + scrutiny * 0.08)
                 + openness * 0.03
-                - identity * (0.02 if claim_credibility < 0.35 else 0.0)
-                - (0.07 if claim_credibility < 0.22 else 0.0),
+                - identity * (0.02 if effective_cred < 0.35 else 0.0)
+                - (0.07 if effective_cred < 0.22 else 0.0),
             )
             state = _state_from_context(
                 score=score,
-                claim_credibility=claim_credibility,
+                claim_credibility=effective_cred,
                 traits=traits,
                 signal=agent.get("dominant_signal"),
                 supportive_context=adopt_exposure,
@@ -2317,6 +1948,9 @@ def _build_swarm_dynamics(
                     "confidence": confidence,
                     "sentiment": sentiment,
                     "post": post,
+                    "source_channel": "physical",
+                    "hop_distance": hop_distance,
+                    "effective_credibility": round(effective_cred, 3),
                 }
             )
             next_scores[agent["id"]] = score
@@ -2360,6 +1994,116 @@ def _build_swarm_dynamics(
         "per_agent_history": per_agent_history,
         "narrative_summary": "The swarm now runs as a real short propagation loop: each round updates agent stance from prior score, local exposure, and network pressure instead of replaying the same canned narrative.",
     }
+
+
+# ── Cyber reach probability by digital media habit ────────────────
+_CYBER_REACH: dict[str, float] = {
+    "Local-news heavy": 0.08,
+    "Group-chat heavy": 0.22,
+    "Public-feed heavy": 0.35,
+    "Mixed verification habit": 0.15,
+}
+
+
+def _apply_cyber_exposure(
+    *,
+    event_log: list[dict[str, Any]],
+    graph_agents: dict[str, dict[str, Any]],
+    per_agent_history: dict[int, list[dict[str, Any]]],
+    claim_credibility: float,
+    analysis_text: str,
+) -> None:
+    """Simulate cyber/digital spread: public posts jump geography to random agents.
+
+    For each `post_public` action, non-neighbor agents across the city have a
+    probability of seeing it — simulating Twitter/Instagram/WhatsApp reach.
+    Cyber-exposed agents get a lightweight history entry with low influence weight,
+    reflecting the reduced trust of digital vs. physical transmission.
+    """
+    # Gather public posts from the event log
+    public_posts: list[dict[str, Any]] = [
+        e for e in event_log
+        if e.get("action_type") == "post_public" and str(e.get("content", "")).strip()
+    ]
+    if not public_posts:
+        return
+
+    all_agent_ids = list(graph_agents.keys())
+    tick = 1  # cyber exposure always lands in tick 1+ context
+
+    for post in public_posts:
+        poster_id = str(post["author_id"])
+        poster = graph_agents.get(poster_id)
+        if not poster:
+            continue
+
+        # ── Compute cyber reach probability ──
+        habit = str(poster.get("digital_media_habit", "Mixed verification habit"))
+        base_prob = _CYBER_REACH.get(habit, 0.15)
+        emotion = float(poster.get("emotional_agitation", 0.5))
+        emotion_boost = 0.5 + emotion * 0.5  # 0.5 → 1.0
+        cyber_prob = base_prob * emotion_boost
+
+        # ── Determine poster's belief stance ──
+        poster_state = str(poster.get("belief_state", "neutral"))
+        poster_role = str(poster.get("role", "unknown"))
+        poster_name = str(poster.get("name", "unknown"))
+        poster_connections = set(str(c) for c in poster.get("connections", []))
+
+        # ── Expose random non-neighbor agents ──
+        n_exposed = 0
+        for target_id in all_agent_ids:
+            if target_id == poster_id:
+                continue
+            if target_id in poster_connections:
+                continue  # already connected physically — skip
+
+            if _seeded(int(poster_id) * 997 + int(target_id) * 331 + tick * 47) < cyber_prob:
+                target_history = per_agent_history.get(int(target_id), [])
+                if not target_history:
+                    continue
+
+                # Use the last existing history entry as the base,
+                # then lightly nudge belief state toward poster's stance
+                last_entry = target_history[-1]
+                current_state = str(last_entry.get("belief_state", "neutral"))
+                current_confidence = float(last_entry.get("confidence", 0.5))
+
+                cyber_cred = claim_credibility * max(0.10, 1.0 - 1 * 0.20)
+                influence = 0.12
+
+                new_conf = current_confidence
+                if poster_state == "adopted" and current_state != "adopted":
+                    new_conf = min(0.92, current_confidence + influence * emotion_boost)
+                elif poster_state == "rejected" and current_state != "rejected":
+                    new_conf = max(0.20, current_confidence - influence * emotion_boost)
+
+                target_history.append({
+                    "round": last_entry["round"],
+                    "phase_label": "cyber exposure · digital spread",
+                    "belief_state": current_state,
+                    "confidence": round(new_conf, 3),
+                    "confidence_delta": round(new_conf - current_confidence, 3),
+                    "sentiment": _sentiment_for_state(current_state),
+                    "post": f"Via {poster_role.lower()} {poster_name}'s online post: \"{str(post.get('content', ''))[:120]}\"",
+                    "trigger": f"cyber exposure · poster {poster_name} ({poster_role})",
+                    "change_summary": f"cyber exposure to {poster_state} stance; credibility {cyber_cred:.2f}; influence {influence:.2f}{' (amplified by emotional charge)' if emotion > 0.7 else ''}",
+                    "supportive_pressure": round(influence if poster_state == "adopted" else 0.0, 3),
+                    "skeptical_pressure": round(influence if poster_state == "rejected" else 0.0, 3),
+                    "support_influence": round(influence if poster_state == "adopted" else 0.0, 3),
+                    "pushback_influence": round(influence if poster_state == "rejected" else 0.0, 3),
+                    "messenger_alignment": 0.0,
+                    "source_channel": "cyber",
+                    "hop_distance": 1,
+                    "effective_credibility": round(cyber_cred, 3),
+                })
+                n_exposed += 1
+
+        if n_exposed > 0:
+            logger.debug(
+                "Cyber exposure: %s (%s, emotion=%.2f) reached %d non-neighbor agents (prob=%.3f)",
+                poster_name, habit, emotion, n_exposed, cyber_prob,
+            )
 
 
 def _build_swarm_dynamics_langgraph(
@@ -2410,6 +2154,8 @@ def _build_swarm_dynamics_langgraph(
             "traits": (payload.get("_pipeline") or {}).get("traits", {}),
             "conditioning": (payload.get("_pipeline") or {}).get("conditioning", {}),
             "demographics": payload.get("demographics", {}),
+            "emotional_agitation": float((payload.get("tribe_neurological_metrics") or {}).get("emotional_friction", 0.5)),
+            "digital_media_habit": str((payload.get("demographics") or {}).get("digital_media_habit", "Mixed verification habit")),
             "baseline_score": float((payload.get("_pipeline") or {}).get("baseline_score", 0.5)),
             "target_score": float((payload.get("_pipeline") or {}).get("final_score", 0.5)),
             "connections": [str(other_id) for other_id in sorted(connections_by_id[virt.id])],
@@ -2462,14 +2208,17 @@ def _build_swarm_dynamics_langgraph(
     event_log: list[dict[str, Any]] = []
 
     for message in final_state["global_message_log"]:
-        author = message.name or message.additional_kwargs.get("author_id")
-        if author in {None, "", "environment"}:
+        author_id_raw = message.additional_kwargs.get("author_id") or message.name
+        if author_id_raw in {None, "", "environment"}:
             continue
         tick = int(message.additional_kwargs.get("tick", 0)) + 1
         action_type = str(message.additional_kwargs.get("action_type") or "do_nothing")
         target_agent_id = message.additional_kwargs.get("target_agent_id")
-        agent_payload = agent_payload_by_id[str(author)]
-        author_id = int(str(author))
+        author_key = str(author_id_raw)
+        if author_key not in agent_payload_by_id:
+            continue
+        agent_payload = agent_payload_by_id[author_key]
+        author_id = int(author_key)
 
         round_post = {
             "agent_id": author_id,
@@ -2579,6 +2328,8 @@ def _build_swarm_dynamics_langgraph(
                 else 0.0
             )
 
+            hop_distance = tick  # tick 1 = direct (hop 0), tick 2 = 1 hop, etc.
+            effective_cred = claim_credibility * max(0.10, 1.0 - hop_distance * 0.08)
             score = _clamp(
                 prev_scores[virt.id] * 0.29
                 + baseline_score * 0.12
@@ -2587,7 +2338,7 @@ def _build_swarm_dynamics_langgraph(
                 - skeptical_ratio * (0.055 + scrutiny * 0.1 + messenger_alignment * 0.045)
                 - neutral_ratio * 0.01
                 + openness * 0.045
-                - identity_sensitivity * (0.022 if claim_credibility < 0.3 else 0.0)
+                - identity_sensitivity * (0.022 if effective_cred < 0.3 else 0.0)
                 + messenger_alignment * 0.028
                 + strongest_neighbor_weight * (0.018 if supportive_weight > skeptical_weight else -0.012)
                 + (0.04 + messenger_alignment * 0.04 if direct_support else 0.0)
@@ -2596,7 +2347,7 @@ def _build_swarm_dynamics_langgraph(
             )
             state = _state_from_context(
                 score=score,
-                claim_credibility=claim_credibility,
+                claim_credibility=effective_cred,
                 traits=traits,
                 signal=agent_payload["dominant_signal"],
                 supportive_context=supportive_ratio,
@@ -2651,6 +2402,9 @@ def _build_swarm_dynamics_langgraph(
                 "support_influence": round(supportive_weight, 3),
                 "pushback_influence": round(skeptical_weight, 3),
                 "messenger_alignment": round(messenger_alignment, 3),
+                "source_channel": "physical",
+                "hop_distance": hop_distance,
+                "effective_credibility": round(effective_cred, 3),
             }
             per_agent_history[virt.id].append(history_row)
 
@@ -2714,6 +2468,18 @@ def _build_swarm_dynamics_langgraph(
         for edge in network_edges
     ]
 
+    # ── Cyber exposure loop ────────────────────────────────────────
+    # Simulate digital spread: when an agent posts publicly, their message
+    # has a probability of reaching random non-neighbor agents across the city.
+    # Probability scales with digital_media_habit and emotional charge.
+    _apply_cyber_exposure(
+        event_log=event_log,
+        graph_agents=graph_agents,
+        per_agent_history=per_agent_history,
+        claim_credibility=claim_credibility,
+        analysis_text=analysis_text,
+    )
+
     return {
         "rounds": rounds,
         "per_agent_history": per_agent_history,
@@ -2721,7 +2487,7 @@ def _build_swarm_dynamics_langgraph(
         "network_edges": edge_payload,
         "narrative_summary": (
             "This propagation layer is driven by a LangGraph loop with per-tick stance updates. "
-            "Agents react only to messages authored by directly connected neighbors, and those neighbors now carry "
+            "Agents react to messages authored by directly connected neighbors, and those neighbors now carry "
             "different influence weights based on tie strength, role compatibility, and whether the exchange is direct or ambient."
         ),
     }
@@ -3170,7 +2936,7 @@ async def _resolve_k2_reasoning_map(
     case_goal: str,
     claim_diagnostics: dict[str, float | str],
     computed_agents: list[dict[str, Any]],
-    chunk_size: int = 8,
+    chunk_size: int = 4,
 ) -> dict[int, dict[str, Any]]:
     requests = [
         _build_k2_batch_payload_item(
@@ -3183,13 +2949,13 @@ async def _resolve_k2_reasoning_map(
         for item in computed_agents
     ]
     reasoning_map: dict[int, dict[str, Any]] = {}
-    for chunk in _chunked(requests, chunk_size):
-        reasoning_map.update(
-            await call_k2_batch_think(
-                httpx_client,
-                agents=chunk,
-            )
-        )
+    chunks = _chunked(requests, chunk_size)
+    chunk_results = await asyncio.gather(*[
+        call_k2_batch_think(httpx_client, agents=chunk)
+        for chunk in chunks
+    ])
+    for result in chunk_results:
+        reasoning_map.update(result)
     return reasoning_map
 
 
@@ -3236,8 +3002,13 @@ async def _render_timeline_language(
             items.append(_timeline_prompt_item(agent, round_item))
 
     rendered: dict[tuple[int, int], dict[str, str]] = {}
-    for chunk in _chunked(items, chunk_size):
-        rendered.update(await call_k2_timeline_batch(httpx_client, items=chunk))
+    chunks = _chunked(items, chunk_size)
+    chunk_results = await asyncio.gather(*[
+        call_k2_timeline_batch(httpx_client, items=chunk)
+        for chunk in chunks
+    ])
+    for result in chunk_results:
+        rendered.update(result)
     return rendered
 
 
@@ -3925,6 +3696,37 @@ def _build_analysis_text(evidence: dict[str, Any], source_excerpt: str | None) -
     return canonical, canonical[:240]
 
 
+async def _index_simulation_async(
+    *,
+    run_id: int,
+    case_goal: str,
+    analysis_text: str,
+    domain: str,
+    city_id: str,
+    response: dict[str, Any],
+) -> None:
+    """Background task: index simulation run and agents into vector store."""
+    try:
+        from app.services.vector_store import index_agent, index_run, is_available
+        if not is_available():
+            return
+        sm = response.get("spread_model", {})
+        await asyncio.to_thread(
+            index_run,
+            run_id=run_id,
+            case_goal=case_goal,
+            analysis_text=analysis_text,
+            domain=domain,
+            city_id=city_id,
+            risk_level=sm.get("spread_risk"),
+            adoption_rate=float(sm.get("belief_adoption_rate", 0)),
+        )
+        for agent in response.get("agents", [])[:12]:
+            await asyncio.to_thread(index_agent, run_id=run_id, agent=agent)
+    except Exception:
+        logger.warning("Background vector store indexing failed for run %s", run_id, exc_info=True)
+
+
 async def run_simulation_http(
     *,
     city_id: str,
@@ -4006,6 +3808,8 @@ async def run_simulation_http(
             if missing_ids:
                 raise RuntimeError(f"TRIBE response is missing BSVs for agent ids: {', '.join(missing_ids[:8])}")
 
+            cond_map = {agent.id: _agent_conditioning(agent, city_id) for agent in population}
+
             calibrated_regions = [
                 _Region(
                     agent_id=agent.id,
@@ -4017,14 +3821,15 @@ async def run_simulation_http(
                         city_id=city_id,
                         case_features=case_features,
                         message_complexity=message_complexity,
+                        conditioning=cond_map[agent.id],
                     ),
                 )
                 for agent in population
             ]
             regions_by_id = {region.agent_id: region for region in calibrated_regions}
 
-            conditioning_map = {agent.id: _agent_conditioning(agent, city_id) for agent in population}
-            trait_map = {agent.id: _agent_traits(agent, city_id) for agent in population}
+            trait_map = {agent.id: _agent_traits(agent, city_id, conditioning=cond_map[agent.id]) for agent in population}
+            conditioning_map = cond_map
             baseline_scores: dict[int, float] = {}
             baseline_breakdowns: dict[int, dict[str, float]] = {}
             for agent in population:
@@ -4146,23 +3951,20 @@ async def run_simulation_http(
                 try:
                     elapsed = time.perf_counter() - pipeline_started
                     remaining_budget = settings.simulate_total_timeout_seconds - elapsed
-                    reasoning_timeout = min(12.0, max(0.0, remaining_budget - 16.0))
+                    reasoning_timeout = min(90.0, max(0.0, remaining_budget - 16.0))
                     if reasoning_timeout < 5.0:
                         raise TimeoutError(
                             f"Skipping K2 batch reasoning because only {remaining_budget:.2f}s remain in the pipeline budget."
                         )
                     reasoning_map = await _timed(
                         "agent_reasoning",
-                        asyncio.wait_for(
-                            _resolve_k2_reasoning_map(
-                                httpx_client,
-                                analysis_text=analysis_text,
-                                domain=domain,
-                                case_goal=case_goal,
-                                claim_diagnostics=claim_diagnostics,
-                                computed_agents=computed_agents,
-                            ),
-                            timeout=reasoning_timeout,
+                        _resolve_k2_reasoning_map(
+                            httpx_client,
+                            analysis_text=analysis_text,
+                            domain=domain,
+                            case_goal=case_goal,
+                            claim_diagnostics=claim_diagnostics,
+                            computed_agents=computed_agents,
                         ),
                     )
                     agents = [
@@ -4354,6 +4156,16 @@ async def run_simulation_http(
                 claim_diagnostics=claim_diagnostics,
                 swarm_dynamics=swarm_dynamics,
             )
+            payload.update(
+                {
+                    "city_id": city_id,
+                    "domain": domain,
+                    "case_goal": case_goal,
+                    "effective_catalyst_text": analysis_text,
+                    "tribe_meta": tribe_meta,
+                    "stage_trace": stage_trace,
+                }
+            )
             run_id = await _timed(
                 "persist_run",
                 asyncio.to_thread(
@@ -4400,13 +4212,8 @@ async def run_simulation_http(
                                 "belief_state": agent["belief_state"],
                                 "confidence": agent["k2_decision_confidence"],
                                 "dominant_signal": agent["dominant_signal"],
-                                "sentiment": "negative"
-                                if agent["belief_state"] == "rejected"
-                                else "positive"
-                                if agent["belief_state"] == "adopted"
-                                else "neutral",
-                                "round_history": agent.get("round_history", []),
                             },
+                            "spread_notes": "",
                         }
                         for agent in agents
                     ],
@@ -4414,18 +4221,18 @@ async def run_simulation_http(
             )
             for agent in agents:
                 agent.pop("_pipeline", None)
+            payload["run_id"] = run_id
 
-            payload.update(
-                {
-                    "city_id": city_id,
-                    "domain": domain,
-                    "case_goal": case_goal,
-                    "effective_catalyst_text": analysis_text,
-                    "run_id": run_id,
-                    "tribe_meta": tribe_meta,
-                    "stage_trace": stage_trace,
-                }
-            )
+            # ── Index into vector store for semantic search ──
+            asyncio.create_task(_index_simulation_async(
+                run_id=run_id,
+                case_goal=case_goal,
+                analysis_text=analysis_text,
+                domain=domain,
+                city_id=city_id,
+                response=payload,
+            ))
+
             return payload
 
     return await asyncio.wait_for(_run_pipeline(), timeout=settings.simulate_total_timeout_seconds)

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 import asyncio
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import get_settings
 from app.pipeline_store import (
     append_agent_conversation,
+    delete_case_run,
     fetch_agent_outcome,
     fetch_case_run,
     init_pipeline_store,
@@ -27,12 +29,15 @@ from app.pipeline_store import (
     update_agent_spread_notes,
 )
 from app.population_store import fetch_population_agent, init_population_store, list_population
+from app.political_geography import get_political_zones_geojson
+from app.services.vector_store import index_all_existing_runs, is_available, search_runs
 from app.services.action_center import action_center_provider_status, build_action_center_research
-from app.services.ai_clients import call_elevenlabs, call_k2_agent_conversation, transcribe_audio_with_elevenlabs
+from app.services.ai_clients import call_edge_tts, call_elevenlabs, call_k2_agent_conversation, transcribe_audio_with_elevenlabs
 from app.services.api_simulation import run_simulation_http
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+AUDIO_DIR = Path(tempfile.gettempdir()) / "audio"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +48,8 @@ logging.basicConfig(
 async def lifespan(_app: FastAPI):
     init_pipeline_store()
     init_population_store()
+    if is_available():
+        await asyncio.to_thread(index_all_existing_runs)
     logger.info("Cortexia API ready; CORS=%s", settings.cors_origin_list)
     yield
 
@@ -214,7 +221,7 @@ async def api_action_center_status() -> dict[str, Any]:
 
 @app.post("/api/action-center/research")
 async def api_action_center_research(body: ActionCenterResearchIn) -> dict[str, Any]:
-    async with httpx.AsyncClient() as httpx_client:
+    async with httpx.AsyncClient(verify=False) as httpx_client:
         try:
             return await build_action_center_research(
                 httpx_client,
@@ -235,19 +242,74 @@ async def api_action_center_research(body: ActionCenterResearchIn) -> dict[str, 
             raise HTTPException(status_code=500, detail=f"Action Center research failed: {exc}") from exc
 
 
+@app.get("/api/political-zones/{city_id}")
+async def api_political_zones(city_id: str) -> dict:
+    """Return GeoJSON overlay of precinct-level political lean for the given city."""
+    return get_political_zones_geojson(city_id)
+
+
+@app.get("/api/runs/{run_id}/report")
+async def api_run_report(run_id: int):
+    """Generate a comprehensive PDF report for a simulation run."""
+    import subprocess
+    import sys
+    import tempfile
+
+    record = fetch_case_run(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "export_report.py"
+    tmp = Path(tempfile.gettempdir()) / f"cortexia-report-{run_id}.pdf"
+    result = subprocess.run(
+        [sys.executable, str(script), str(run_id), "-o", str(tmp)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {result.stderr[:500]}")
+    return FileResponse(
+        tmp,
+        media_type="application/pdf",
+        filename=f"cortexia-run-{run_id}.pdf",
+    )
+
+
 @app.get("/api/runs/recent")
-async def api_recent_runs(limit: int = Query(default=8, ge=1, le=25)) -> dict[str, list[dict[str, Any]]]:
-    """
-    Recent persisted case runs for reproducibility and inspection.
-    """
-    return {"runs": list_recent_runs(limit)}
+async def api_recent_runs(
+    limit: int = Query(default=25, ge=1, le=100),
+    domain: str = Query(default=""),
+    city_id: str = Query(default=""),
+    search: str = Query(default=""),
+) -> dict[str, list[dict[str, Any]]]:
+    """List recent runs with optional domain/city/search filters."""
+    return {"runs": list_recent_runs(limit, domain=domain, city_id=city_id, search=search)}
+
+
+@app.get("/api/runs/search")
+async def api_search_runs(
+    q: str = Query(default="", min_length=1),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> dict[str, list[dict[str, Any]]]:
+    """Semantic search over simulation runs using vector embeddings."""
+    if not is_available() or not q.strip():
+        return {"results": []}
+    results = await asyncio.to_thread(search_runs, q, limit=limit)
+    return {"results": results}
+
+
+@app.delete("/api/runs/{run_id}")
+async def api_delete_run(run_id: int) -> dict[str, Any]:
+    """Delete a case run and all associated data."""
+    if delete_case_run(run_id):
+        return {"deleted": True, "run_id": run_id}
+    raise HTTPException(status_code=404, detail="Run not found.")
 
 
 @app.get("/api/runs/{run_id}")
 async def api_case_run(run_id: int) -> dict[str, Any]:
-    """
-    Load a persisted case run by id.
-    """
+    """Load a persisted case run by id."""
     record = fetch_case_run(run_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found.")
@@ -351,19 +413,19 @@ async def api_agent_conversation(run_id: int, agent_id: int, body: AgentConversa
                 user_message=body.message,
                 prior_turns=prior_turns,
             )
-            audio_path = await call_elevenlabs(
-                httpx_client,
-                reply,
-                voice_context={
-                    "demographics": agent.get("demographics") or payload_agent.get("demographics"),
-                    "tribe": agent.get("tribe") or {},
-                    "calibrated": agent.get("calibrated") or {},
-                    "outcome": {
-                        "belief_state": payload_agent.get("belief_state"),
-                        "confidence": payload_agent.get("k2_decision_confidence"),
-                    },
+            voice_ctx = {
+                "demographics": agent.get("demographics") or payload_agent.get("demographics"),
+                "tribe": agent.get("tribe") or {},
+                "calibrated": agent.get("calibrated") or {},
+                "outcome": {
+                    "belief_state": payload_agent.get("belief_state"),
+                    "confidence": payload_agent.get("k2_decision_confidence"),
                 },
-            )
+            }
+            if settings.elevenlabs_api_key.strip() and settings.elevenlabs_voice_id.strip():
+                audio_path = await call_elevenlabs(httpx_client, reply, voice_context=voice_ctx)
+            else:
+                audio_path = await call_edge_tts(reply, voice_context=voice_ctx)
         except httpx.HTTPError as exc:
             logger.exception("Agent conversation upstream HTTP failure")
             raise HTTPException(status_code=502, detail=f"Agent conversation upstream failed: {exc}") from exc
@@ -401,7 +463,7 @@ async def api_agent_conversation(run_id: int, agent_id: int, body: AgentConversa
 @app.get("/api/audio/{filename}")
 async def api_audio_file(filename: str):
     safe_name = Path(filename).name
-    path = Path("/tmp/audio") / safe_name
+    path = AUDIO_DIR / safe_name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found.")
     return FileResponse(path, media_type="audio/mpeg", filename=safe_name)

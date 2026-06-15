@@ -29,6 +29,11 @@ TRIBE_REPO_ID = "facebook/tribev2"
 
 
 def _load_hf_token() -> str:
+    """Load HF token for Modal deploy secrets.
+
+    Precedence: environment → local .env (for deploy convenience).
+    During runtime inside Modal, only os.getenv works (no .env file).
+    """
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
     if token:
         return token
@@ -36,9 +41,7 @@ def _load_hf_token() -> str:
     env_path = Path(__file__).resolve().parent / ".env"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("HF_TOKEN="):
-                return line.split("=", 1)[1].strip()
-            if line.startswith("HUGGINGFACE_TOKEN="):
+            if line.startswith("HF_TOKEN=") or line.startswith("HUGGINGFACE_TOKEN="):
                 return line.split("=", 1)[1].strip()
     return ""
 
@@ -107,12 +110,7 @@ class BatchRequest(BaseModel):
     agents: list[AgentData] = Field(min_length=1)
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, value))
-
-
-def _sigmoid(value: float) -> float:
-    return 1.0 / (1.0 + math.exp(-value))
+from app.services.shared_math import clamp as _clamp, sigmoid as _sigmoid
 
 
 def _derive_bsv(stats: dict[str, dict[str, float]], composites: dict[str, float]) -> dict[str, float]:

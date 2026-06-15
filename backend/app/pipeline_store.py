@@ -18,6 +18,8 @@ def init_pipeline_store() -> None:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS case_runs (
@@ -90,6 +92,28 @@ def init_pipeline_store() -> None:
             )
             """
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_outcomes_run_agent "
+            "ON agent_outcomes(run_id, agent_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_conversations_run_agent "
+            "ON agent_conversations(run_id, agent_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulation_rounds_run "
+            "ON simulation_rounds(run_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_simulation_rounds_run_round "
+            "ON simulation_rounds(run_id, round_number)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_case_runs_domain ON case_runs(domain)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_case_runs_city ON case_runs(city_id)"
+        )
         conn.commit()
 
 
@@ -120,7 +144,6 @@ def persist_case_run(
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
-        _ensure_agent_outcome_columns(conn)
         cursor = conn.execute(
             """
             INSERT INTO case_runs (
@@ -221,16 +244,33 @@ def fetch_case_run(run_id: int) -> dict[str, Any] | None:
         }
 
 
-def list_recent_runs(limit: int = 10) -> list[dict[str, Any]]:
+def list_recent_runs(limit: int = 10, domain: str = "", city_id: str = "", search: str = "") -> list[dict[str, Any]]:
     path = _db_path()
     if not path.exists():
         return []
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT id, created_at, domain, city_id, case_goal, claim_json, fidelity FROM case_runs ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        query = (
+            "SELECT id, created_at, domain, city_id, case_goal, claim_json, fidelity FROM case_runs"
+        )
+        conditions: list[str] = []
+        params: list[Any] = []
+        if domain:
+            conditions.append("domain = ?")
+            params.append(domain)
+        if city_id:
+            conditions.append("city_id = ?")
+            params.append(city_id)
+        if search:
+            conditions.append("(case_goal LIKE ? OR analysis_text LIKE ?)")
+            like = f"%{search}%"
+            params.extend([like, like])
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
         return [
             {
                 "id": row["id"],
@@ -245,13 +285,27 @@ def list_recent_runs(limit: int = 10) -> list[dict[str, Any]]:
         ]
 
 
+def delete_case_run(run_id: int) -> bool:
+    """Delete a case run and all associated agent outcomes, conversations, and rounds."""
+    path = _db_path()
+    if not path.exists():
+        return False
+    with sqlite3.connect(path) as conn:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM agent_conversations WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM agent_outcomes WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM simulation_rounds WHERE run_id = ?", (run_id,))
+        cursor = conn.execute("DELETE FROM case_runs WHERE id = ?", (run_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def fetch_agent_outcome(run_id: int, agent_id: int) -> dict[str, Any] | None:
     path = _db_path()
     if not path.exists():
         return None
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        _ensure_agent_outcome_columns(conn)
         row = conn.execute(
             "SELECT * FROM agent_outcomes WHERE run_id = ? AND agent_id = ?",
             (run_id, agent_id),
@@ -281,7 +335,6 @@ def list_run_agents(run_id: int, limit: int = 250) -> list[dict[str, Any]]:
         return []
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        _ensure_agent_outcome_columns(conn)
         rows = conn.execute(
             """
             SELECT * FROM agent_outcomes
@@ -340,7 +393,6 @@ def update_agent_spread_notes(*, run_id: int, agent_id: int, spread_notes: str) 
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
-        _ensure_agent_outcome_columns(conn)
         conn.execute(
             """
             UPDATE agent_outcomes

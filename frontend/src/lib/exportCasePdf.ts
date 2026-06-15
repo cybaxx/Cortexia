@@ -20,7 +20,7 @@ function setText(doc: jsPDF, color: readonly number[]) {
   doc.setTextColor(color[0], color[1], color[2]);
 }
 
-function card(doc: jsPDF, x: number, y: number, w: number, h: number, color = COLORS.surface) {
+function card(doc: jsPDF, x: number, y: number, w: number, h: number, color: readonly number[] = COLORS.surface) {
   setFill(doc, color);
   doc.roundedRect(x, y, w, h, 8, 8, 'F');
 }
@@ -41,7 +41,7 @@ function addPageFrame(doc: jsPDF, title: string, eyebrow: string, accent: readon
   doc.text(title, 14, 33);
 }
 
-function textBlock(doc: jsPDF, text: string, x: number, y: number, w: number, size = 11, color = COLORS.text) {
+function textBlock(doc: jsPDF, text: string, x: number, y: number, w: number, size = 11, color: readonly number[] = COLORS.text) {
   setText(doc, color);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(size);
@@ -61,7 +61,7 @@ function labelValue(doc: jsPDF, label: string, value: string, x: number, y: numb
   doc.text(value, x + 6, y + 17);
 }
 
-function chip(doc: jsPDF, text: string, x: number, y: number, color = COLORS.pastel2) {
+function chip(doc: jsPDF, text: string, x: number, y: number, color: readonly number[] = COLORS.pastel2) {
   setFill(doc, color);
   doc.roundedRect(x, y, Math.max(22, text.length * 2.2 + 8), 8, 4, 4, 'F');
   setText(doc, COLORS.deep);

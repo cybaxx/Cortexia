@@ -79,8 +79,9 @@ interface CortexState {
   setSelectedAgentId: (id: number | null) => void;
   runSimulation: () => Promise<void>;
   exportCase: (format?: 'json' | 'markdown' | 'pdf') => void;
-  loadRecentRuns: () => Promise<void>;
+  loadRecentRuns: (limit?: number) => Promise<void>;
   openRun: (runId: number) => Promise<void>;
+  deleteRun: (runId: number) => Promise<void>;
 }
 
 const DEFAULT_GOAL =
@@ -152,6 +153,10 @@ function applySimulationResponse(set: (partial: Partial<CortexState>) => void, r
 }
 
 function applyPersistedRun(set: (partial: Partial<CortexState>) => void, record: PersistedRunResponse) {
+  // Inject run_id into response — persisted runs store it at the record level
+  if (!record.response.run_id) {
+    record.response.run_id = record.id;
+  }
   applySimulationResponse(set, record.response);
   set({
     cityId: record.city_id,
@@ -321,10 +326,10 @@ export const useCortexStore = create<CortexState>((set, get) => ({
     set({ exportState: { exportFormat: format, lastExportAt: Date.now() } });
   },
 
-  loadRecentRuns: async () => {
+  loadRecentRuns: async (limit = 8) => {
     set({ recentRunsStatus: 'loading' });
     try {
-      const runs = await getRecentRuns();
+      const runs = await getRecentRuns(limit);
       set({ recentRuns: runs, recentRunsStatus: 'ready' });
     } catch {
       set({ recentRunsStatus: 'error' });
@@ -338,7 +343,20 @@ export const useCortexStore = create<CortexState>((set, get) => ({
       applyPersistedRun(set, record);
     } catch (error) {
       const msg = error instanceof Error ? error.message : 'Loading persisted run failed';
+      console.error('openRun failed:', msg, error);
       set({ status: 'error', apiError: msg });
+    }
+  },
+
+  deleteRun: async (runId: number) => {
+    try {
+      await fetch(`/api/runs/${runId}`, { method: 'DELETE' });
+      // Remove from local list immediately
+      set((state) => ({
+        recentRuns: state.recentRuns.filter((r) => r.id !== runId),
+      }));
+    } catch (error) {
+      console.error('deleteRun failed:', error);
     }
   },
 }));

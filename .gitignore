@@ -35,3 +35,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+vector_db/
+
+# TRIBE model cache and data files
+backend/tribe_data/cache/
+backend/batch_results.json
+backend/tribe_data/cache/**/*.pkl
+backend/tribe_data/cache/**/*.mp3

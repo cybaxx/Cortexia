@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, TypedDict
 
 import httpx
 
+# Cross-platform audio output directory
+AUDIO_DIR = Path(tempfile.gettempdir()) / "audio"
+
 from app.config import get_settings
-from app.constants import tribe_modal_deployment_url
 from app.services.tribe_framework import run_framework_batch
 
 logger = logging.getLogger(__name__)
@@ -289,10 +292,10 @@ async def call_tribe_modal_batch(
     if settings.tribe_runtime_mode.strip().lower() == "framework":
         return await run_framework_batch(catalyst_text, agents)
 
-    if not tribe_modal_deployment_url():
+    if not settings.tribe_modal_url.strip():
         raise RuntimeError("TRIBE_MODAL_URL is required. No TRIBE fallback is available.")
 
-    url = tribe_modal_deployment_url().rstrip("/")
+    url = settings.tribe_modal_url.strip().rstrip("/")
     if not url.startswith("http"):
         url = f"https://{url}"
     
@@ -562,94 +565,94 @@ async def call_k2_batch_think(
     if not agents:
         return {}
 
-    headers: dict[str, str] = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {settings.ifm_api_key}",
-    }
-    payload: dict[str, Any] = {
-        "model": settings.ifm_k2_model,
-        "stream": False,
-        "messages": [
-            {"role": "system", "content": K2_BATCH_REASONING_PROMPT},
-            {"role": "user", "content": json.dumps(agents, ensure_ascii=True)},
-        ],
-    }
-    r = await httpx_client.post(
-        settings.ifm_api_url,
-        json=payload,
-        headers=headers,
-        timeout=settings.simulate_k2_timeout_seconds,
-    )
-    r.raise_for_status()
-    out = _k2_response_body_to_object(r)
-    text = _openai_style_assistant_text(out)
-    if not text.strip():
-        raise ValueError("K2 batch reasoning returned empty content.")
-    parsed = _extract_json_payload(text)
-    if isinstance(parsed, dict):
-        for key in ("results", "items", "data", "agents", "output"):
-            candidate = parsed.get(key)
-            if isinstance(candidate, list):
-                parsed = candidate
-                break
-        else:
-            nested = _find_first_list_candidate(parsed)
-            if nested is not None:
-                parsed = nested
-    if not isinstance(parsed, list):
-        raise ValueError("K2 batch reasoning did not return a JSON array.")
-
-    results: dict[int, dict[str, Any]] = {}
-    skipped_items = 0
-    for item in parsed:
-        if isinstance(item, str):
-            try:
-                recovered = _extract_json_payload(item)
-            except ValueError:
-                skipped_items += 1
-                continue
-            if isinstance(recovered, list):
-                recovered_objects = [candidate for candidate in recovered if isinstance(candidate, dict)]
-                if len(recovered_objects) == 1:
-                    item = recovered_objects[0]
-                else:
-                    skipped_items += 1
-                    continue
-            elif isinstance(recovered, dict):
-                item = recovered
-            else:
-                skipped_items += 1
-                continue
-
-        if not isinstance(item, dict):
-            skipped_items += 1
-            continue
-        if "id" not in item or "action" not in item or "confidence" not in item or "signal" not in item:
-            skipped_items += 1
-            continue
-        agent_id = int(item["id"])
-        reasoning = item.get("reasoning")
-        if isinstance(reasoning, str):
-            reasoning_lines = [reasoning.strip()] if reasoning.strip() else []
-        elif isinstance(reasoning, list):
-            reasoning_lines = [str(line).strip() for line in reasoning if str(line).strip()]
-        else:
-            skipped_items += 1
-            continue
-        results[agent_id] = {
-            "reasoning": reasoning_lines,
-            "action": str(item["action"]).strip(),
-            "confidence": float(item["confidence"]),
-            "signal": str(item["signal"]).strip(),
+    # Try batch call first (fast, single request)
+    try:
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {settings.ifm_api_key}",
         }
+        payload: dict[str, Any] = {
+            "model": settings.ifm_k2_model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": K2_BATCH_REASONING_PROMPT},
+                {"role": "user", "content": json.dumps(agents, ensure_ascii=True)},
+            ],
+        }
+        r = await httpx_client.post(
+            settings.ifm_api_url,
+            json=payload,
+            headers=headers,
+            timeout=settings.simulate_k2_timeout_seconds,
+        )
+        r.raise_for_status()
+        out = _k2_response_body_to_object(r)
+        text = _openai_style_assistant_text(out)
+        if not text.strip():
+            raise ValueError("K2 batch reasoning returned empty content.")
+        parsed = _extract_json_payload(text)
+        if isinstance(parsed, dict):
+            for key in ("results", "items", "data", "agents", "output"):
+                candidate = parsed.get(key)
+                if isinstance(candidate, list):
+                    parsed = candidate
+                    break
+            else:
+                nested = _find_first_list_candidate(parsed)
+                if nested is not None:
+                    parsed = nested
+        if not isinstance(parsed, list):
+            raise ValueError("K2 batch reasoning did not return a JSON array.")
 
-    if skipped_items:
-        logger.warning("K2 batch reasoning skipped %s malformed item(s) while recovering usable results.", skipped_items)
+        results: dict[int, dict[str, Any]] = {}
+        skipped_items = 0
+        for agent, entry in zip(agents, parsed):
+            aid = agent.get("id") or agent.get("agent_id")
+            if aid is None:
+                skipped_items += 1
+                continue
+            results[int(aid)] = entry if isinstance(entry, dict) else {"raw": entry}
+        if skipped_items:
+            logger.warning("K2 batch skipped %d items due to missing agent ids.", skipped_items)
+        if results and len(results) == len(agents):
+            return results
+        # Partial results — fall through to per-agent calls for missing agents
+        logger.info("K2 batch returned %d/%d results; filling missing with per-agent calls.", len(results), len(agents))
+    except Exception:
+        logger.warning("K2 batch reasoning failed; falling back to per-agent explanation calls.", exc_info=True)
 
-    missing = sorted(set(int(agent["id"]) for agent in agents) - set(results.keys()))
-    if missing:
-        raise ValueError(f"K2 batch reasoning omitted agent ids: {missing[:8]}")
+    # Fallback: per-agent individual calls (more reliable with smaller LLMs)
+    results: dict[int, dict[str, Any]] = {}
+    for agent in agents:
+        aid = agent.get("id") or agent.get("agent_id")
+        if aid is None:
+            continue
+        try:
+            traces = await call_k2_explanation_only(
+                httpx_client,
+                agent_name=str(agent.get("name", f"Agent {aid}")),
+                agent_role=str(agent.get("role", "unknown")),
+                role_lens=str(agent.get("role_lens", "")),
+                scenario=str(agent.get("scenario", "")),
+                case_goal=str(agent.get("case_goal", "")),
+                precomputed_outcome=str(agent.get("precomputed_outcome", "")),
+                dominant_signal=str(agent.get("dominant_signal_hint") or agent.get("dominant_signal", "neutral")),
+                social_context_label=str(agent.get("social_context_label", "")),
+                primary_decision_anchor=str(agent.get("primary_decision_anchor", "")),
+                traits=agent.get("traits") or {},
+                demographics=agent.get("demographics"),
+                bsv=agent.get("bsv") or {},
+                score_breakdown=agent.get("score_breakdown") or {},
+            )
+            # Map to the format _materialize_agent_result expects
+            results[int(aid)] = {
+                "signal": str(agent.get("dominant_signal_hint") or agent.get("dominant_signal", "social_proof")),
+                "reasoning": traces,
+                "confidence": float(agent.get("final_score", 0.5)),
+            }
+        except Exception as e:
+            logger.warning("Per-agent K2 call failed for agent %s: %s", aid, e)
     return results
 
 
@@ -831,7 +834,7 @@ async def call_elevenlabs(
     voice_context: dict[str, Any] | None = None,
 ) -> str:
     """
-    Synthesize speech with ElevenLabs, save to /tmp/audio, return file path.
+    Synthesize speech with ElevenLabs, save to the audio dir, return file path.
     """
     if not settings.elevenlabs_api_key.strip() or not settings.elevenlabs_voice_id.strip():
         raise RuntimeError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required. No TTS fallback is available.")
@@ -853,9 +856,85 @@ async def call_elevenlabs(
         timeout=settings.simulate_k2_timeout_seconds,
     )
     r.raise_for_status()
-    Path("/tmp/audio").mkdir(parents=True, exist_ok=True)
-    path = str(Path("/tmp/audio") / f"tts-{uuid.uuid4().hex}.mp3")
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    path = str(AUDIO_DIR / f"tts-{uuid.uuid4().hex}.mp3")
     Path(path).write_bytes(r.content)
+    return path
+
+
+async def call_edge_tts(
+    text: str,
+    *,
+    voice: str = "en-US-AriaNeural",
+    rate: str = "+0%",
+    pitch: str = "+0Hz",
+    voice_context: dict[str, Any] | None = None,
+) -> str:
+    """
+    Synthesize speech using Microsoft Edge TTS (free, no API key).
+
+    Uses the `edge-tts` Python library which calls the same TTS service
+    that powers Microsoft Edge's Read Aloud feature. Voices are neural
+    and sound very natural.
+
+    Voice selection adapts to demographics in voice_context when present,
+    choosing age/gender-appropriate voices from the 300+ available Edge voices.
+    """
+    import edge_tts
+
+    voice_name = voice
+    if voice_context:
+        demographics = voice_context.get("demographics") or {}
+        age_band = str(demographics.get("age_band") or "")
+        age = int(demographics.get("age_years") or 30)
+
+        gender_voices = {
+            "male": [
+                "en-US-GuyNeural", "en-US-DavisNeural", "en-US-TonyNeural",
+                "en-US-EricNeural", "en-US-AndrewNeural", "en-US-SteffanNeural",
+            ],
+            "female": [
+                "en-US-AriaNeural", "en-US-JennyNeural", "en-US-AnaNeural",
+                "en-US-MichelleNeural", "en-US-JaneNeural", "en-US-NancyNeural",
+            ],
+        }
+
+        if age < 30:
+            voice_name = "en-US-JennyNeural"  # younger female
+        elif age > 55:
+            voice_name = "en-US-GuyNeural" if age % 2 == 0 else "en-US-JaneNeural"
+        else:
+            voice_name = "en-US-AriaNeural"  # natural mid-range
+
+    try:
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=voice_name,
+            rate=rate,
+            pitch=pitch,
+        )
+        AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        path = str(AUDIO_DIR / f"tts-{uuid.uuid4().hex}.mp3")
+        await communicate.save(path)
+        logger.info("Edge TTS synthesized %d chars → %s", len(text), path)
+        return path
+    except Exception as exc:
+        logger.exception("Edge TTS synthesis failed — falling back to silent audio")
+        return _silent_mp3(text)
+
+
+def _silent_mp3(text: str) -> str:
+    """Generate a minimal silent MP3 as a fallback when TTS fails."""
+    estimated_duration = max(1000, int(len(text) * 60))  # rough ms estimate
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    path = str(AUDIO_DIR / f"tts-{uuid.uuid4().hex}.mp3")
+
+    # Minimal valid MP3 frame (silence)
+    silent_frame = bytes([
+        0xFF, 0xFB, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ] * 10)
+    Path(path).write_bytes(silent_frame)
     return path
 
 

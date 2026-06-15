@@ -30,16 +30,23 @@ function normalizeConversationMessage(message: AgentConversationMessage): AgentC
 
 export async function postSimulate(body: SimulateRequest): Promise<SimulateResponse> {
   const url = `${base.replace(/\/$/, '')}/api/simulate`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(t || `Simulation failed (${res.status})`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 900_000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(t || `Simulation failed (${res.status})`);
+    }
+    return res.json() as Promise<SimulateResponse>;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return res.json() as Promise<SimulateResponse>;
 }
 
 export async function postTranscribeAudio(file: File, languageCode?: string): Promise<TranscriptionResponse> {
@@ -78,6 +85,30 @@ export async function getRunById(runId: number): Promise<PersistedRunResponse> {
     throw new Error(t || `Fetching run ${runId} failed (${res.status})`);
   }
   return res.json() as Promise<PersistedRunResponse>;
+}
+
+export function getRunReportUrl(runId: number): string {
+  return `${base.replace(/\/$/, '')}/api/runs/${runId}/report`;
+}
+
+export async function searchRunsSemantic(query: string, limit = 5): Promise<SemanticSearchResult[]> {
+  const url = `${base.replace(/\/$/, '')}/api/runs/search?q=${encodeURIComponent(query)}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(t || `Semantic search failed (${res.status})`);
+  }
+  const payload = (await res.json()) as { results: SemanticSearchResult[] };
+  return payload.results;
+}
+
+export interface SemanticSearchResult {
+  run_id: number;
+  domain: string;
+  city_id: string;
+  risk_level: string;
+  similarity: number;
+  snippet: string;
 }
 
 export async function getAgentConversationHistory(
